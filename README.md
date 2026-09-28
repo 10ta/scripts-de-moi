@@ -1,12 +1,102 @@
-# self-use-scripts
+# scripts-de-moi
 
-自用的服务器脚本合集。每个脚本都是单文件、可重复运行，配置写在脚本顶部。
+自用的服务器脚本和笔记合集。脚本都是单文件、可重复运行，配置写在脚本顶部。
 
 > 这些脚本按我自己的环境编写和测试（Debian + systemd）。用在别处之前，请先读一遍代码。
 
-| 脚本 | 说明 |
+| 文件 | 说明 |
 |---|---|
-| [`brutal-cn/brutal-cn.sh`](brutal-cn/brutal-cn.sh) | 用中国大陆 IP 段自动维护 TCP Brutal v2 规则，定时更新并自愈 |
+| [`debian-init.sh`](debian-init.sh) | 新 Debian 13 初始化：SSH 密钥、防火墙、fish、Go、Node.js、Caddy 等，模块可勾选 |
+| [`debian-note.md`](debian-note.md) | Debian 服务器笔记：重装、初始化、网络调优、代理服务、维护升级、PVE |
+| [`brutal-cn.sh`](brutal-cn.sh) | 用中国大陆 IP 段自动维护 TCP Brutal v2 规则，定时更新并自愈 |
+| [`upsing.sh`](upsing.sh) | 从 GitHub Release 下载并安装 sing-box 的 `.deb` 包 |
+
+---
+
+## debian-init
+
+新装 Debian 13 后的初始化脚本，对应 [`debian-note.md`](debian-note.md) 第 2 章中标注 📜 的步骤。
+
+### 功能
+
+- **模块化**：16 个模块，可以在菜单里勾选，也可以用参数指定。无论选了哪些，都按固定顺序执行。
+- **幂等**：可以反复运行。修改文件前先备份为 `<文件>.bak.<时间>`；追加的配置用标记块包住，重复运行时整块替换，不会重复追加。
+- **互不影响**：每个模块在独立的子进程中运行，一个失败不影响其他模块。结束时列出失败的模块，并给出重跑命令。
+- **远程脚本先下载再执行**：避免网络中断时执行半截脚本。
+- **结束时打印待办清单**：列出需要手动处理的事项（sing-box 配置、DNS、网络调优等）。
+
+### 用法
+
+```bash
+chmod +x debian-init.sh
+./debian-init.sh                    # 勾选菜单
+./debian-init.sh --all              # 按顺序执行全部
+./debian-init.sh --only ssh,ufw     # 只执行指定模块
+./debian-init.sh --list             # 列出模块
+```
+
+需要 root 权限，并且必须以文件方式运行（不支持 `curl | bash`），因为每个模块要调用脚本自身。
+
+SSH 端口会在运行时提示输入，也可以提前传入：
+
+```bash
+SSH_PORT=xxxx ./debian-init.sh --all
+```
+
+### 模块
+
+| 模块 | 内容 |
+|---|---|
+| `grub` | 串口控制台 + GRUB 等待时间设为 0（串口参数追加到原有参数后，不覆盖） |
+| `packages` | 基础软件，含 iperf3；clang / llvm / lld 使用系统默认版本 |
+| `chrony` | 时间同步 |
+| `ssh` | 粘贴密钥 → 写入密钥文件并设置权限 → GitHub 走 443 端口 → 修改 sshd 端口、只允许密钥登录 |
+| `brutal` | TCP Brutal |
+| `ufw` | 先放行 SSH 端口，再添加规则，最后启用防火墙 |
+| `fish` | fish 4（openSUSE Build Service 源）+ fisher + `config.fish`，设为 root 默认 shell |
+| `lsd` | lsd 配置 |
+| `nvim` | Neovim，从 GitHub Release 安装到 `/opt` |
+| `go` | Go 官方二进制，默认安装最新稳定版 |
+| `node` | Node.js LTS（NodeSource 源）+ pnpm |
+| `logs` | journald 与 logrotate 限额，日志总量控制在 100MB 以内 |
+| `timezone` | 设置时区 |
+| `exim4` | 已安装时卸载 exim4 |
+| `caddy` | Caddy（[lxhao61/integrated-examples](https://github.com/lxhao61/integrated-examples) 构建版），校验 sha256 后安装并启动 |
+| `singbox` | 调用 [`upsing.sh`](upsing.sh) 安装 sing-box |
+
+### 配置
+
+脚本顶部的配置区：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SSH_PORT` | 空 | 留空时运行到 `ssh` 或 `ufw` 模块会提示输入 |
+| `TIMEZONE` | `Asia/Taipei` | 时区 |
+| `GO_VERSION` | 空 | 留空安装最新稳定版；也可以指定，如 `go1.26.1` |
+| `UFW_RULES` | 80、443 及两个端口段 | 需要放行的端口，SSH 端口会自动放行 |
+| `JOURNAL_SYSTEM_MAX` 等 | `50M` / `10M` | journald 与 logrotate 的大小限制 |
+
+### 注意事项
+
+- **`ssh` 模块会关闭密码登录。** 重启 sshd 后脚本会暂停，请**保留当前窗口**，新开一个终端测试密钥登录。确认成功后才会继续；测试失败时自动恢复密码登录。
+- **每台服务器放同一把私钥**时，任何一台被入侵都会连带其他服务器和 GitHub 账号。请自行权衡。
+- **更换内核后要重新安装 Brutal**：`./debian-init.sh --only brutal`。
+- `grub`、默认 shell 等设置需要重启后才生效。
+
+---
+
+## upsing
+
+下载并安装 sing-box 的官方 `.deb` 包，首次安装和更新都可以用。
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/upsing.sh)
+```
+
+- 自动识别架构：`amd64`、`arm64`、`armv7`。
+- 取 GitHub Release 列表中的**第一个版本**安装。这个版本可能是 alpha 或 beta 预发布版。
+- 只安装程序，不修改配置文件。配置放在 `/etc/sing-box/config.json`，服务由你自己启用和启动。
+- 执行日志写在 `/tmp/upsing.log`。
 
 ---
 
@@ -53,15 +143,15 @@ APNIC 分配数据 ──▶ 大陆 IPv4 / IPv6 前缀 ──▶ 合并到规则
 定时器会直接调用脚本文件本身，所以脚本需要放在固定位置，不能放在 `/tmp` 下。推荐直接 clone 仓库：
 
 ```bash
-git clone https://github.com/10ta/self-use-scripts.git /opt/self-use-scripts
-bash /opt/self-use-scripts/brutal-cn/brutal-cn.sh install
+git clone https://github.com/10ta/scripts-de-moi.git /opt/scripts-de-moi
+bash /opt/scripts-de-moi/brutal-cn.sh install
 ```
 
 也可以只下载这一个脚本：
 
 ```bash
 curl -fsSL -o /opt/brutal-cn.sh \
-  https://raw.githubusercontent.com/10ta/self-use-scripts/main/brutal-cn/brutal-cn.sh
+  https://raw.githubusercontent.com/10ta/scripts-de-moi/main/brutal-cn.sh
 bash /opt/brutal-cn.sh install
 ```
 
