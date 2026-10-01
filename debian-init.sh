@@ -21,6 +21,13 @@ TIMEZONE="Asia/Taipei"
 # Go 版本：留空则安装最新稳定版；也可指定，如 "go1.26.1"
 GO_VERSION=""
 
+# Node.js 主版本（NodeSource）。改它再运行 --only node 即切换主版本
+NODE_MAJOR="${NODE_MAJOR:-24}"
+
+# pm2 日志轮转：单文件超过此大小即轮转，保留份数
+PM2_LOG_MAXSIZE="10M"
+PM2_LOG_KEEP=5
+
 # UFW 放行规则（SSH 端口会自动放行，无需写在这里）
 UFW_RULES=(
   "80"
@@ -61,7 +68,7 @@ MODULES=(
   "lsd|lsd 配置"
   "nvim|Neovim（GitHub Release）"
   "go|Go（官方二进制，默认最新稳定版）"
-  "node|Node.js LTS（NodeSource）+ pnpm"
+  "node|Node.js（NodeSource 固定主版本）+ pm2 + pnpm（重复运行即更新）"
   "logs|journald + logrotate 限额"
   "timezone|时区 ${TIMEZONE}"
   "exim4|卸载 exim4"
@@ -366,14 +373,93 @@ mod_go() {
 }
 
 mod_node() {
-  # NodeSource LTS：apt 统一管理，所有 shell 和 systemd 服务都能用，apt upgrade 即可跟进同一大版本的更新
-  run_remote https://deb.nodesource.com/setup_lts.x
-  apt_install nodejs
-  ok "Node.js 已安装：$(node --version)"
+  # Node.js：NodeSource apt 源，固定主版本 NODE_MAJOR；npm 随 nodejs 自带
+  # pm2：npm 全局装到 /usr（/usr/bin/pm2）+ systemd 开机自启 + 日志轮转
+  # 幂等：重复运行 = 更新（node 升到该主版本最新，pm2 升到最新，有变化且守护进程在跑则 pm2 update）
+  local f tmp cand cur before after changed=0
+  local src=/etc/apt/sources.list.d/nodesource.sources
+  local svc=pm2-root.service
+  local clean_path="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin"
+  [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] || die "NODE_MAJOR 必须是数字：${NODE_MAJOR}"
+  command -v logrotate >/dev/null || apt_install logrotate
 
-  # pnpm：以 fish 为目标 shell，安装脚本会自行写入 config.fish 的 pnpm 配置块
-  curl -fsSL https://get.pnpm.io/install.sh | env SHELL="$(command -v fish || echo /bin/bash)" sh -
-  ok "pnpm 已安装（重新登录后生效）"
+  # 1. NodeSource 源：先停用旧脚本留下的其他 NodeSource 源（同源不同 Signed-By 会让 apt 报冲突）
+  for f in /etc/apt/sources.list.d/*; do
+    [[ -f "$f" && "$f" != "$src" ]] || continue
+    case "$f" in *.list|*.sources) ;; *) continue ;; esac
+    if grep -qs 'deb\.nodesource\.com' "$f"; then
+      mv "$f" "$f.bak.$TS"; info "已停用旧的 NodeSource 源：$f → $f.bak.$TS"
+    fi
+  done
+  install -d -m 755 /etc/apt/keyrings
+  tmp="$(mktemp)"
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o "$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "NodeSource 密钥下载失败"; }
+  install -m 644 "$tmp" /etc/apt/keyrings/nodesource.gpg; rm -f "$tmp"
+  printf '%s\n' "Types: deb" "URIs: https://deb.nodesource.com/node_${NODE_MAJOR}.x" "Suites: nodistro" \
+    "Components: main" "Signed-By: /etc/apt/keyrings/nodesource.gpg" >"$src"
+  # 同名 nodejs 包以 NodeSource 为准，Debian 自带的 20.x 不会插进来
+  printf '%s\n' "Package: nodejs" "Pin: origin deb.nodesource.com" "Pin-Priority: 600" >/etc/apt/preferences.d/nodejs
+
+  # 2. Node.js（Debian 的 npm 包与 NodeSource 的 nodejs 冲突，先卸掉）
+  if dpkg -s npm >/dev/null 2>&1; then apt-get purge -y npm; fi
+  apt-get update -y
+  cand="$(apt-cache policy nodejs | awk '/Candidate:/{print $2}')"
+  [[ "$cand" == *nodesource* ]] || die "nodejs 候选版本不是 NodeSource 的（${cand:-无}），请检查 ${src}"
+  cur="$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)"
+  if [[ "$cur" != "$cand" ]]; then
+    apt-get install -y --no-install-recommends --allow-downgrades "nodejs=${cand}"
+    changed=1
+  fi
+  [[ "$(/usr/bin/node -p 'process.versions.node.split(".")[0]')" == "$NODE_MAJOR" ]] || die "Node.js 主版本不是 ${NODE_MAJOR}"
+  ok "Node.js $(/usr/bin/node -v)（NodeSource ${NODE_MAJOR}.x）"
+
+  # 3. pm2
+  before="$(/usr/bin/node -p "require('/usr/lib/node_modules/pm2/package.json').version" 2>/dev/null || true)"
+  PATH="$clean_path" /usr/bin/npm install -g --prefix /usr --no-fund --no-audit --loglevel=error pm2@latest
+  after="$(/usr/bin/node -p "require('/usr/lib/node_modules/pm2/package.json').version")"
+  [[ -x /usr/bin/pm2 ]] || die "pm2 安装后未找到 /usr/bin/pm2"
+  [[ "$before" == "$after" ]] || changed=1
+  ok "pm2 ${after}"
+
+  # 4. pm2 开机自启（官方 systemd 单元；PATH 固定为系统路径）
+  if [[ -d /run/systemd/system ]]; then
+    if ! { systemctl is-enabled "$svc" >/dev/null 2>&1 && grep -qs '/usr/lib/node_modules/pm2/bin/pm2' "/etc/systemd/system/$svc"; }; then
+      PATH="$clean_path" /usr/bin/pm2 startup systemd -u root --hp /root >/dev/null
+    fi
+    systemctl is-enabled "$svc" >/dev/null 2>&1 || die "pm2 startup 执行后 ${svc} 仍未启用"
+    ok "pm2 开机自启：${svc}"
+  else
+    warn "非 systemd 环境，跳过 pm2 开机自启"
+  fi
+
+  # 5. pm2 日志轮转（~/.pm2/logs 不在系统默认的 logrotate 范围内，补上以守住日志总量）
+  printf '%s\n' "# 由 debian-init.sh 生成" "/root/.pm2/pm2.log /root/.pm2/logs/*.log {" \
+    "    rotate ${PM2_LOG_KEEP}" "    maxsize ${PM2_LOG_MAXSIZE}" "    copytruncate" "    compress" \
+    "    delaycompress" "    missingok" "    notifempty" "}" >/etc/logrotate.d/pm2-root
+  chmod 644 /etc/logrotate.d/pm2-root
+  ok "pm2 日志轮转：单文件 ${PM2_LOG_MAXSIZE}，保留 ${PM2_LOG_KEEP} 份"
+
+  # 6. 更新后让常驻的 pm2 守护进程换上新版 node/pm2（会短暂重启受管应用）
+  if ((changed)) && pgrep -f 'PM2.*God Daemon' >/dev/null 2>&1; then
+    info "node/pm2 有更新，执行 pm2 update"
+    PATH="$clean_path" /usr/bin/pm2 update
+  fi
+
+  # 7. pnpm：以 fish 为目标 shell，安装脚本会自行写入 config.fish 的 pnpm 配置块；已装则自更新
+  if [[ -x "$ROOT_HOME/.local/share/pnpm/pnpm" ]]; then
+    "$ROOT_HOME/.local/share/pnpm/pnpm" self-update || warn "pnpm self-update 失败"
+  else
+    tmp="$(mktemp)"
+    curl -fsSL -o "$tmp" https://get.pnpm.io/install.sh || { rm -f "$tmp"; die "pnpm 安装脚本下载失败"; }
+    env SHELL="$(command -v fish || echo /bin/bash)" sh "$tmp"; rm -f "$tmp"
+  fi
+  ok "pnpm 已就绪（重新登录后生效）"
+
+  # 8. 提示其他 Node 安装（可能抢在 /usr/bin 之前）
+  for f in /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/pm2 "$ROOT_HOME/.nvm" "$ROOT_HOME/.volta" "$ROOT_HOME/.fnm"; do
+    if [[ -e "$f" ]]; then warn "发现其他 Node 安装：$f，可能抢在 /usr/bin 之前，确认不用就清掉"; fi
+  done
 }
 
 mod_logs() {
@@ -527,7 +613,8 @@ print_todo() {
  5. 网络调优（文档第 3 章）：按 BDP 计算并写入 sysctl 配置
  6. Caddy：编写 /etc/caddy/Caddyfile，然后 systemctl reload caddy
  7. 仅旁路由机器：UFW 内网转发规则与回程 MASQUERADE（文档 2.9）
- 8. 重启一次，使 GRUB 串口控制台、默认 shell 等设置生效
+ 8. pm2：pm2 start 启动应用后执行 pm2 save，重启后才会自动恢复应用
+ 9. 重启一次，使 GRUB 串口控制台、默认 shell 等设置生效
 ====================================================
 EOF
 }
