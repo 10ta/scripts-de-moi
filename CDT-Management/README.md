@@ -67,7 +67,7 @@
 
 ```bash
 # 方式 A：直接运行
-bash <(curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/script/CDT-Management/init.sh)
+bash (curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/script/CDT-Management/init.sh | psub)
 
 # 方式 B：先 clone 再运行
 git clone https://github.com/10ta/scripts-de-moi.git
