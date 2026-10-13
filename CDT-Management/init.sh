@@ -201,12 +201,35 @@ start_timer() {
     return 0
 }
 
+# ---------------------------------------------------------------- 升级：补齐新版本引入的配置项（已有的不动）
+upgrade_env() {
+    local added=()
+    ensure() {
+        grep -qE "^$1=" "$ENV_FILE" && return 0
+        printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"
+        added+=("$1=$2")
+    }
+    if ! grep -qE '^COST_LIMIT=' "$ENV_FILE"; then
+        printf '\n# ── 费用熔断（由 init.sh 升级时追加）──\n' >> "$ENV_FILE"
+    fi
+    ensure COST_LIMIT 5
+    ensure COST_WARN_PCT 50
+    ensure COST_CHECK_MIN 30
+    ensure ALI_SITE intl
+    chmod 600 "$ENV_FILE"
+    if ((${#added[@]})); then
+        info "已补齐新配置项：${added[*]}"
+        warn "费用熔断需要 RAM 权限 bss:DescribeBillList（见 README），没有的话 Telegram 会提示一次"
+    fi
+}
+
 # ---------------------------------------------------------------- 子命令
 cmd_install() {
     preflight
     install_files
     if [[ -f "$ENV_FILE" ]]; then
         info "已存在 $ENV_FILE，保留原配置（要重填请运行：bash init.sh reconfigure）"
+        upgrade_env
     else
         configure
     fi
