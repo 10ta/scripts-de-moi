@@ -35,12 +35,18 @@
 
 不要用主账号的 AccessKey。
 
-1. 打开 [RAM 控制台 → 用户](https://ram.console.aliyun.com/users)，点 **创建用户**，访问方式勾选 **OpenAPI 调用访问**。
-2. 创建完成后，**马上复制 AccessKey ID 和 Secret**。Secret 只显示这一次。
-3. 给这个用户授权，二选一：
-   - **推荐：自定义最小权限。** 到 [权限策略](https://ram.console.aliyun.com/policies) → **创建权限策略** → 脚本编辑，粘贴本目录的 [`ram-policy.json`](ram-policy.json)，然后把这条策略授权给该用户。
+1. 打开 [RAM 控制台 → 用户](https://ram.console.aliyun.com/users)，点 **创建用户**。
+   - **登录名称**随便填，例如 `cdt-guard`。
+   - 页面下方的 **访问配置**：只勾选右边的 **「使用永久 AccessKey 访问」**，左边的「使用控制台访问」不要勾。
+   - 点 **确定**。
+2. 跳转到「创建用户」结果页后，在 AccessKey 一列**马上复制 AccessKey ID 和 AccessKey Secret**，或者点 **保存结果** 下载 CSV。页面关掉之后 Secret 就再也看不到了。
+   - 如果这一列显示「AccessKey 没有设置」，说明上一步漏勾了，不用删掉用户重建。直接到 **用户** 列表 → 点这个用户名 → **认证管理** 标签 → **创建 AccessKey** 补一个就行。
+3. 给这个用户授权：在结果页勾选这个用户 → **新增授权**，或者在用户列表那一行点 **添加权限**。资源范围选 **账号级别**，然后二选一：
+   - **推荐：自定义最小权限。**
+     先到左侧 **权限管理 → 权限策略** → **创建权限策略** → **脚本编辑** 标签，把本目录的 [`ram-policy.json`](ram-policy.json) 整段粘进去，名称填 `cdt-guard`，保存。
+     然后回到授权面板，把策略类型切到 **自定义策略**，搜索 `cdt-guard`，勾选并确认。
      这条策略只能查 CDT 流量、查询和启停 ECS、改安全组规则。如果只用关机模式，可以删掉第三段（安全组）。
-   - 省事：授权系统策略 `AliyunCDTFullAccess` + `AliyunECSFullAccess`。
+   - 省事：在授权面板的搜索框分别搜 `CDT` 和 `ECS`，勾选系统策略 `AliyunCDTFullAccess` 和 `AliyunECSFullAccess`。
      ⚠️ ECSFullAccess 可以**删除或创建整个账号下的任何实例**，一旦 AK 泄露，影响的是整个账号，不只是这一台机器。
 
 ### ③ 另一台常开的 Debian / Ubuntu
@@ -143,7 +149,7 @@ journalctl -u cdt-guard -f                     # 看日志
 
 ## 和 traffic-bot 一起用
 
-把 traffic-bot 更新到带阿里云 CDT 的版本，重启 bot 就可以了，**不用给 bot 加任何配置**：
+把 traffic-bot 更新到带阿里云 CDT 的版本（`sudo cp bot.py /opt/traffic-bot/ && sudo systemctl restart traffic-bot`），**不用给 bot 加任何配置**：
 
 - bot 发现 `/var/lib/cdt-guard/state.json` 存在，就会在报告里显示 🟧 Aliyun CDT 一栏。
 - 新增命令 `/aliyun`（或 `/cdt`），单独查看这一栏。
