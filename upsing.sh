@@ -67,4 +67,6 @@ echo "开始安装..." | tee -a "$LOG"
 
 dpkg -i "/tmp/${DEB_NAME}" 2>&1 | tee -a "$LOG"
 
+systemctl restart sing-box
+
 echo "===== $(date '+%Y-%m-%d %H:%M:%S') 执行结束 =====" | tee -a "$LOG"

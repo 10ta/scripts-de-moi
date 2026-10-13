@@ -302,7 +302,7 @@ mod_fish() {
   ok "fish 已安装：$(fish --version)"
 
   # fisher
-  fish_run 'curl -fsSL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | source && fisher install jorgebucaran/fisher'
+  fish_run 'curl -fsSL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | source && fisher install jorgebucaran/fisher && fisher install IlanCosman/tide@v6'
 
   # config.fish（pnpm 的配置块由 pnpm 安装脚本自行写入，见 node 模块）
   write_block "$ROOT_HOME/.config/fish/config.fish" aliases 'alias ls="lsd"
