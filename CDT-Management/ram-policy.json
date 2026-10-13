@@ -1,0 +1,30 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cdt:ListCdtInternetTraffic"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeInstances",
+        "ecs:StartInstance",
+        "ecs:StopInstance"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeSecurityGroupAttribute",
+        "ecs:AuthorizeSecurityGroup",
+        "ecs:RevokeSecurityGroup"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

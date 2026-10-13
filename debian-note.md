@@ -48,6 +48,16 @@ bash reinstall.sh debian 13 --ssh-port <SSH_PORT>
 
 公共参数：`-d 12`（Debian 12）、`-v 64`、`-port "<SSH_PORT>"`、`-p "123@@@"`（root 密码）。
 
+### Alpine to Debian 13
+
+```bash
+wget --no-check-certificate -qO InstallNET.sh 'https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh' && chmod a+x InstallNET.sh
+```
+
+```bash
+bash InstallNET.sh -debian 13 -port "22101" -pwd '123@@@' -mirror "http://mirrors.cloud.aliyuncs.com/debian/" -swap '512' --cloudkernel "0" --bbr --motd --setdns
+```
+
 **🇫🇷 IPv6 机器**
 
 ```bash

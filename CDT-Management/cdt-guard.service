@@ -1,0 +1,12 @@
+[Unit]
+Description=Aliyun CDT traffic guard (one shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CDT_GUARD_ENV=/etc/cdt-guard.env
+ExecStart=/usr/bin/python3 /opt/cdt-guard/cdt_guard.py check
+StateDirectory=cdt-guard
+StateDirectoryMode=0755
+TimeoutStartSec=120
