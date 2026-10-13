@@ -11,6 +11,13 @@
     {
       "Effect": "Allow",
       "Action": [
+        "bss:DescribeBillList"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
         "ecs:DescribeInstances",
         "ecs:StartInstance",
         "ecs:StopInstance"

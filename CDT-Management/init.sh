@@ -138,6 +138,14 @@ configure() {
     fi
 
     echo
+    echo "${c_b}── 费用熔断 ──${c_0}"
+    echo "  本月应付（已扣优惠）达到这个金额就关机，防止意外刷爆卡。国际站单位 USD，0 = 关闭"
+    echo "  需要 RAM 权限 bss:DescribeBillList（ram-policy.json 已包含；用系统策略的话再加 AliyunBSSReadOnlyAccess）"
+    local cost_limit site
+    ask cost_limit "费用熔断线" "$(get_val COST_LIMIT "$ENV_FILE" | grep . || echo 5)"
+    ask site "账号站点 intl（国际站，USD）/ cn（中国站，CNY）" "$(get_val ALI_SITE "$ENV_FILE" | grep . || echo intl)"
+
+    echo
     echo "${c_b}── Telegram 通知（可留空）──${c_0}"
     local def_token def_chat
     def_token="$(get_val TG_BOT_TOKEN "$ENV_FILE")"; def_chat="$(get_val TG_CHAT_ID "$ENV_FILE")"
@@ -162,6 +170,11 @@ GUARD_MODE=$mode
 STOP_MODE=$stopmode
 SG_ID=$sg
 GUARD_KEEPALIVE=$(get_val GUARD_KEEPALIVE "$ENV_FILE" | grep . || echo 1)
+
+COST_LIMIT=$cost_limit
+COST_WARN_PCT=$(get_val COST_WARN_PCT "$ENV_FILE" | grep . || echo 50)
+COST_CHECK_MIN=$(get_val COST_CHECK_MIN "$ENV_FILE" | grep . || echo 30)
+ALI_SITE=$site
 
 TG_BOT_TOKEN=$tg_token
 TG_CHAT_ID=$tg_chat

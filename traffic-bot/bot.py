@@ -1097,8 +1097,10 @@ def get_aliyun_data() -> Section:
     remain_days = max(math.ceil((next_reset - now).total_seconds() / 86400), 1)
     remain_to_limit = max(limit - used, 0)
 
-    if st.get("locked"):
-        guard = "🛑 已熔断" + ("（已关机）" if st.get("mode") == "stop" else "（安全组已封禁）")
+    if st.get("cost_locked"):
+        guard = "🛑 费用熔断（已关机）"
+    elif st.get("locked"):
+        guard = "🛑 流量熔断" + ("（已关机）" if st.get("mode") == "stop" else "（安全组已封禁）")
     elif st.get("hold"):
         guard = "⏸ 暂停自动开机"
     else:
@@ -1116,6 +1118,14 @@ def get_aliyun_data() -> Section:
         lines.append("🗺 " + " · ".join(f"{r} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
     lines.append(f"🔄 {fmt_reset(next_reset)}后重置({fmt_date(next_reset.astimezone(REPORT_TZ))}) · "
                  f"日均可用 {fmt_gb(remain_to_limit / remain_days)}")
+    cost_limit = float(st.get("cost_limit") or 0)
+    cost_pct = None
+    if cost_limit and st.get("cost_cycle") == cn_now.strftime("%Y-%m"):
+        cost, cur = float(st.get("cost") or 0), st.get("currency", "USD")
+        cost_pct = cost / cost_limit * 100
+        lines.append(f"💰 本月应付 {cost:.2f} / 熔断 {cost_limit:g} {cur}（账单有几小时延迟）")
+    if st.get("cost_error"):
+        lines.append(f"⚠️ 账单查询失败，费用熔断暂时失效：{str(st['cost_error'])[:80]}")
 
     age_min = (time.time() - float(st.get("updated", 0))) / 60
     stale = age_min >= CDT_STALE_MIN
@@ -1127,6 +1137,9 @@ def get_aliyun_data() -> Section:
     period = cn_now.strftime("%Y-%m")
     metrics = [
         Metric("aliyun:cdt", "阿里云 CDT 流量", pct, period, f"{used:.1f} / {quota_gb:g}GB"),
+        *([Metric("aliyun:cost", "阿里云本月费用（相对费用熔断线）", cost_pct, period,
+                  f"{float(st.get('cost') or 0):.2f} / {cost_limit:g} {st.get('currency', 'USD')}")]
+          if cost_pct is not None else []),
         # 快照长时间不更新 = 熔断失效，每天提醒一次
         Metric("aliyun:cdt_stale", "cdt-guard 状态", 100 if stale else 0, now.strftime("%Y-%m-%d"), "",
                f"⚠️ cdt-guard 已 {age_min:.0f} 分钟没有更新状态，阿里云 CDT 熔断可能失效。"

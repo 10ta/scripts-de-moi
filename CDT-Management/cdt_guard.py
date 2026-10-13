@@ -24,9 +24,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 GIB = 1024 ** 3
+CN_TZ = timezone(timedelta(hours=8))  # 阿里云账期 / CDT 按北京时间
 RULE_TAG = "cdt-guard"
 
 
@@ -42,7 +43,7 @@ def load_env(path):
                 k, v = line.split("=", 1)
                 v = v.split(" #", 1)[0]  # 允许行尾注释
                 env[k.strip()] = v.strip().strip('"').strip("'")
-    env.update({k: v for k, v in os.environ.items() if k in env or k.startswith(("ALI_", "CDT_", "TG_", "GUARD_", "STOP_", "SG_", "STATE_"))})
+    env.update({k: v for k, v in os.environ.items() if k in env or k.startswith(("ALI_", "CDT_", "TG_", "GUARD_", "STOP_", "SG_", "STATE_", "COST_"))})
     return env
 
 
@@ -69,6 +70,12 @@ class Config:
         self.tg_token = env.get("TG_BOT_TOKEN", "")
         self.tg_chat = env.get("TG_CHAT_ID", "")
         self.state_dir = env.get("STATE_DIR", "/var/lib/cdt-guard")
+        # 费用熔断：本月应付 ≥ COST_LIMIT 就关机（0 = 关闭）。国际站 USD，中国站 CNY
+        self.cost_limit = float(env.get("COST_LIMIT", 0))
+        self.cost_warn = float(env.get("COST_WARN_PCT", 50))
+        self.cost_every = float(env.get("COST_CHECK_MIN", 30))
+        self.site = env.get("ALI_SITE", "intl")  # intl = 国际站（alibabacloud.com），cn = 中国站
+        self.bss_host = "business.ap-southeast-1.aliyuncs.com" if self.site == "intl" else "business.aliyuncs.com"
         self.endpoint = env.get("ALI_ENDPOINT_OVERRIDE", "")  # 仅测试用
         if self.mode not in ("stop", "sg"):
             raise SystemExit("GUARD_MODE 只能是 stop 或 sg")
@@ -259,6 +266,20 @@ def rate_per_hour(samples, now, bw_mbps=0):
 
 
 # ───────────────────────── 主逻辑 ─────────────────────────
+def bill_cycle(ts=None):
+    """账单月份按北京时间（阿里云账期口径）"""
+    return datetime.fromtimestamp(ts or time.time(), CN_TZ).strftime("%Y-%m")
+
+
+def get_month_cost(cfg, cycle):
+    """本月应付金额（PretaxAmount 合计，已扣优惠）。按量账单按小时生成，有几小时延迟"""
+    data = rpc(cfg, cfg.bss_host, "2017-12-14", "QueryBillOverview", BillingCycle=cycle)
+    items = (data.get("Data") or {}).get("Items", {}).get("Item", [])
+    total = sum(float(i.get("PretaxAmount") or 0) for i in items)
+    currency = next((i.get("Currency") for i in items if i.get("Currency")), "USD" if cfg.site == "intl" else "CNY")
+    return total, currency
+
+
 def check(cfg):
     st = load_state(cfg)
     now = time.time()
@@ -281,34 +302,74 @@ def check(cfg):
     st["fail"] = 0
     st.pop("last_error", None)
 
+    events = []
+    cycle = bill_cycle(now)
+
+    # ── 费用：每 COST_CHECK_MIN 分钟查一次账单（账单本身是小时级的，查太勤没意义）
+    if cfg.cost_limit > 0 and (now - st.get("cost_ts", 0) >= cfg.cost_every * 60 or st.get("cost_cycle") != cycle):
+        try:
+            cost, cur = get_month_cost(cfg, cycle)
+            st.update({"cost": round(cost, 4), "currency": cur, "cost_cycle": cycle, "cost_ts": now})
+            if st.pop("cost_error", None):
+                events.append(f"✅ {tag} 账单查询恢复")
+        except Exception as e:
+            if "cost_error" not in st:
+                events.append(f"⚠️ {tag} 查询账单失败，费用熔断暂时失效：{e}"
+                              + ("\n（RAM 用户缺少 bss:DescribeBillList 权限？）" if "Forbidden" in str(e) or "NoPermission" in str(e) else ""))
+            st["cost_error"] = str(e)[:200]
+    cost = st.get("cost", 0.0) if st.get("cost_cycle") == cycle else 0.0
+    cur = st.get("currency", "USD")
+
     # 速率 & 预测（CDT 数据本身有延迟，用速率往前看 LOOKAHEAD 分钟）
     samples = [s for s in st.get("samples", []) if now - s[0] <= 7200 and s[1] <= used + 0.001]
     samples.append([now, round(used, 4)])
     rate = rate_per_hour(samples, now, float(inst.get("bw_out") or 0))
     projected = used + rate * cfg.lookahead / 60
     locked = st.get("locked", False)
+    cost_locked = st.get("cost_lock") == cycle  # 费用熔断只在本账单月有效，换月自动失效
     status = inst["status"]
-    events = []
     just_unlocked = False
+    if st.get("cost_lock") and not cost_locked:  # 新的账单月
+        st.pop("cost_lock")
+        just_unlocked = True
+        events.append(f"🔓 {tag} 新账单月 {cycle}，解除费用熔断")
 
     try:
+        # ── 费用熔断：不管 GUARD_MODE 都关机（安全组封禁省不了钱）
+        if cfg.cost_limit > 0:
+            if not cost_locked and cost >= cfg.cost_limit:
+                if status == "Running":
+                    stop_instance(cfg, inst)
+                cost_locked = True
+                st["cost_lock"] = cycle
+                events.append(f"🛑 {tag} 费用熔断：本月应付 {cost:.2f} {cur} ≥ {cfg.cost_limit:g} {cur}，已关机。"
+                              f"\n关机只能止住 ECS 算力和流量，云盘/EIP/OSS 仍会计费，请到控制台查明原因。"
+                              f"\n确认无误后：cdt_guard.py unlock")
+            elif cost_locked and status == "Running":
+                stop_instance(cfg, inst)
+                events.append(f"🛑 {tag} 费用熔断期间实例被启动，已再次关机")
+            elif not cost_locked and cost >= cfg.cost_limit * cfg.cost_warn / 100 and st.get("cost_warned") != cycle:
+                st["cost_warned"] = cycle
+                events.append(f"💰 {tag} 本月应付已到 {cost:.2f} {cur}（费用熔断线 {cfg.cost_limit:g} {cur} 的 {cfg.cost_warn:g}%）")
+
+        # ── 流量熔断
         if locked:
             if used < cfg.release:  # 月初重置；stop 模式的开机交给下面的保活段
                 if cfg.mode == "sg":
                     sg_unlock(cfg, inst)
                 locked = False
                 just_unlocked = True
-                events.append(f"🔓 {tag} 流量已重置（{used:.2f} GB），解除熔断")
+                events.append(f"🔓 {tag} 流量已重置（{used:.2f} GB），解除流量熔断")
             else:  # 维持熔断：有人手动开机/删规则就再执行一次
-                if cfg.mode == "stop" and status == "Running":
+                if cfg.mode == "stop" and status == "Running" and not cost_locked:
                     stop_instance(cfg, inst)
-                    events.append(f"🛑 {tag} 熔断期间实例被启动，已再次关机（{used:.2f} GB）")
+                    events.append(f"🛑 {tag} 流量熔断期间实例被启动，已再次关机（{used:.2f} GB）")
                 elif cfg.mode == "sg" and sg_lock(cfg, inst):
                     events.append(f"🛑 {tag} 熔断规则丢失，已重新加上")
         elif used >= cfg.limit or projected >= cfg.limit:
             why = f"{used:.2f} GB" + (f"，按 {rate:.1f} GB/h 预计 {cfg.lookahead:.0f} 分钟内到 {projected:.1f}" if used < cfg.limit else "")
             if cfg.mode == "stop":
-                if status == "Running":
+                if status == "Running" and not cost_locked:
                     stop_instance(cfg, inst)
                 events.append(f"🛑 {tag} 流量熔断：{why} ≥ {cfg.limit:g} GB，已关机（{cfg.stop_mode if inst['charge'] == 'PostPaid' else '包年包月'}）")
             else:
@@ -316,26 +377,38 @@ def check(cfg):
                 events.append(f"🛑 {tag} 流量熔断：{why} ≥ {cfg.limit:g} GB，已在安全组 {_sg(cfg, inst)} 加 drop-all 入站规则")
             locked = True
 
-        # 保活 / 解除熔断后开机（sg 模式熔断期间也照样保活，反正规则挡着）
-        if (cfg.keepalive or just_unlocked) and status == "Stopped" and not st.get("hold") and (not locked or cfg.mode == "sg"):
+        # ── 保活 / 解除熔断后开机（sg 模式流量熔断期间也照样保活，反正规则挡着）
+        may_run = not cost_locked and (not locked or cfg.mode == "sg")
+        if (cfg.keepalive or just_unlocked) and status == "Stopped" and not st.get("hold") and may_run:
             if just_unlocked or now - st.get("last_start", 0) > 600:  # 10 分钟冷却，防止库存不足时狂刷
                 st["last_start"] = now
-                start_instance(cfg)
-                events.append(f"🔄 {tag} 实例处于停机，已发送开机指令（{used:.2f} GB）")
+                try:
+                    start_instance(cfg)
+                    events.append(f"🔄 {tag} 实例处于停机，已发送开机指令（{used:.2f} GB）")
+                    st.pop("start_fail", None)
+                except AliError as e:
+                    if not st.get("start_fail"):  # 开机失败只报第一次，之后每 10 分钟静默重试
+                        events.append(f"❌ {tag} 开机失败，之后每 10 分钟自动重试：{e}"
+                                      + ("\n库存不足（抢占式/节省停机常见），等库存恢复会自动开起来" if "NoStock" in str(e) else ""))
+                    st["start_fail"] = str(e)[:200]
+        elif status == "Running" and st.pop("start_fail", None):
+            events.append(f"✅ {tag} 实例已恢复运行")
     except AliError as e:
-        events.append(f"❌ {tag} 操作失败：{e}" + ("\n库存不足：节省停机释放了算力，换时段/换可用区或改 KeepCharging" if "NoStock" in str(e) else ""))
+        events.append(f"❌ {tag} 操作失败：{e}")
 
     st.update({
         "locked": locked, "samples": samples[-30:], "updated": now,
         "used_gb": round(used, 3), "by_region": {k: round(v, 3) for k, v in by_region.items()},
         "rate_gbh": round(rate, 3), "quota_gb": cfg.quota, "limit_gb": cfg.limit, "cls": cfg.cls,
         "mode": cfg.mode, "instance": cfg.instance, "region": cfg.region,
-        "status": status, "ip": inst["ip"], "name": inst["name"],
+        "status": status, "ip": inst["ip"], "name": inst["name"], "bw_out": inst.get("bw_out", 0),
+        "cost_limit": cfg.cost_limit, "cost_locked": cost_locked,
     })
     save_state(cfg, st)
     for ev in events:
         notify(cfg, ev)
-    print(f"{datetime.now():%F %T} used={used:.3f}GB rate={rate:.2f}GB/h proj={projected:.2f} status={status} locked={locked} hold={st.get('hold', False)}")
+    print(f"{datetime.now():%F %T} used={used:.3f}GB rate={rate:.2f}GB/h proj={projected:.2f} status={status} "
+          f"locked={locked} cost={cost:.4f}{cur} cost_locked={cost_locked} hold={st.get('hold', False)}")
     return 0
 
 
@@ -348,8 +421,10 @@ def format_report(st, now=None):
     pct = used / quota * 100 if quota else 0
     bar = "▓" * min(10, int(pct / 10)) + "░" * (10 - min(10, int(pct / 10)))
     age = int((now - st["updated"]) / 60)
-    if st.get("locked"):
-        guard = "🛑 已熔断" + ("（关机）" if st.get("mode") == "stop" else "（安全组封禁）")
+    if st.get("cost_locked"):
+        guard = "🛑 费用熔断（关机）"
+    elif st.get("locked"):
+        guard = "🛑 流量熔断" + ("（关机）" if st.get("mode") == "stop" else "（安全组封禁）")
     elif st.get("hold"):
         guard = "⏸ 暂停自启"
     else:
@@ -364,6 +439,10 @@ def format_report(st, now=None):
     ]
     if len(st.get("by_region", {})) > 1:
         lines.append(" / ".join(f"{r} {g:.1f}" for r, g in sorted(st["by_region"].items())))
+    if st.get("cost_limit"):
+        cur = st.get("currency", "USD")
+        lines.append(f"本月应付 {st.get('cost', 0):.2f} / 熔断 {st['cost_limit']:g} {cur}"
+                     + (" · 🛑 已费用熔断" if st.get("cost_locked") else ""))
     if st.get("fail"):
         lines.append(f"⚠️ 最近 {st['fail']} 次查询失败：{st.get('last_error', '')[:80]}")
     lines.append(f"更新于 {age} 分钟前" if age > 0 else "刚刚更新")
@@ -397,8 +476,10 @@ def main(argv):
         if cfg.mode == "sg" and cfg.instance:
             print("已删除安全组 drop 规则" if sg_unlock(cfg, get_instance(cfg)) else "安全组里没有 cdt-guard 规则")
         st["locked"] = False
+        st.pop("cost_lock", None)  # 费用熔断也一并解除；本月再超线会再次熔断——想放行就把 COST_LIMIT 调高
+        st["cost_ts"] = 0
         save_state(cfg, st)
-        print("已解除熔断状态")
+        print("已解除流量/费用熔断状态")
         return 0
     if cmd in ("hold", "release"):
         st = load_state(cfg)
