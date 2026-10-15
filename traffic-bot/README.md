@@ -12,6 +12,7 @@
 | 🖥 搬瓦工 BWH | 流量已用 / 套餐总量、日均可用 | 按 VPS 自己的重置日 |
 | ☁️ AWS Lightsail | 每台实例的流量（入+出）/ 套餐额度 | UTC 自然月 |
 | 🌐 AWS CloudFront | 出流量 / 1TB，请求数 / 1000 万，月底预测 | UTC 自然月 |
+| 💵 AWS 账单 | 本月预估总额、每个收费服务的金额，可设金额告警 | UTC 自然月 |
 | ⚡ Cloudflare Workers & Pages | 今日请求 / 10 万，账期内请求数与 CPU 时间 | 每天 00:00 UTC |
 | 🪣 Cloudflare R2 | 存储 / 10GB，Class A / 100 万，Class B / 1000 万 | 自然月 |
 | 🗄 Cloudflare D1 | 今日读取行 / 500 万，写入行 / 10 万，存储 / 5GB，每个库的大小 / 500MB | 每天 00:00 UTC |
@@ -102,7 +103,8 @@
            "lightsail:GetInstances",
            "lightsail:GetInstanceMetricData",
            "cloudfront:ListDistributions",
-           "cloudwatch:GetMetricData"
+           "cloudwatch:GetMetricStatistics",
+           "cloudwatch:ListMetrics"
          ],
          "Resource": "*"
        }
@@ -132,6 +134,20 @@
 Lightsail 实例所在的区域。在 [Lightsail 控制台](https://lightsail.aws.amazon.com/) 的实例卡片上能看到位置，例如 “Tokyo, Zone A (ap-northeast-1a)”，去掉最后的字母 `a` 就是区域代码。不在东京的话，安装后到 `/etc/traffic-bot.env` 里取消这一行的注释并修改。
 
 CloudFront 是全局服务，不需要填区域。
+
+> bot 只调用 CloudWatch 的 `GetMetricStatistics` / `ListMetrics`，它们算在每月 100 万次免费 API 请求里。**不要**换成 `GetMetricData`：它不在免费范围内，按请求的指标数收费（每 1000 个 $0.01）。旧版本用的是它，每 10 分钟查一次，一个月会产生几美分账单。
+
+**AWS 账单（开启一次即可）**
+
+账单数据来自 CloudWatch 的账单指标，默认是关闭的，要用主账号（root）或有账单权限的用户开启一次：
+
+1. 打开 [Billing and Cost Management 控制台](https://console.aws.amazon.com/costmanagement/)。
+2. 左侧 **Billing preferences**（账单首选项）。
+3. **Alert preferences**（提醒首选项）右边点 **Edit**。
+4. 勾选 **Receive CloudWatch Billing Alerts**（接收 CloudWatch 账单提醒），点 **Save preferences**。
+5. 约 15 分钟后开始有数据。这个选项开启后不能关闭，但它本身不收费。
+
+账单显示的是本月税前预估，AWS 每天更新几次，所以会比控制台“账单”页面晚几个小时。不想看账单就把 `AWS_BILL` 设为 `0`。
 
 ---
 
@@ -296,6 +312,7 @@ sudo bash install.sh
 | `/start` | 显示说明（白名单里的 chat 启动时就会自动注册定时播报） |
 | `/check` | 查询全部平台 |
 | `/cloudfront`、`/cf` | 只查 CloudFront |
+| `/bill`、`/awsbill` | 只查 AWS 本月账单（总额和收费项目） |
 | `/cloudflare` | 只查 Cloudflare（Workers & Pages、R2、D1、CDN） |
 | `/oracle`、`/oci` | 只查 Oracle Cloud |
 | `/aliyun`、`/cdt` | 只查阿里云 CDT |
@@ -335,6 +352,9 @@ sudo bash install.sh
 | `BWH_TOTAL_GB` | `2000` | BWH 套餐流量（GB） |
 | `AWS_ACCESS_KEY`、`AWS_SECRET_KEY` | — | 见 ③；留空则用 boto3 默认凭证链 |
 | `LIGHTSAIL_REGION` | `ap-northeast-1` | Lightsail 区域 |
+| `AWS_BILL` | `1` | 显示 AWS 本月账单，`0` 关闭 |
+| `AWS_BILL_LIMIT_USD` | `1` | 本月账单越过这个金额的 80% / 95% 时告警，`0` 不告警 |
+| `AWS_BILL_CACHE_MIN` | `60` | 账单查询结果缓存多久（分钟） |
 | `CLOUDFRONT_LIMIT_GB` | `1024` | CloudFront 免费流量（GB） |
 | `CLOUDFRONT_LIMIT_REQUESTS` | `10000000` | CloudFront 免费请求数 |
 | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID` | — | 见 ④ |
@@ -412,7 +432,11 @@ sudo nano /etc/traffic-bot.env                  # 改配置（改完 restart）
 
 **AWS 显示 `AccessDenied`**
 
-IAM 策略缺少某个 Action。对照 ③ 的策略，检查四个 Action 是否都在。Lightsail 显示“无活跃实例”时，检查 `LIGHTSAIL_REGION`。
+IAM 策略缺少某个 Action。对照 ③ 的策略，检查五个 Action 是否都在。Lightsail 显示“无活跃实例”时，检查 `LIGHTSAIL_REGION`。
+
+**AWS 账单显示“没有账单数据”**
+
+还没开启 CloudWatch 账单指标，按 ③ 里“AWS 账单”的步骤开启，等 15 分钟。
 
 **阿里云 CDT 提示数据未更新**
 

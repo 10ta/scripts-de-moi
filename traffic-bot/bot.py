@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""流量监控 Telegram Bot：BWH + AWS Lightsail + AWS CloudFront + Cloudflare(Workers/Pages、R2、D1、CDN) + Oracle Cloud
+"""流量监控 Telegram Bot：BWH + AWS Lightsail + AWS CloudFront + AWS 账单 + Cloudflare(Workers/Pages、R2、D1、CDN) + Oracle Cloud
                          + 阿里云 CDT
 
 依赖：pip install "python-telegram-bot[job-queue]" boto3 requests oci
@@ -40,6 +40,10 @@ BWH_VEID = os.getenv("BWH_VEID", "")
 
 BWH_TOTAL_GB = float(os.getenv("BWH_TOTAL_GB", "2000"))
 LIGHTSAIL_REGION = os.getenv("LIGHTSAIL_REGION", "ap-northeast-1")
+# AWS 账单（CloudWatch 账单指标，需在 Billing preferences 开启 Receive CloudWatch Billing Alerts）
+AWS_BILL = os.getenv("AWS_BILL", "1") not in ("0", "false", "no", "")
+AWS_BILL_LIMIT_USD = float(os.getenv("AWS_BILL_LIMIT_USD", "1"))   # 本月账单越过它的 80%/95% 时告警，0 = 不告警
+AWS_BILL_CACHE_MIN = float(os.getenv("AWS_BILL_CACHE_MIN", "60"))  # 账单数据每天只更新几次，不必每次都查
 
 # CloudFront 免费额度（按 UTC 自然月）。兼容旧变量名 CF_LIMIT_*
 CLOUDFRONT_LIMIT_GB = float(os.getenv("CLOUDFRONT_LIMIT_GB", os.getenv("CF_LIMIT_GB", "1024")))
@@ -320,36 +324,16 @@ def get_cloudfront_data() -> Section:
         cw = aws_client("cloudwatch", "us-east-1")
         totals = {"Requests": 0.0, "BytesDownloaded": 0.0}
 
-        for i in range(0, len(dist_ids), 100):  # 每次最多 200 个查询
-            queries = []
-            for j, dist_id in enumerate(dist_ids[i:i + 100]):
-                for prefix, metric in (("r", "Requests"), ("b", "BytesDownloaded")):
-                    queries.append({
-                        "Id": f"{prefix}{j}",
-                        "MetricStat": {
-                            "Metric": {
-                                "Namespace": "AWS/CloudFront",
-                                "MetricName": metric,
-                                "Dimensions": [
-                                    {"Name": "DistributionId", "Value": dist_id},
-                                    {"Name": "Region", "Value": "Global"},
-                                ],
-                            },
-                            "Period": 86400,
-                            "Stat": "Sum",
-                        },
-                        "ReturnData": True,
-                    })
-
-            kwargs = {"MetricDataQueries": queries, "StartTime": start, "EndTime": now}
-            while True:
-                resp = cw.get_metric_data(**kwargs)
-                for r in resp["MetricDataResults"]:
-                    key = "Requests" if r["Id"].startswith("r") else "BytesDownloaded"
-                    totals[key] += sum(r["Values"])  # 分页时同一 Id 可能多次出现，累加即可
-                if not resp.get("NextToken"):
-                    break
-                kwargs["NextToken"] = resp["NextToken"]
+        # 用 GetMetricStatistics 而不是 GetMetricData：前者算在 CloudWatch 每月 100 万次免费 API 请求里，
+        # 后者按"请求的指标数"收费（$0.01 / 1000 个），每 10 分钟查一次一个月也会产生几美分
+        for dist_id in dist_ids:
+            for metric in totals:
+                resp = cw.get_metric_statistics(
+                    Namespace="AWS/CloudFront", MetricName=metric,
+                    Dimensions=[{"Name": "DistributionId", "Value": dist_id}, {"Name": "Region", "Value": "Global"}],
+                    StartTime=start, EndTime=now, Period=86400, Statistics=["Sum"],
+                )
+                totals[metric] += sum(p.get("Sum", 0) for p in resp.get("Datapoints", []))
 
         used_gb = totals["BytesDownloaded"] / 1024**3
         used_req = totals["Requests"]
@@ -383,6 +367,83 @@ def get_cloudfront_data() -> Section:
     except Exception as e:
         logger.exception("CloudFront 查询失败")
         return Section(f"🌐 CloudFront\n❌ 查询失败：{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------- AWS 账单
+_bill_cache = {"ts": 0.0, "section": None}
+
+
+def get_aws_bill_data() -> Section:
+    """本月预估账单（总额 + 按服务的收费项目），来自 CloudWatch 的 AWS/Billing 指标。
+    只用 ListMetrics / GetMetricStatistics，属于 CloudWatch 免费 API 请求；不用 Cost Explorer（每次调用 $0.01）。
+    账单数据 AWS 每天只更新几次，所以结果缓存 AWS_BILL_CACHE_MIN 分钟"""
+    if _bill_cache["section"] and time.monotonic() - _bill_cache["ts"] < AWS_BILL_CACHE_MIN * 60:
+        return _bill_cache["section"]
+    title = "💵 AWS 账单 · 本月预估"
+    try:
+        now = datetime.now(timezone.utc)
+        start = month_start(now)
+        cw = aws_client("cloudwatch", "us-east-1")  # 账单指标只在 us-east-1
+
+        metrics = []
+        for page in cw.get_paginator("list_metrics").paginate(Namespace="AWS/Billing", MetricName="EstimatedCharges"):
+            metrics += page.get("Metrics", [])
+        if not metrics:
+            sec = Section(f"{title}\n❔ 没有账单数据。到 Billing → Billing preferences → Alert preferences "
+                          "勾选 Receive CloudWatch Billing Alerts，约 15 分钟后生效")
+            _bill_cache.update(ts=time.monotonic(), section=sec)
+            return sec
+
+        def latest(dims: list):
+            """本月最新一个数据点（月初 AWS 会把值清零重新累计）；本月还没数据时返回 (None, 0)"""
+            resp = cw.get_metric_statistics(
+                Namespace="AWS/Billing", MetricName="EstimatedCharges", Dimensions=dims,
+                StartTime=start, EndTime=now, Period=21600, Statistics=["Maximum"],
+            )
+            pts = resp.get("Datapoints", [])
+            if not pts:
+                return None, 0.0
+            p = max(pts, key=lambda x: x["Timestamp"])
+            return p["Timestamp"], float(p["Maximum"])
+
+        total, total_ts, items = None, None, []
+        for m in metrics:
+            dims = {d["Name"]: d["Value"] for d in m.get("Dimensions", [])}
+            if dims.get("Currency", "USD") != "USD":
+                continue
+            ts, val = latest(m["Dimensions"])
+            if "ServiceName" in dims:
+                if val >= 0.005:  # 只列出有费用的服务
+                    items.append((dims["ServiceName"], val))
+            elif "LinkedAccount" not in dims:
+                total, total_ts = val, ts
+
+        if total is None:
+            total = sum(v for _, v in items)
+        lines = [title, f"💰 总额 USD {total:.2f}"]
+        if items:
+            for name, val in sorted(items, key=lambda x: -x[1]):
+                lines.append(f"└ {name} · USD {val:.2f}")
+        else:
+            lines.append("└ 没有收费项目")
+        if total_ts:
+            lines.append(f"🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
+                         f"{total_ts.astimezone(REPORT_TZ):%H:%M}（税前预估，AWS 每天更新几次）")
+
+        metrics_out = []
+        if AWS_BILL_LIMIT_USD > 0:
+            pct = total / AWS_BILL_LIMIT_USD * 100
+            lines.append(f"🛡 告警线 USD {AWS_BILL_LIMIT_USD:g}（已到 {pct:.0f}%）")
+            metrics_out.append(Metric("aws:bill", "AWS 本月账单", pct, now.strftime("%Y-%m"),
+                                      f"USD {total:.2f} / {AWS_BILL_LIMIT_USD:g}"))
+        sec = Section("\n".join(lines), metrics_out)
+        _bill_cache.update(ts=time.monotonic(), section=sec)
+        return sec
+    except Exception as e:
+        logger.exception("AWS 账单查询失败")
+        hint = "（IAM 策略需要 cloudwatch:ListMetrics 和 cloudwatch:GetMetricStatistics）" \
+            if "AccessDenied" in str(e) else ""
+        return Section(f"{title}\n❌ 查询失败：{type(e).__name__}: {e}{hint}")
 
 
 # ---------------------------------------------------------------- Cloudflare
@@ -1153,6 +1214,7 @@ PROVIDERS = [
     (lambda: bool(BWH_API_KEY and BWH_VEID), get_bwh_data),
     (lambda: True, get_aws_data),
     (lambda: True, get_cloudfront_data),
+    (lambda: AWS_BILL, get_aws_bill_data),
     (lambda: bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), get_cloudflare_data),
     (oci_enabled, get_oracle_data),
     (cdt_enabled, get_aliyun_data),
@@ -1304,7 +1366,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "流量监控助手已启动。\n"
         "/check - 查询全部\n/cloudfront - 只查 CloudFront\n/cloudflare - 只查 Cloudflare\n"
-        "/oracle - 只查 Oracle Cloud\n/aliyun - 只查阿里云 CDT\n"
+        "/bill - 只查 AWS 账单\n/oracle - 只查 Oracle Cloud\n/aliyun - 只查阿里云 CDT\n"
         f"{interval}；用量越过 {thresholds} 会立即推送告警。"
     )
 
@@ -1335,6 +1397,12 @@ async def cloudflare_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @restricted
+async def bill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bill_cache["ts"] = 0  # 手动查询时跳过缓存
+    await _single(update, "AWS 账单", get_aws_bill_data)
+
+
+@restricted
 async def oracle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not oci_enabled():
         await update.message.reply_text("未配置 OCI_TENANCY / OCI_USER / OCI_FINGERPRINT")
@@ -1361,7 +1429,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start - 开启定时播报与告警\n/check - 查询全部\n"
         "/cloudfront（或 /cf）- 只查 CloudFront\n/cloudflare - 只查 Cloudflare\n"
-        "/oracle（或 /oci）- 只查 Oracle Cloud\n"
+        "/bill - 只查 AWS 账单\n/oracle（或 /oci）- 只查 Oracle Cloud\n"
         "/aliyun（或 /cdt）- 只查阿里云 CDT"
     )
 
@@ -1384,6 +1452,7 @@ def main():
     app.add_handler(CommandHandler(["cloudfront", "cf"], cloudfront_command))
     app.add_handler(CommandHandler("cloudflare", cloudflare_command))
     app.add_handler(CommandHandler(["oracle", "oci"], oracle_command))
+    app.add_handler(CommandHandler(["bill", "awsbill"], bill_command))
     app.add_handler(CommandHandler(["aliyun", "cdt"], aliyun_command))
     app.add_handler(CommandHandler("help", help_command))
 

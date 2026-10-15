@@ -76,6 +76,10 @@ ALLOWED_CHAT_IDS="$ALLOWED_CHAT_IDS"
 # AWS 凭证。留空则使用 boto3 默认凭证链（例如实例角色）
 AWS_ACCESS_KEY="$AWS_ACCESS_KEY"
 AWS_SECRET_KEY="$AWS_SECRET_KEY"
+# AWS 本月账单（总额 + 收费项目）。需在 Billing preferences 勾选 Receive CloudWatch Billing Alerts
+AWS_BILL="1"
+# 本月账单越过这个金额的 80%/95% 时告警（USD，0=不告警）
+AWS_BILL_LIMIT_USD="1"
 
 # 搬瓦工。不用 BWH 可留空（BWH 部分会显示查询失败）
 BWH_API_KEY="$BWH_API_KEY"
@@ -235,6 +239,8 @@ if [[ -f "$ENV_FILE" ]]; then
   ensure_line ALERT_CHECK_MINUTES "10"
   ensure_line CLOUDFLARE_BILLING_DAY "8"
   ensure_line OCI_IDLE_CHECK "0"
+  ensure_line AWS_BILL "1"
+  ensure_line AWS_BILL_LIMIT_USD "1"
 else
   BOT_TOKEN="" ALLOWED_CHAT_IDS="" AWS_ACCESS_KEY="" AWS_SECRET_KEY="" BWH_API_KEY="" BWH_VEID=""
   if [[ -t 0 ]]; then
@@ -263,7 +269,7 @@ fi
 # ---------------------------------------------------------------- 4. systemd 服务
 cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Traffic usage Telegram bot (BWH / Lightsail / CloudFront / Cloudflare / Oracle / Aliyun CDT)
+Description=Traffic usage Telegram bot (BWH / Lightsail / CloudFront / AWS bill / Cloudflare / Oracle / Aliyun CDT)
 After=network-online.target
 Wants=network-online.target
 
