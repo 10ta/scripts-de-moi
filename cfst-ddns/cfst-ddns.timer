@@ -1,0 +1,11 @@
+[Unit]
+Description=定时运行 cfst-ddns
+
+[Timer]
+# 开机 3 分钟后跑一次，之后每次启动后隔 1 小时再跑
+OnBootSec=3min
+OnUnitActiveSec=1h
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
