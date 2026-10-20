@@ -43,7 +43,7 @@ IPv4 写 A 记录，IPv6 写 AAAA 记录。记录会被设为 **DNS only（灰�
 
 | 文件 | 安装位置 | 作用 |
 |---|---|---|
-| `install.sh` | — | 安装 / 升级：下载最新 cfst，创建用户，安装脚本和 systemd 单元 |
+| `install.sh` | — | 安装 / 升级：创建用户，安装脚本和 systemd 单元；首次安装时下载 cfst |
 | `cfst-ddns.sh` | `/opt/cfst-ddns/` | 主脚本：调度 + 测速 + 更新 DNS + 发送简报 |
 | `cfst-ddns@.service` | `/etc/systemd/system/` | 服务模板，`%i` 是模式（auto / check / pool / full），沙箱化运行，最长 30 分钟 |
 | `cfst-ddns.timer` | `/etc/systemd/system/` | 每 5 分钟触发一次 `cfst-ddns@auto` |
@@ -64,7 +64,16 @@ sudo ./install.sh
 - `GH_PROXY=https://你的反代前缀/`：GitHub 下载慢时使用
 - `CFST_UID=951`：默认 UID 950 被占用时指定其他值
 
-升级时重新执行 `sudo ./install.sh` 即可：已有的 `/etc/cfst-ddns.env` 不会被覆盖，旧版的 `cfst-ddns.service` 会被自动清理。新版本新增的配置项都有默认值，不补也能跑；想调整就参照 `cfst-ddns.env.example` 补进去。
+升级时 `git pull` 后重新执行 `sudo ./install.sh` 即可，几秒完成：
+- cfst 已经装过就不会重新下载；想顺便升级 cfst 用 `sudo UPDATE_CFST=1 ./install.sh`
+- 已有的 `/etc/cfst-ddns.env` 不会被覆盖，旧版的 `cfst-ddns.service` 会被自动清理
+- 新增的配置项都有默认值，不补也能跑。查看 env 里还缺哪些（bash 和 fish 都能用）：
+
+```bash
+bash -c "comm -23 <(grep -oE '^#?[A-Z_]+=' cfst-ddns.env.example | tr -d '#' | sort -u) <(grep -oE '^[A-Z_]+=' /etc/cfst-ddns.env | sort -u)"
+```
+
+日志第一行的 `cfst-ddns <版本号>` 可以确认跑的是不是新版。
 
 ## 配置
 
@@ -147,7 +156,8 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 
 ### 选 IP 的规则
 
-1. **延迟测速**：淘汰延迟超过 `-tl`、丢包超过 `-tlr` 的
+1. **延迟测速**：cfst 先测出所有能连通的 IP，脚本再按 `-tl`（延迟上限）、`-tll`（延迟下限）、`-tlr`（丢包率上限）筛选。日志会分别写出可连通多少、满足限制条件多少、种子各多少，以及当前 IP 本轮的实际延迟，能直接看出是连不上还是超出限制
+   - 全量扫描时如果一个都不满足，就放宽为全部可连通的 IP 继续测速（简报里会注明「已放宽」）；巡检和复测榜单不放宽，直接升级到下一级
 2. **挑候选**（全量扫描时，结果就是榜单）
    - **分段**（`LATENCY_SPLIT > 0`）：以该延迟为界分两段，每段取丢包最少、延迟最低的 `PICK_PER_GROUP` 个
    - **不分段**（`LATENCY_SPLIT = 0`）：取延迟最低的 `PICK_PER_GROUP` 个
@@ -350,9 +360,11 @@ sudo systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
 当前解析: cf.example.com (A) = 104.18.x.x（API 经代理 socks5h://127.0.0.1:2080）
 ===== 全量扫描 =====
 延迟测速（全部 IP）: cfst -tl 250 -dt 5 -dd
-  [15s] 延迟测速：已测 881/5955 个 IP，延迟合格 292 个
+  [15s] 延迟测速：已测 881/5955 个 IP，可连通 292 个（限制条件最后统一筛）
   ...
-  延迟合格 1696 个：<150ms 段 420 个，≥150ms 段 1276 个
+  测了 6044 个 IP：可连通 1893 个（最低延迟 52ms），满足限制条件（延迟 ≤250ms）1696 个
+  其中种子 78 个：可连通 70 个（最低延迟 61ms），满足限制条件 66 个
+  参与挑选 1696 个（其中种子 66 个）：<150ms 段 420 个，≥150ms 段 1276 个
   新榜单 10 个 IP
 下载测速: 11 个 IP
 结果（IP / 延迟ms / 丢包 / 下载MB/s）：

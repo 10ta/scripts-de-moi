@@ -31,16 +31,21 @@ case "$(uname -m)" in
 esac
 
 mkdir -p "$DIR"
-echo "下载 cfst (linux_${ARCH}) ..."
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-curl -fL "${GH_PROXY}https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_${ARCH}.tar.gz" \
-  | tar -xz -C "$TMP"
-# 新版压缩包里多了一层 cfst_linux_<arch>/ 目录，旧版没有，两种都兼容
-BIN=$(find "$TMP" -type f -name cfst | head -n1)
-[[ -n "$BIN" ]] || { echo "压缩包里没找到 cfst"; exit 1; }
-SRC=$(dirname "$BIN")
-install -m 755 "$SRC/cfst" "$DIR/cfst"
-install -m 644 "$SRC/ip.txt" "$SRC/ipv6.txt" "$DIR/"
+# cfst 已装过就不再下载；想顺便升级 cfst：UPDATE_CFST=1 ./install.sh
+if [[ -x "$DIR/cfst" && -s "$DIR/ip.txt" && -z "${UPDATE_CFST:-}" ]]; then
+  echo "cfst 已安装，跳过下载（升级 cfst：UPDATE_CFST=1 ./install.sh）"
+else
+  echo "下载 cfst (linux_${ARCH}) ..."
+  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  curl -fL "${GH_PROXY}https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_${ARCH}.tar.gz" \
+    | tar -xz -C "$TMP"
+  # 新版压缩包里多了一层 cfst_linux_<arch>/ 目录，旧版没有，两种都兼容
+  BIN=$(find "$TMP" -type f -name cfst | head -n1)
+  [[ -n "$BIN" ]] || { echo "压缩包里没找到 cfst"; exit 1; }
+  SRC=$(dirname "$BIN")
+  install -m 755 "$SRC/cfst" "$DIR/cfst"
+  install -m 644 "$SRC/ip.txt" "$SRC/ipv6.txt" "$DIR/"
+fi
 
 install -m 755 cfst-ddns.sh "$DIR/cfst-ddns.sh"
 
@@ -74,5 +79,6 @@ if [[ -n "$ENV_KEPT" ]]; then
   echo
   echo "注意：/etc/cfst-ddns.env 已存在，没有覆盖。新版本新增的配置项请参照 cfst-ddns.env.example 补进去"
   echo "      （不补也能跑，都有默认值）。可以这样对比缺了哪些："
-  echo "      diff <(grep -oE '^#?[A-Z_]+=' cfst-ddns.env.example | tr -d '#' | sort -u) <(grep -oE '^[A-Z_]+=' /etc/cfst-ddns.env | sort -u)"
+  echo "      bash -c \"comm -23 <(grep -oE '^#?[A-Z_]+=' cfst-ddns.env.example | tr -d '#' | sort -u) <(grep -oE '^[A-Z_]+=' /etc/cfst-ddns.env | sort -u)\""
+  echo "      （列出的是 env 里还没有的配置项，不管用的是 bash 还是 fish 都能直接粘贴）"
 fi

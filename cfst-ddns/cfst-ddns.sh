@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.20"
+VERSION="2026.10.20.2"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -175,7 +175,7 @@ mode_name() { case "$1" in check) echo 巡检 ;; pool) echo 复测榜单 ;; full
 
 # 运行状态，结束时用来写日志和 Telegram 简报
 KIND=""; REASON=""; WHY=""; PATH_DESC=""; IP=""; OLD_IP=""; LAT=""; LOSS=""; SPEED=""; GROUP=""; SRC=""; COMPARE=""
-PID=""; t=0; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""
+PID=""; t=0; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""
 
 # ---------- 状态文件：上次全量/巡检时间、当前 IP 的基准速度 ----------
 STATE="$WORK/state"
@@ -218,6 +218,7 @@ notify() {
                [[ -n "$OLD_IP" ]] && msg+=$'\n'"$(md "当前解析：")$(code "$OLD_IP")" ;;
   esac
   [[ -n "$WHY" && "$KIND" != failed ]] && msg+=$'\n'"$(md "说明：$WHY")"
+  [[ -n "$SCAN_NOTE" && "$KIND" != healthy ]] && msg+=$'\n'"$(md "延迟筛选：$SCAN_NOTE")"
   if [[ -n "$IP" && "$KIND" != failed ]]; then
     stat="延迟 ${LAT} ms${GROUP:+（$GROUP）} · 丢包 ${LOSS}"
     [[ -n "$METRIC" ]] && stat+=" · ${METRIC} ${SPEED} MB/s"
@@ -312,7 +313,7 @@ progress() {
   case "$phase" in
     开始延迟测速)
       avail=$(grep -aoE '可用: *[0-9]+' <<<"$tail" | tail -n1 | grep -oE '[0-9]+') || true
-      echo "  [${1}s] 延迟测速：已测 ${cur:-0/?} 个 IP，延迟合格 ${avail:-0} 个" ;;
+      echo "  [${1}s] 延迟测速：已测 ${cur:-0/?} 个 IP，可连通 ${avail:-0} 个（限制条件最后统一筛）" ;;
     开始下载测速)
       hdr=$(grep -aoE '开始下载测速.{0,80}' <<<"$log" | tail -n1) || true
       lim=$(grep -aoE '下限：[0-9.]+' <<<"$hdr" | grep -oE '[0-9.]+$') || true
@@ -346,8 +347,57 @@ split_on() { awk -v s="$LATENCY_SPLIT" 'BEGIN{exit !(s+0>0)}'; }
 group_of() { awk -v l="$1" -v s="$LATENCY_SPLIT" 'BEGIN{ if (s+0>0) printf (l+0<s+0 ? "<%sms 段" : "≥%sms 段"), s }'; }
 row_of()   { awk -F, -v ip="$1" 'NR>1 && $1==ip { print; exit }' "$2"; }
 
-# ping_list 文件 —— 只测这些 IP 的延迟（-dd），结果写到 latency.csv
-ping_list() { run_cfst latency.csv "${ARGS[@]}" -f "$1" -dd; }
+# 延迟限制条件（来自 CFST_ARGS 的 -tl / -tll / -tlr）的一句话描述
+limits_desc() {
+  local s
+  if awk -v a="$TL" 'BEGIN{exit !(a+0 >= 9999)}'; then s="延迟不限"; else s="延迟 ≤${TL}ms"; fi
+  awk -v a="$TLL" 'BEGIN{exit !(a+0 > 0)}' && s+=" 且 ≥${TLL}ms"
+  awk -v a="$TLR" 'BEGIN{exit !(a+0 < 1)}' && s+=" · 丢包率 ≤${TLR}"
+  echo "$s"
+}
+
+# 某个 IP 本轮的延迟情况（给"为什么没入选"用）
+ip_lat_desc() {
+  local r loss lat
+  r=$(row_of "$1" latency.all.csv)
+  if [[ -z "$r" ]]; then echo "连不上（TCP 握手全部失败）"; return; fi
+  IFS=, read -r _ _ _ loss lat _ <<<"$r"
+  echo "延迟 ${lat}ms · 丢包率 ${loss}"
+}
+
+# ping_list 文件 [relax] —— 测这些 IP 的延迟。cfst 不带 -tl/-tll/-tlr 跑，拿到全部能连通的 IP（latency.all.csv），
+# 再由脚本按限制条件筛到 latency.csv：这样能说清楚每个 IP 是连不上还是超出限制。
+# 带 relax 时（全量扫描），一个都不满足就放宽：用全部能连通的 IP 继续，免得整轮白跑。
+ping_list() {
+  local reach pass min seed
+  run_cfst latency.all.csv "${LAT_ARGS[@]}" -f "$1" -dd
+  [[ -s latency.all.csv ]] || : > latency.all.csv            # 一个都连不上时 cfst 不写文件
+  LAT_RELAXED=""
+  if [[ -s latency.all.csv ]]; then
+    awk -F, -v tl="$TL" -v tll="$TLL" -v tlr="$TLR" \
+      'NR == 1 || ($5 + 0 <= tl + 0 && $5 + 0 >= tll + 0 && $4 + 0 <= tlr + 0)' latency.all.csv > latency.csv
+  else : > latency.csv; fi
+  reach=$(rows latency.all.csv); pass=$(rows latency.csv)
+  min=$(awk -F, 'NR > 1 && (m == "" || $5 + 0 < m) { m = $5 + 0 } END { if (m != "") printf "%.0f", m }' latency.all.csv)
+  echo "  测了 $(awk 'NF' "$1" | wc -l) 个 IP：可连通 ${reach} 个${min:+（最低延迟 ${min}ms）}，满足限制条件（$(limits_desc)）${pass} 个"
+  SCAN_NOTE="可连通 ${reach}${min:+（最低 ${min}ms）}，满足 $(limits_desc) 的 ${pass} 个"
+  # 种子单独统计：到底是连不上、超出限制，还是被官方 IP 比下去了
+  if [[ "$MODE" != check && -s seeds.txt ]]; then
+    seed=$(awk -F, '
+      FILENAME == ARGV[1] { s[$1] = 1; n++; next }
+      FILENAME == ARGV[2] { if (FNR > 1 && ($1 in s)) { r++; if (m == "" || $5 + 0 < m) m = $5 + 0 }; next }
+      FNR > 1 && ($1 in s) { p++ }
+      END { printf "%d %d %d %s", n, r + 0, p + 0, (m == "" ? "" : sprintf("%.0f", m)) }' seeds.txt latency.all.csv latency.csv)
+    read -r sn sr sp sm <<<"$seed"
+    echo "  其中种子 ${sn} 个：可连通 ${sr} 个${sm:+（最低延迟 ${sm}ms）}，满足限制条件 ${sp} 个"
+    SCAN_NOTE+="；种子 ${sn} 个，可连通 ${sr}，满足 ${sp}"
+  fi
+  if (( pass == 0 && reach > 0 )) && [[ "${2:-}" == relax ]]; then
+    cp latency.all.csv latency.csv; LAT_RELAXED=1
+    echo "  没有 IP 满足限制条件，本轮放宽：用全部 ${reach} 个可连通的 IP 继续（按丢包、延迟排序）"
+    SCAN_NOTE+="；无 IP 满足限制，已放宽"
+  fi
+}
 
 # ---------- 来源：官方扫描 / 种子 ----------
 # origin.map：榜单里每个 IP 是从哪来的（"官方" 或 "种子:来源名"），第一次发现时记下，之后一直沿用
@@ -431,9 +481,9 @@ pick_candidates() {
   ns=$(grep -c ',种子:' labeled.csv) || ns=0
   if split_on; then
     read -r nlo nhi < <(awk -F, -v s="$LATENCY_SPLIT" '{ if ($5 + 0 < s + 0) a++; else b++ } END { print a + 0, b + 0 }' labeled.csv)
-    echo "  延迟合格 $((nlo + nhi)) 个（其中种子 ${ns} 个）：<${LATENCY_SPLIT}ms 段 ${nlo} 个，≥${LATENCY_SPLIT}ms 段 ${nhi} 个"
+    echo "  参与挑选 $((nlo + nhi)) 个（其中种子 ${ns} 个）：<${LATENCY_SPLIT}ms 段 ${nlo} 个，≥${LATENCY_SPLIT}ms 段 ${nhi} 个"
   else
-    echo "  延迟合格 $(rows latency.csv) 个（其中种子 ${ns} 个）"
+    echo "  参与挑选 $(rows latency.csv) 个（其中种子 ${ns} 个）"
   fi
 }
 
@@ -521,7 +571,7 @@ speed_test() {
       cut -d, -f1 candidates.csv > candidates.txt
       n=$(wc -l < candidates.txt)
       echo "下载测速: ${n} 个 IP"
-      run_cfst result.csv "${ARGS[@]}" -f candidates.txt -dn "$n" ;;
+      run_cfst result.csv "${LAT_ARGS[@]}" -f candidates.txt -dn "$n" ;;   # 候选已按限制条件筛过，这里不让 cfst 再筛一遍
   esac
   [[ $(rows result.csv) -ge 1 && -n "$METRIC" ]] || return 0
   # 按速度从高到低排序（表头保持在第一行）
@@ -594,12 +644,9 @@ config_brief() {
 
 # 当前 IP 为什么不在测速结果里
 missing_reason() {
-  if [[ -n "$(row_of "$OLD_IP" latency.csv)" ]]; then echo "当前 IP 延迟合格，但测速没有结果"
-  else
-    local tl tlr
-    tl=$(grep -oE -- '-tl [0-9.]+' <<<"$CFST_ARGS" | awk '{print $2}') || tl=""
-    tlr=$(grep -oE -- '-tlr [0-9.]+' <<<"$CFST_ARGS" | awk '{print $2}') || tlr=""
-    echo "当前 IP 这次延迟测速不合格（延迟超过 ${tl:-9999}ms 或丢包超过 ${tlr:-1}，或者连不上），直接换掉"
+  if [[ -n "$(row_of "$OLD_IP" latency.csv)" ]]; then echo "当前 IP 满足限制条件，但测速没有结果"
+  elif [[ -z "$(row_of "$OLD_IP" latency.all.csv)" ]]; then echo "当前 IP 本轮连不上（TCP 握手全部失败），换掉"
+  else echo "当前 IP 本轮$(ip_lat_desc "$OLD_IP")，限制条件：$(limits_desc)，换掉"
   fi
 }
 
@@ -683,7 +730,7 @@ do_check() {
   echo "$OLD_IP" > check.txt
   ping_list check.txt
   if [[ $(rows latency.csv) -lt 1 ]]; then
-    echo "当前 IP 延迟/丢包不合格（或已不可用）"; NEXT=pool; return
+    echo "当前 IP 本轮$(ip_lat_desc "$OLD_IP")，限制条件：$(limits_desc)"; NEXT=pool; return
   fi
   tail -n +2 latency.csv > candidates.csv
   speed_test
@@ -724,7 +771,7 @@ do_pool() {
   echo "复测榜单: $(wc -l < pool.txt) 个 IP（榜单 + 种子 + 当前 IP）"
   ping_list pool.txt
   if [[ $(rows latency.csv) -lt 1 ]]; then
-    echo "榜单里的 IP 延迟全部不合格"; NEXT=full; return
+    echo "榜单里没有满足限制条件的 IP"; NEXT=full; return
   fi
   pick_candidates "$PICK_PER_GROUP"
   add_current
@@ -789,8 +836,8 @@ do_full() {
   if [[ -n "$OLD_IP" ]]; then echo "$OLD_IP" >> scan.txt; fi        # 当前 IP 一定参加，好跟新候选比较
   if [[ -s pool.csv ]]; then tail -n +2 pool.csv | cut -d, -f1 >> scan.txt; fi
   echo "延迟测速（全量）: cfst $CFST_ARGS -dd"
-  ping_list scan.txt
-  [[ $(rows latency.csv) -ge 1 ]] || die "延迟测速没有结果（全部超出延迟/丢包条件？）"
+  ping_list scan.txt relax
+  [[ $(rows latency.csv) -ge 1 ]] || die "延迟测速：扫描的 $(wc -l < scan.txt) 个 IP 全部连不上（TCP 端口 ${TP}），检查本机网络或 sing-box 的 exclude_uid"
   pick_candidates "$PICK_PER_GROUP"
   add_current
   finish_candidates
@@ -801,6 +848,17 @@ do_full() {
 # ---------- 主流程 ----------
 mkdir -p "$WORK"; cd "$WORK"; touch origin.map
 read -ra ARGS <<<"$CFST_ARGS"
+# 拆出延迟限制条件：cfst 延迟测速时不带它们，由脚本自己筛（见 ping_list）
+TL=9999; TLL=0; TLR=1; TP=443; LAT_ARGS=()
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  case "${ARGS[i]}" in
+    -tl)  TL=${ARGS[i+1]:-9999}; i=$((i + 1)) ;;
+    -tll) TLL=${ARGS[i+1]:-0}; i=$((i + 1)) ;;
+    -tlr) TLR=${ARGS[i+1]:-1}; i=$((i + 1)) ;;
+    -tp)  TP=${ARGS[i+1]:-443}; LAT_ARGS+=("${ARGS[i]}" "${ARGS[i+1]}"); i=$((i + 1)) ;;
+    *)    LAT_ARGS+=("${ARGS[i]}") ;;
+  esac
+done
 [[ -n "$IPLIST_URL" && -s iplist.txt ]] && CFST_IPFILE="$WORK/iplist.txt"
 
 # 非 Cloudflare 目标的必填项检查（cfst 默认的下载测速地址在 Cloudflare 上，换 CDN 必须自己给）
@@ -834,7 +892,7 @@ REC_ID=$(jq -r '.result[0].id // empty' <<<"$RESP")
 OLD_IP=$(jq -r '.result[0].content // empty' <<<"$RESP")
 echo "当前解析: $CF_RECORD_NAME ($TYPE) = ${OLD_IP:-<无>}${API_PROXY:+（API 经代理 $API_PROXY）}"
 
-rm -f result.csv latency.csv candidates.csv candidates.txt
+rm -f result.csv latency.csv latency.all.csv candidates.csv candidates.txt
 while :; do
   PATH_DESC+="${PATH_DESC:+ → }$(mode_name "$MODE")"
   echo "===== $(mode_name "$MODE") ====="
