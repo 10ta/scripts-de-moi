@@ -43,23 +43,36 @@ install -m 755 "$SRC/cfst" "$DIR/cfst"
 install -m 644 "$SRC/ip.txt" "$SRC/ipv6.txt" "$DIR/"
 
 install -m 755 cfst-ddns.sh "$DIR/cfst-ddns.sh"
-install -m 644 cfst-ddns.service cfst-ddns.timer /etc/systemd/system/
+
+# 旧版本是单个 cfst-ddns.service，新版本改成 cfst-ddns@.service（按模式运行），这里清理掉旧的
+TIMER_WAS_ON=""
+systemctl is-enabled --quiet cfst-ddns.timer 2>/dev/null && TIMER_WAS_ON=1
+if [[ -f /etc/systemd/system/cfst-ddns.service ]]; then
+  echo "移除旧版 cfst-ddns.service ..."
+  systemctl stop cfst-ddns.timer cfst-ddns.service 2>/dev/null || true
+  rm -f /etc/systemd/system/cfst-ddns.service
+fi
+install -m 644 'cfst-ddns@.service' cfst-ddns.timer /etc/systemd/system/
 ENV_KEPT=""
 if [[ -f /etc/cfst-ddns.env ]]; then ENV_KEPT=1
 else install -m 600 cfst-ddns.env.example /etc/cfst-ddns.env; fi
 systemctl daemon-reload
+if [[ -n "$TIMER_WAS_ON" ]]; then systemctl restart cfst-ddns.timer; echo "已重启 cfst-ddns.timer（新的调度方式已生效）"; fi
 
 cat <<EOF
 
 安装完成，测速用户 cfst-ddns 的 UID 是 ${CFST_UID}。接下来：
   1. sing-box 的 tun inbound 里加上  "exclude_uid": [${CFST_UID}]  然后重启 sing-box
   2. 编辑配置        nano /etc/cfst-ddns.env
-  3. 手动跑一次      systemctl start cfst-ddns.service   （立即返回，测速在后台进行）
-  4. 看进度和结果    journalctl -fu cfst-ddns --output cat
+  3. 手动全量跑一次  systemctl start cfst-ddns@full   （立即返回，测速在后台进行）
+                     其他模式：cfst-ddns@check 巡检 / cfst-ddns@pool 复测榜单
+  4. 看进度和结果    journalctl -fu 'cfst-ddns@*' --output cat
   5. 没问题就启用    systemctl enable --now cfst-ddns.timer
+                     （每 5 分钟检查一次时间表，按 env 里的 FULL_AT / PEAK_* 决定做什么）
 EOF
 if [[ -n "$ENV_KEPT" ]]; then
   echo
-  echo "注意：/etc/cfst-ddns.env 已存在，没有覆盖。新增的配置项（API_PROXY、TG_BOT_TOKEN、TG_CHAT_ID、TG_NOTIFY）"
-  echo "      请参照 cfst-ddns.env.example 自己补进去。"
+  echo "注意：/etc/cfst-ddns.env 已存在，没有覆盖。新版本新增的配置项请参照 cfst-ddns.env.example 补进去"
+  echo "      （不补也能跑，都有默认值）。可以这样对比缺了哪些："
+  echo "      diff <(grep -oE '^#?[A-Z_]+=' cfst-ddns.env.example | tr -d '#' | sort -u) <(grep -oE '^[A-Z_]+=' /etc/cfst-ddns.env | sort -u)"
 fi

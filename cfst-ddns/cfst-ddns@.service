@@ -1,0 +1,26 @@
+[Unit]
+Description=Cloudflare 优选 IP（%i）
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# %i 是模式：auto（timer 用，按 env 里的时间表决定做什么）/ check 巡检 / pool 复测榜单 / full 全量扫描
+# 手动跑：systemctl start cfst-ddns@full    看日志：journalctl -fu 'cfst-ddns@*' --output cat
+# exec：systemctl start 立即返回，测速在后台进行
+Type=exec
+EnvironmentFile=/etc/cfst-ddns.env
+ExecStart=/opt/cfst-ddns/cfst-ddns.sh %i
+# 卡死保护：一次运行超过 30 分钟就结束它（会发失败简报）
+RuntimeMaxSec=30min
+Nice=10
+
+# 以固定 UID 的专用用户运行（由 install.sh 创建），sing-box TUN 用 exclude_uid 放行它直连
+# 只能写 /var/lib/cfst-ddns
+User=cfst-ddns
+Group=cfst-ddns
+StateDirectory=cfst-ddns
+WorkingDirectory=/var/lib/cfst-ddns
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

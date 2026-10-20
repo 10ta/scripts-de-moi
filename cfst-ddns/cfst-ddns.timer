@@ -1,11 +1,13 @@
 [Unit]
-Description=定时运行 cfst-ddns
+Description=cfst-ddns 调度（每 5 分钟检查一次是否到时间）
 
 [Timer]
-# 开机 3 分钟后跑一次，之后每次启动后隔 1 小时再跑
-OnBootSec=3min
-OnUnitActiveSec=1h
-RandomizedDelaySec=2min
+# 只负责"敲门"：真正做不做、做哪一级（巡检 / 复测榜单 / 全量扫描），
+# 由脚本按 /etc/cfst-ddns.env 里的 FULL_AT / PEAK_HOURS / PEAK_EVERY / OFFPEAK_EVERY 决定，
+# 不到时间就什么都不做，几毫秒就退出。改时间表只改 env，不用动这个文件。
+OnCalendar=*:0/5
+AccuracySec=1s
+Unit=cfst-ddns@auto.service
 
 [Install]
 WantedBy=timers.target
