@@ -236,6 +236,24 @@ def bq(lines: list, expandable: bool = False) -> str:
     return f"<{tag}>" + "\n".join(lines) + "</blockquote>"
 
 
+# ---- 脱敏：TG 消息里不出现 IP、网址、域名。实例/分发等只用它们自己的名字区分
+_RE_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"）)]*")
+_RE_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b|\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b")
+_RE_HOST = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|xyz|io|dev|app|cn|me|top|cc|co|info|cloud|site|tech|link|one"
+                      r"|uk|jp|kr|hk|tw|us|de|fr)\b")
+
+
+def looks_like_host(x: str) -> bool:
+    return bool(_RE_HOST.fullmatch(x.strip()) or _RE_IP.fullmatch(x.strip()))
+
+
+def scrub(text: str) -> str:
+    """发送前的兜底：错误信息等里漏出来的 IP、网址、域名一律替换掉"""
+    for rx in (_RE_URL, _RE_IP, _RE_HOST):
+        text = rx.sub("***", text)
+    return text
+
+
 def err(msg: str) -> str:
     return f"❌ <b>{esc(msg)}</b>"
 
@@ -969,7 +987,9 @@ def cf_cdn_block(now: datetime):
         ], []
     tot_req = tot_bytes = 0
     box = []
-    for label, zid in zones:
+    for n, (label, zid) in enumerate(zones, 1):
+        if looks_like_host(label) or label == zid[:8]:  # 自动列出的是域名、没起名的是 ID 前缀，都不发
+            label = "站点" if len(zones) == 1 else f"站点 {n}"
         try:
             m_req, m_bytes, t_req, t_bytes = zone_traffic(zid, now)
         except CFError as e:
@@ -1215,10 +1235,9 @@ def get_aliyun_data() -> Section:
     lines = [hdr("🟧 Aliyun CDT", f"本月 · {pool}")]
     lines.append(bq(quota("流量", pct, fmt_gb(used), fmt_gb(quota_gb), fmt_gb(max(quota_gb - used, 0)))
                     + [f"🛡 <b>{esc(guard)}</b> · 熔断线 {limit:g}GB（{esc(mode)}）· 距熔断 <b>{fmt_gb(remain_to_limit)}</b>"]))
-    host = st.get("name") or st.get("instance", "?")
-    ip = st.get("ip")
+    host = st.get("name") or "ECS"  # 只用实例名称，不显示实例 ID 和公网 IP
     lines.append(f"🖥 <b>{esc(host)}</b> · {esc(st.get('status', '?'))} · "
-                 f"{f'<code>{esc(ip)}</code>' if ip else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
+                 f"{'有公网IP' if st.get('ip') else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
     if len(st.get("by_region") or {}) > 1:
         lines.append("🗺 " + " · ".join(f"{esc(r)} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
     lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset.astimezone(REPORT_TZ))})</i> · "
@@ -1347,6 +1366,7 @@ def chunk_text(text: str, limit: int = 3900) -> list:
 
 async def send_html(send, text: str):
     """用 HTML 格式发送；万一某处没转义干净导致 Telegram 解析失败，退回纯文本重发，消息不丢"""
+    text = scrub(text)
     try:
         return await send(text, parse_mode=ParseMode.HTML)
     except BadRequest as ex:

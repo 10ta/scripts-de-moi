@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -239,10 +240,19 @@ def save_state(cfg, st):
     os.replace(tmp, state_path(cfg))
 
 
+# TG 消息脱敏：不出现 IP、网址、域名（错误信息里常带 aliyuncs.com 的接口地址）
+_SCRUB = [re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"）)]*"),
+          re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b"),
+          re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|xyz|io|dev|app|cn|me|top|cc|co|info|cloud|site|tech|link"
+                     r"|one|uk|jp|kr|hk|tw|us|de|fr)\b")]
+
+
 def notify(cfg, text):
     print(text)
     if not (cfg.tg_token and cfg.tg_chat):
         return
+    for rx in _SCRUB:
+        text = rx.sub("***", text)
     for chat in (c.strip() for c in cfg.tg_chat.split(",") if c.strip()):
         try:
             body = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
@@ -283,7 +293,7 @@ def get_month_cost(cfg, cycle):
 def check(cfg):
     st = load_state(cfg)
     now = time.time()
-    tag = f"[CDT {cfg.instance[-6:]}]"
+    tag = f"[CDT {st.get('name') or 'ECS'}]"  # 用实例名称区分，不用实例 ID
 
     try:
         used, by_region = get_traffic(cfg)

@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.21.1"
+VERSION="2026.10.21.2"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -192,25 +192,40 @@ state_set() {
 }
 
 # ---------- Telegram 简报（HTML） ----------
-# 结构：标题（结果）→ 域名/流程 → 引用块（IP 与成绩，最醒目）→ 说明 → 前 5 名表格 → 可展开的参数细节 → 页脚
+# 结构：标题（结果）→ 流程 → 引用块（节点与成绩，最醒目）→ 说明 → 前 5 名表格 → 可展开的参数细节 → 页脚
+# 脱敏：简报里不出现 IP、域名、网址。IP 用 CF 机房代码（LAX、HKG…）区分，种子来源只标「种子」
 h() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }   # HTML 转义
-c() { printf '<code>%s</code>' "$(h "$1")"; }                              # 行内代码（可点按复制）
+# 兜底：发出去之前把漏网的 IPv4、网址、常见后缀的域名替换掉
+scrub() {
+  sed -E -e 's#[a-zA-Z][a-zA-Z0-9+.-]*://[^ <>"）)]*#***#g' \
+         -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?\b/***/g' \
+         -e 's/\b([a-zA-Z0-9-]+\.)+(com|net|org|xyz|io|dev|app|cn|me|top|cc|co|info|cloud|site|tech|link|one|uk|jp|kr|hk|tw|us|de|fr)\b/***/g' <<<"$1"
+}
+src_name() { sed -E -e 's/^种子:.*\(段外\)$/种子（段外）/' -e 's/^种子:.*/种子/' <<<"$1"; }
+colo_of() {     # IP → 机房代码（cfst 结果第 7 列「地区码」）
+  local r cc
+  r=$(row_of "$1" result.csv 2>/dev/null); [[ -n "$r" ]] || r=$(row_of "$1" latency.all.csv 2>/dev/null)
+  IFS=, read -r _ _ _ _ _ _ cc _ <<<"$r"; cc=${cc%$'\r'}
+  [[ -n "$cc" && "$cc" != N/A ]] && echo "$cc" || echo "?"
+}
 
-top_table() {   # 前 5 名，等宽表格；标出这次选用的和原来的 IP
+top_table() {   # 前 5 名，等宽表格；用排名 + 机房代码代替 IP，标出这次选用的和原来的
   awk -F, -v s="$LATENCY_SPLIT" -v m="$METRIC" -v pick="$IP" -v cur="$OLD_IP" -v kind="$KIND" '
     FILENAME == ARGV[1] { lab[$1] = $2; next }
     FNR == 1 { g = (s + 0 > 0) ? "   段 " : ""
-               if (m != "") printf "%-15s %5s %6s%s  来源\n", "IP", "ms", "MB/s", g
-               else         printf "%-15s %5s %5s%s  来源\n", "IP", "ms", "loss", g
+               if (m != "") printf "%-2s %-2s %5s %6s%s  来源\n", "#", "机房", "ms", "MB/s", g
+               else         printf "%-2s %-2s %5s %5s%s  来源\n", "#", "机房", "ms", "loss", g
                next }
     FNR <= 6 {
+      cc = $7; sub(/\r$/, "", cc); if (cc == "" || cc == "N/A") cc = "?"
       g = (s + 0 > 0) ? (($5 + 0 < s + 0) ? "  <" s : "  ≥" s) : ""
-      l = ($1 in lab) ? lab[$1] : "官方"; sub(/^种子:/, "种子 ", l)
+      l = ($1 in lab) ? lab[$1] : "官方"
+      if (l ~ /^种子/) l = (l ~ /\(段外\)$/) ? "种子（段外）" : "种子"
       mk = ""
       if (kind != "failed" && $1 == pick) mk = (pick == cur) ? "  ◀ 保持" : "  ◀ 选用"
       else if ($1 == cur) mk = "  ◀ 原"
-      if (m != "") printf "%-15s %5.0f %6.2f%s  %s%s\n", $1, $5, $6, g, l, mk
-      else         printf "%-15s %5.0f %5s%s  %s%s\n", $1, $5, $4, g, l, mk }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null
+      if (m != "") printf "%-2d %-4s %5.0f %6.2f%s  %s%s\n", FNR - 1, cc, $5, $6, g, l, mk
+      else         printf "%-2d %-4s %5.0f %5s%s  %s%s\n", FNR - 1, cc, $5, $4, g, l, mk }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null
 }
 
 notify() {
@@ -219,7 +234,7 @@ notify() {
   [[ "$KIND" == healthy && "$TG_NOTIFY_CHECK" != on ]] && return 0
   [[ "$TG_NOTIFY" == change && ( "$KIND" == unchanged || "$KIND" == healthy ) ]] && return 0
 
-  local l msg box stat top det resp
+  local l msg box stat top det resp cmp brief
   l=$(h "$TARGET_LABEL")
   case "$KIND" in
     updated)   msg="🔄 <b>${l} · 优选 IP 已更新</b>" ;;
@@ -227,36 +242,43 @@ notify() {
     healthy)   msg="🩺 <b>${l} · 巡检正常</b>" ;;
     *)         msg="❌ <b>${l} · 更新失败</b>" ;;
   esac
-  msg+=$'\n'"🌐 $(c "$CF_RECORD_NAME")${PATH_DESC:+ · <i>$(h "$PATH_DESC")</i>}"
+  [[ -n "$PATH_DESC" ]] && msg+=$'\n'"🧭 <i>$(h "$PATH_DESC")</i>"
 
   # 引用块：这一轮最重要的东西
   if [[ "$KIND" == failed ]]; then
     box="⚠️ <b>$(h "$REASON")</b>"
-    [[ -n "$OLD_IP" ]] && box+=$'\n'"当前解析 $(c "$OLD_IP") 保持不变"
+    [[ -n "$OLD_IP" ]] && box+=$'\n'"当前解析保持不变（机房 <b>$(h "$(colo_of "$OLD_IP")")</b>）"
   else
-    if [[ "$KIND" == updated ]]; then box="$(c "${OLD_IP:-（新建）}")  ➜  $(c "$IP")"
-    else box="📍 $(c "$IP")"; fi
+    if [[ "$KIND" == updated ]]; then
+      if [[ -n "$OLD_IP" ]]; then box="🔀 机房 <b>$(h "$(colo_of "$OLD_IP")")</b>  ➜  <b>$(h "$(colo_of "$IP")")</b>"
+      else box="🆕 新建解析 · 机房 <b>$(h "$(colo_of "$IP")")</b>"; fi
+    else box="📍 机房 <b>$(h "$(colo_of "$IP")")</b>"; fi
     if [[ -n "$IP" ]]; then
       if [[ -n "$METRIC" ]]; then stat="⚡ <b>${METRIC} $(h "$SPEED") MB/s</b> · 🕒 $(h "$LAT") ms"
       else stat="🕒 <b>$(h "$LAT") ms</b>"; fi
-      stat+="$(h "${GROUP:+（$GROUP）}") · 丢包 $(h "$LOSS")${SRC:+ · $(h "$SRC")}"
+      stat+="$(h "${GROUP:+（$GROUP）}") · 丢包 $(h "$LOSS")${SRC:+ · $(h "$(src_name "$SRC")")}"
       box+=$'\n'"$stat"
     fi
   fi
   msg+=$'\n'"<blockquote>${box}</blockquote>"
   [[ -n "$WHY" && "$KIND" != failed ]] && msg+=$'\n'"💡 $(h "$WHY")"
-  [[ -n "$COMPARE" && -n "$IP" && "$KIND" != healthy && "$KIND" != failed ]] && msg+=$'\n'"🆚 $(h "$COMPARE")"
+  if [[ -n "$COMPARE" && -n "$IP" && "$KIND" != healthy && "$KIND" != failed ]]; then
+    cmp=$(sed 's/（[^）]*）//g' <<<"$COMPARE")             # 去掉种子来源（域名）
+    msg+=$'\n'"🆚 $(h "$cmp")"
+  fi
 
   if [[ "$KIND" != healthy && -s "$WORK/result.csv" && $(wc -l < "$WORK/result.csv") -ge 3 ]]; then
     top=$(top_table)
     [[ -n "$top" ]] && msg+=$'\n\n'"📊 <b>前 5 名</b>${METRIC:+ <i>按${METRIC}</i>}"$'\n'"<pre>$(h "$top")</pre>"
   fi
 
-  # 细节默认折叠，点开才看
-  det="⚙️ 参数：$(h "$(config_brief)")"
+  # 细节默认折叠，点开才看；cfst 参数里的测速地址去掉
+  brief=$(sed -E 's/ -url [^ ]+//' <<<"$(config_brief)")
+  det="⚙️ 参数：$(h "$brief")"
   [[ -n "$SCAN_NOTE" && "$KIND" != healthy ]] && det="🔎 延迟筛选：$(h "$SCAN_NOTE")"$'\n'"$det"
   msg+=$'\n'"<blockquote expandable>${det}</blockquote>"
   msg+=$'\n'"<i>🖥 $(h "$(cat /proc/sys/kernel/hostname)") · ⏱ ${t}s · $(date '+%m-%d %H:%M') · v${VERSION}</i>"
+  msg=$(scrub "$msg")
 
   resp=$(curl "${CURL_BASE[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
