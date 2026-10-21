@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.20.2"
+VERSION="2026.10.21.1"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -191,9 +191,27 @@ state_set() {
   mv "$tmp" "$STATE"
 }
 
-# ---------- Telegram 简报（MarkdownV2） ----------
-md()   { sed 's/[][_*()~`>#+=|{}.!\\-]/\\&/g' <<<"$1"; }        # 普通文本转义
-code() { local s=${1//\\/\\\\}; printf '`%s`' "${s//\`/\\\`}"; }  # 行内代码
+# ---------- Telegram 简报（HTML） ----------
+# 结构：标题（结果）→ 域名/流程 → 引用块（IP 与成绩，最醒目）→ 说明 → 前 5 名表格 → 可展开的参数细节 → 页脚
+h() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }   # HTML 转义
+c() { printf '<code>%s</code>' "$(h "$1")"; }                              # 行内代码（可点按复制）
+
+top_table() {   # 前 5 名，等宽表格；标出这次选用的和原来的 IP
+  awk -F, -v s="$LATENCY_SPLIT" -v m="$METRIC" -v pick="$IP" -v cur="$OLD_IP" -v kind="$KIND" '
+    FILENAME == ARGV[1] { lab[$1] = $2; next }
+    FNR == 1 { g = (s + 0 > 0) ? "   段 " : ""
+               if (m != "") printf "%-15s %5s %6s%s  来源\n", "IP", "ms", "MB/s", g
+               else         printf "%-15s %5s %5s%s  来源\n", "IP", "ms", "loss", g
+               next }
+    FNR <= 6 {
+      g = (s + 0 > 0) ? (($5 + 0 < s + 0) ? "  <" s : "  ≥" s) : ""
+      l = ($1 in lab) ? lab[$1] : "官方"; sub(/^种子:/, "种子 ", l)
+      mk = ""
+      if (kind != "failed" && $1 == pick) mk = (pick == cur) ? "  ◀ 保持" : "  ◀ 选用"
+      else if ($1 == cur) mk = "  ◀ 原"
+      if (m != "") printf "%-15s %5.0f %6.2f%s  %s%s\n", $1, $5, $6, g, l, mk
+      else         printf "%-15s %5.0f %5s%s  %s%s\n", $1, $5, $4, g, l, mk }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null
+}
 
 notify() {
   [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" && "$TG_NOTIFY" != off ]] || return 0
@@ -201,53 +219,60 @@ notify() {
   [[ "$KIND" == healthy && "$TG_NOTIFY_CHECK" != on ]] && return 0
   [[ "$TG_NOTIFY" == change && ( "$KIND" == unchanged || "$KIND" == healthy ) ]] && return 0
 
-  local head msg top resp stat
-  local l; l=$(md "$TARGET_LABEL")
+  local l msg box stat top det resp
+  l=$(h "$TARGET_LABEL")
   case "$KIND" in
-    updated)   head="✅ *${l} 优选 IP 已更新*" ;;
-    unchanged) head="☑️ *${l} 优选 IP 无变化*" ;;
-    healthy)   head="🩺 *${l} 巡检正常*" ;;
-    *)         head="❌ *${l} 优选 IP 更新失败*" ;;
+    updated)   msg="🔄 <b>${l} · 优选 IP 已更新</b>" ;;
+    unchanged) msg="☑️ <b>${l} · 优选 IP 无变化</b>" ;;
+    healthy)   msg="🩺 <b>${l} · 巡检正常</b>" ;;
+    *)         msg="❌ <b>${l} · 更新失败</b>" ;;
   esac
-  msg="$head"$'\n\n'"$(md "域名：")$(code "$CF_RECORD_NAME")"
-  [[ -n "$PATH_DESC" ]] && msg+=$'\n'"$(md "流程：$PATH_DESC")"
-  case "$KIND" in
-    updated)   msg+=$'\n'"$(md "IP：")$(code "${OLD_IP:-新建}") → $(code "$IP")" ;;
-    unchanged|healthy) msg+=$'\n'"$(md "IP：")$(code "$IP")" ;;
-    *)         msg+=$'\n'"$(md "原因：$REASON")"
-               [[ -n "$OLD_IP" ]] && msg+=$'\n'"$(md "当前解析：")$(code "$OLD_IP")" ;;
-  esac
-  [[ -n "$WHY" && "$KIND" != failed ]] && msg+=$'\n'"$(md "说明：$WHY")"
-  [[ -n "$SCAN_NOTE" && "$KIND" != healthy ]] && msg+=$'\n'"$(md "延迟筛选：$SCAN_NOTE")"
-  if [[ -n "$IP" && "$KIND" != failed ]]; then
-    stat="延迟 ${LAT} ms${GROUP:+（$GROUP）} · 丢包 ${LOSS}"
-    [[ -n "$METRIC" ]] && stat+=" · ${METRIC} ${SPEED} MB/s"
-    [[ -n "$SRC" ]] && stat+=" · 来源 ${SRC}"
-    msg+=$'\n'"$(md "$stat")"
-    [[ -n "$COMPARE" && "$KIND" != healthy ]] && msg+=$'\n'"$(md "$COMPARE")"
+  msg+=$'\n'"🌐 $(c "$CF_RECORD_NAME")${PATH_DESC:+ · <i>$(h "$PATH_DESC")</i>}"
+
+  # 引用块：这一轮最重要的东西
+  if [[ "$KIND" == failed ]]; then
+    box="⚠️ <b>$(h "$REASON")</b>"
+    [[ -n "$OLD_IP" ]] && box+=$'\n'"当前解析 $(c "$OLD_IP") 保持不变"
+  else
+    if [[ "$KIND" == updated ]]; then box="$(c "${OLD_IP:-（新建）}")  ➜  $(c "$IP")"
+    else box="📍 $(c "$IP")"; fi
+    if [[ -n "$IP" ]]; then
+      if [[ -n "$METRIC" ]]; then stat="⚡ <b>${METRIC} $(h "$SPEED") MB/s</b> · 🕒 $(h "$LAT") ms"
+      else stat="🕒 <b>$(h "$LAT") ms</b>"; fi
+      stat+="$(h "${GROUP:+（$GROUP）}") · 丢包 $(h "$LOSS")${SRC:+ · $(h "$SRC")}"
+      box+=$'\n'"$stat"
+    fi
   fi
+  msg+=$'\n'"<blockquote>${box}</blockquote>"
+  [[ -n "$WHY" && "$KIND" != failed ]] && msg+=$'\n'"💡 $(h "$WHY")"
+  [[ -n "$COMPARE" && -n "$IP" && "$KIND" != healthy && "$KIND" != failed ]] && msg+=$'\n'"🆚 $(h "$COMPARE")"
+
   if [[ "$KIND" != healthy && -s "$WORK/result.csv" && $(wc -l < "$WORK/result.csv") -ge 3 ]]; then
-    top=$(awk -F, -v s="$LATENCY_SPLIT" -v m="$METRIC" '
-      FILENAME == ARGV[1] { lab[$1] = $2; next }
-      FNR > 1 && FNR <= 6 {
-      g = (s+0>0) ? (($5+0 < s+0) ? " <" s : " ≥" s) : ""
-      l = ($1 in lab) ? lab[$1] : "官方"; sub(/^种子:/, "种子 ", l)
-      if (m != "") printf "%-15s %6sms %5sMB/s%s %s\n", $1, $5, $6, g, l
-      else         printf "%-15s %6sms 丢包%s%s %s\n", $1, $5, $4, g, l }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null)
-    top=${top//\\/\\\\}; top=${top//\`/\\\`}
-    [[ -n "$top" ]] && msg+=$'\n\n'"*前 5 名*$(md "${METRIC:+（按${METRIC}）}")"$'\n```\n'"$top"$'\n```'
+    top=$(top_table)
+    [[ -n "$top" ]] && msg+=$'\n\n'"📊 <b>前 5 名</b>${METRIC:+ <i>按${METRIC}</i>}"$'\n'"<pre>$(h "$top")</pre>"
   fi
-  msg+=$'\n\n'"$(md "参数：$(config_brief)")"
-  msg+=$'\n'"_$(md "$(cat /proc/sys/kernel/hostname) · 用时 ${t}s · $(date '+%m-%d %H:%M') · v${VERSION}")_"
+
+  # 细节默认折叠，点开才看
+  det="⚙️ 参数：$(h "$(config_brief)")"
+  [[ -n "$SCAN_NOTE" && "$KIND" != healthy ]] && det="🔎 延迟筛选：$(h "$SCAN_NOTE")"$'\n'"$det"
+  msg+=$'\n'"<blockquote expandable>${det}</blockquote>"
+  msg+=$'\n'"<i>🖥 $(h "$(cat /proc/sys/kernel/hostname)") · ⏱ ${t}s · $(date '+%m-%d %H:%M') · v${VERSION}</i>"
 
   resp=$(curl "${CURL_BASE[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
-    -d parse_mode=MarkdownV2 -d disable_web_page_preview=true 2>&1) || true
+    -d parse_mode=HTML -d disable_web_page_preview=true 2>&1) || true
   if jq -e '.ok' >/dev/null 2>&1 <<<"$resp"; then
     echo "已发送 Telegram 简报"
-  else
-    local why; why=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || true
-    echo "警告: Telegram 发送失败: ${why:-${resp:0:200}}" >&2
+    return
+  fi
+  local why; why=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || true
+  echo "警告: Telegram 发送失败: ${why:-${resp:0:200}}" >&2
+  # 格式出错（比如某段文字没转义干净）时，去掉标签再发一次纯文本，至少别丢了这条简报
+  if [[ "$why" == *"parse entities"* ]]; then
+    msg=$(sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g' <<<"$msg")
+    curl "${CURL_BASE[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
+      -d disable_web_page_preview=true >/dev/null 2>&1 && echo "已改用纯文本重发简报"
   fi
 }
 

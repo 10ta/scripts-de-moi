@@ -6,11 +6,11 @@
 #   bash init.sh status         # 查看运行状态和当前用量
 #   bash init.sh uninstall      # 卸载
 #
-# 也可以不 clone 仓库，直接：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/script/CDT-Management/init.sh)
+# 也可以不 clone 仓库，直接（bash / zsh / fish 通用）：
+#   curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Management/init.sh -o /tmp/cdt-init.sh && bash /tmp/cdt-init.sh
 set -euo pipefail
 
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/10ta/scripts-de-moi/main/script/CDT-Management}"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Management}"
 APP_DIR=/opt/cdt-guard
 ENV_FILE=/etc/cdt-guard.env
 STATE_DIR=/var/lib/cdt-guard
@@ -59,8 +59,10 @@ preflight() {
 
 # ---------------------------------------------------------------- 安装程序文件
 install_files() {
-    local src
-    src="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    # 只有以文件方式运行（bash init.sh / bash /tmp/cdt-init.sh）时才看脚本旁边有没有程序文件；
+    # bash -c / 管道运行时 BASH_SOURCE 为空，直接从 GitHub 下载，不去碰当前目录
+    local src="" self="${BASH_SOURCE[0]:-}"
+    [[ -n "$self" && -f "$self" ]] && src="$(cd "$(dirname "$self")" && pwd)"
     if [[ -n "$src" && -f "$src/cdt_guard.py" ]]; then
         info "使用本地文件：$src"
     else

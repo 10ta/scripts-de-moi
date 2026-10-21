@@ -69,14 +69,17 @@
 在第 ③ 步那台 Debian 上，用 root 执行下面任意一种方式。
 
 ```bash
-# 方式 A：直接运行
-bash <(curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/script/CDT-Management/init.sh)
+# 方式 A：直接下载运行（bash / zsh / fish 都能用）
+curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Management/init.sh -o /tmp/cdt-init.sh && bash /tmp/cdt-init.sh
 
 # 方式 B：先 clone 再运行
 git clone https://github.com/10ta/scripts-de-moi.git
-cd scripts-de-moi/script/CDT-Management
+cd scripts-de-moi/CDT-Management
 bash init.sh
 ```
+
+> 也可以写成 `bash -c "$(curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Management/init.sh)"`，bash、zsh 和 fish 3.4 及以上都支持。
+> 但不要用 `bash <(curl …)`，fish 不支持这种写法；也不要用 `curl … | bash`，脚本中途调用 apt 时可能会把管道里剩下的脚本内容吃掉。
 
 脚本会依次完成以下步骤：
 

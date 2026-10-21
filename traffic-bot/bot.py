@@ -14,6 +14,7 @@
 """
 import asyncio
 import calendar
+import html
 import json
 import logging
 import math
@@ -29,6 +30,8 @@ import boto3
 import requests
 from botocore.config import Config
 from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------- 配置
@@ -214,9 +217,36 @@ def bar(pct: float, width: int = 10) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+# ---- Telegram HTML 排版。约定：所有动态文本都经过 esc() 转义，拼出来的行本身就是 HTML
+def esc(x) -> str:
+    return html.escape(str(x), quote=False)
+
+
+def hdr(title: str, sub: str = "") -> str:
+    """区块标题：粗体 + 斜体副标题"""
+    return f"<b>{esc(title)}</b>" + (f"  <i>{esc(sub)}</i>" if sub else "")
+
+
+def bq(lines: list, expandable: bool = False) -> str:
+    """引用块（左侧竖条），放最重要的数字；expandable=True 时默认折叠，点开才看"""
+    lines = [x for x in lines if x is not None]
+    if not lines:
+        return ""
+    tag = "blockquote expandable" if expandable else "blockquote"
+    return f"<{tag}>" + "\n".join(lines) + "</blockquote>"
+
+
+def err(msg: str) -> str:
+    return f"❌ <b>{esc(msg)}</b>"
+
+
 def quota(name: str, pct: float, used: str, total: str, remain: str) -> list:
-    """统一的额度展示：两行，已用比例 + 已用/总量 + 剩余"""
-    return [f"{status_icon(pct)} {name} {bar(pct)} {pct:.1f}%", f"└ {used} / {total} · 剩 {remain}"]
+    """统一的额度展示：两行，已用比例 + 已用/总量 + 剩余。越线时百分比加下划线更醒目"""
+    p = f"<b>{pct:.1f}%</b>"
+    if pct >= 80:
+        p = f"<u>{p}</u>"
+    return [f"{status_icon(pct)} <b>{esc(name)}</b>  {bar(pct)}  {p}",
+            f"└ <code>{esc(used)}</code> / {esc(total)} · 剩 <b>{esc(remain)}</b>"]
 
 
 def fmt_reset(dt: datetime) -> str:
@@ -236,7 +266,7 @@ def get_bwh_data() -> Section:
         resp.raise_for_status()
         data = resp.json()
         if data.get("error") not in (0, None):
-            return Section(f"🖥 BWH\n❌ 接口返回错误：{data.get('message', data.get('error'))}")
+            return Section(hdr("🖥 BWH") + "\n" + err(f"接口返回错误：{data.get('message', data.get('error'))}"))
 
         used_gb = data["data_counter"] / 1024**3
         remain_gb = max(BWH_TOTAL_GB - used_gb, 0)
@@ -245,17 +275,17 @@ def get_bwh_data() -> Section:
         remain_days = max(math.ceil((reset_ts - time.time()) / 86400), 1)
         pct = used_gb / BWH_TOTAL_GB * 100
 
-        lines = ["🖥 BWH"]
-        lines += quota("流量", pct, fmt_gb(used_gb), fmt_gb(BWH_TOTAL_GB), fmt_gb(remain_gb))
-        lines.append(f"🔄 {fmt_reset(reset_dt)}后重置({fmt_date(reset_dt.astimezone(REPORT_TZ))}) · "
-                     f"日均可用 {fmt_gb(remain_gb / remain_days)}")
+        lines = [hdr("🖥 BWH", "本周期"),
+                 bq(quota("流量", pct, fmt_gb(used_gb), fmt_gb(BWH_TOTAL_GB), fmt_gb(remain_gb))),
+                 f"🔄 {fmt_reset(reset_dt)}后重置 <i>({fmt_date(reset_dt.astimezone(REPORT_TZ))})</i> · "
+                 f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]
         metric = Metric("bwh", "BWH 流量", pct, str(reset_ts), f"{used_gb:.1f} / {BWH_TOTAL_GB:.0f}GB")
         return Section("\n".join(lines), [metric])
     except Exception as e:
         # 异常信息里可能带有含 api_key 的 URL，必须脱敏后再记录/回显
         safe = str(e).replace(BWH_API_KEY, "***") if BWH_API_KEY else str(e)
         logger.error("BWH 查询失败: %s", safe)
-        return Section(f"🖥 BWH\n❌ 查询失败：{type(e).__name__}")
+        return Section(hdr("🖥 BWH") + "\n" + err(f"查询失败：{type(e).__name__}"))
 
 
 # ---------------------------------------------------------------- AWS Lightsail
@@ -274,7 +304,7 @@ def get_aws_data() -> Section:
             if not token:
                 break
         if not instances:
-            return Section("☁️ Lightsail\n无活跃实例（若有实例，请检查 LIGHTSAIL_REGION）")
+            return Section(hdr("☁️ Lightsail") + "\n无活跃实例（若有实例，请检查 <code>LIGHTSAIL_REGION</code>）")
 
         remain_days = max(math.ceil((next_reset - now).total_seconds() / 86400), 1)
 
@@ -285,25 +315,25 @@ def get_aws_data() -> Section:
             )
             return sum(p.get("Sum", 0) for p in res.get("metricData", []))
 
-        lines, metrics = ["☁️ Lightsail · 本月"], []
+        lines, metrics = [hdr("☁️ Lightsail", "本月")], []
         for inst in instances:
             name = inst["name"]
             quota_gb = inst["networking"]["monthlyTransfer"]["gbPerMonthAllocated"]
             used_gb = (metric_sum(name, "NetworkIn") + metric_sum(name, "NetworkOut")) / 1024**3
             if not quota_gb:
-                lines.append(f"{name}：已用 {fmt_gb(used_gb)}（无额度信息）")
+                lines.append(f"<b>{esc(name)}</b>：已用 <b>{fmt_gb(used_gb)}</b>（无额度信息）")
                 continue
             remain_gb = max(quota_gb - used_gb, 0)
             pct = used_gb / quota_gb * 100
-            lines += quota(name, pct, fmt_gb(used_gb), fmt_gb(quota_gb), fmt_gb(remain_gb))
-            lines.append(f"   日均可用 {fmt_gb(remain_gb / remain_days)}")
+            lines.append(bq(quota(name, pct, fmt_gb(used_gb), fmt_gb(quota_gb), fmt_gb(remain_gb))
+                            + [f"└ 日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]))
             metrics.append(Metric(f"lightsail:{name}", f"Lightsail {name} 流量", pct,
                                   now.strftime("%Y-%m"), f"{used_gb:.1f} / {quota_gb}GB"))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置({fmt_date(next_reset)})")
+        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i>")
         return Section("\n".join(lines), metrics)
     except Exception as e:
         logger.exception("AWS 查询失败")
-        return Section(f"☁️ Lightsail\n❌ 查询失败：{type(e).__name__}: {e}")
+        return Section(hdr("☁️ Lightsail") + "\n" + err(f"查询失败：{type(e).__name__}: {e}"))
 
 
 # ---------------------------------------------------------------- AWS CloudFront
@@ -319,7 +349,7 @@ def get_cloudfront_data() -> Section:
         for page in cf.get_paginator("list_distributions").paginate():
             dist_ids += [d["Id"] for d in page.get("DistributionList", {}).get("Items", [])]
         if not dist_ids:
-            return Section("🌐 CloudFront\n没有找到任何 Distribution")
+            return Section(hdr("🌐 CloudFront") + "\n没有找到任何 Distribution")
 
         cw = aws_client("cloudwatch", "us-east-1")
         totals = {"Requests": 0.0, "BytesDownloaded": 0.0}
@@ -347,14 +377,17 @@ def get_cloudfront_data() -> Section:
         # 按本月已过时间线性外推月底用量（第 1 天数据太少，不外推）
         elapsed = (now - start).total_seconds()
         month_sec = (next_reset - start).total_seconds()
-        lines = [f"🌐 CloudFront · 本月 · {len(dist_ids)}个分发"]
-        lines += quota("流量", gb_pct, fmt_gb(used_gb), fmt_gb(CLOUDFRONT_LIMIT_GB), fmt_gb(remain_gb))
-        lines += quota("请求", req_pct, fmt_num(used_req), fmt_num(CLOUDFRONT_LIMIT_REQUESTS), fmt_num(remain_req))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置({fmt_date(next_reset)}) · "
-                     f"日均可用 {fmt_gb(remain_gb / remain_days)} / {fmt_num(remain_req / remain_days)}次")
+        lines = [hdr("🌐 CloudFront", f"本月 · {len(dist_ids)} 个分发"),
+                 bq(quota("流量", gb_pct, fmt_gb(used_gb), fmt_gb(CLOUDFRONT_LIMIT_GB), fmt_gb(remain_gb))
+                    + quota("请求", req_pct, fmt_num(used_req), fmt_num(CLOUDFRONT_LIMIT_REQUESTS),
+                            fmt_num(remain_req))),
+                 f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i> · "
+                 f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b> / <b>{fmt_num(remain_req / remain_days)}</b>次"]
         if elapsed >= 86400:  # 第 1 天数据太少，不外推
             k = month_sec / elapsed
-            lines.append(f"📈 预计月底 {fmt_gb(used_gb * k)} / {fmt_num(used_req * k)}次")
+            proj = used_gb * k / CLOUDFRONT_LIMIT_GB * 100
+            warn = " ⚠️ <u>会超额</u>" if proj >= 100 else ""
+            lines.append(f"📈 预计月底 <b>{fmt_gb(used_gb * k)}</b> / {fmt_num(used_req * k)}次{warn}")
         text = "\n".join(lines)
         period = now.strftime("%Y-%m")
         metrics = [
@@ -366,7 +399,7 @@ def get_cloudfront_data() -> Section:
         return Section(text, metrics)
     except Exception as e:
         logger.exception("CloudFront 查询失败")
-        return Section(f"🌐 CloudFront\n❌ 查询失败：{type(e).__name__}: {e}")
+        return Section(hdr("🌐 CloudFront") + "\n" + err(f"查询失败：{type(e).__name__}: {e}"))
 
 
 # ---------------------------------------------------------------- AWS 账单
@@ -379,7 +412,7 @@ def get_aws_bill_data() -> Section:
     账单数据 AWS 每天只更新几次，所以结果缓存 AWS_BILL_CACHE_MIN 分钟"""
     if _bill_cache["section"] and time.monotonic() - _bill_cache["ts"] < AWS_BILL_CACHE_MIN * 60:
         return _bill_cache["section"]
-    title = "💵 AWS 账单 · 本月预估"
+    title = hdr("💵 AWS 账单", "本月预估")
     try:
         now = datetime.now(timezone.utc)
         start = month_start(now)
@@ -390,7 +423,7 @@ def get_aws_bill_data() -> Section:
             metrics += page.get("Metrics", [])
         if not metrics:
             sec = Section(f"{title}\n❔ 没有账单数据。到 Billing → Billing preferences → Alert preferences "
-                          "勾选 Receive CloudWatch Billing Alerts，约 15 分钟后生效")
+                          "勾选 <b>Receive CloudWatch Billing Alerts</b>，约 15 分钟后生效")
             _bill_cache.update(ts=time.monotonic(), section=sec)
             return sec
 
@@ -420,22 +453,22 @@ def get_aws_bill_data() -> Section:
 
         if total is None:
             total = sum(v for _, v in items)
-        lines = [title, f"💰 总额 USD {total:.2f}"]
+        box = [f"💰 总额 <b>USD {total:.2f}</b>"]
         if items:
-            for name, val in sorted(items, key=lambda x: -x[1]):
-                lines.append(f"└ {name} · USD {val:.2f}")
+            box += [f"└ {esc(name)} · <code>USD {val:.2f}</code>" for name, val in sorted(items, key=lambda x: -x[1])]
         else:
-            lines.append("└ 没有收费项目")
-        if total_ts:
-            lines.append(f"🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
-                         f"{total_ts.astimezone(REPORT_TZ):%H:%M}（税前预估，AWS 每天更新几次）")
+            box.append("└ 没有收费项目")
+        lines = [title, bq(box)]
 
         metrics_out = []
         if AWS_BILL_LIMIT_USD > 0:
             pct = total / AWS_BILL_LIMIT_USD * 100
-            lines.append(f"🛡 告警线 USD {AWS_BILL_LIMIT_USD:g}（已到 {pct:.0f}%）")
+            lines.append(f"🛡 告警线 USD {AWS_BILL_LIMIT_USD:g} · 已到 {status_icon(pct)} <b>{pct:.0f}%</b>")
             metrics_out.append(Metric("aws:bill", "AWS 本月账单", pct, now.strftime("%Y-%m"),
                                       f"USD {total:.2f} / {AWS_BILL_LIMIT_USD:g}"))
+        if total_ts:
+            lines.append(f"<i>🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
+                         f"{total_ts.astimezone(REPORT_TZ):%H:%M} · 税前预估，AWS 每天更新几次</i>")
         sec = Section("\n".join(lines), metrics_out)
         _bill_cache.update(ts=time.monotonic(), section=sec)
         return sec
@@ -443,7 +476,7 @@ def get_aws_bill_data() -> Section:
         logger.exception("AWS 账单查询失败")
         hint = "（IAM 策略需要 cloudwatch:ListMetrics 和 cloudwatch:GetMetricStatistics）" \
             if "AccessDenied" in str(e) else ""
-        return Section(f"{title}\n❌ 查询失败：{type(e).__name__}: {e}{hint}")
+        return Section(f"{title}\n" + err(f"查询失败：{type(e).__name__}: {e}") + esc(hint))
 
 
 # ---------------------------------------------------------------- Cloudflare
@@ -624,27 +657,27 @@ def cf_workers_block(now: datetime):
     detail = f"Workers {fmt_num(workers_total)}"
     if pages_total is not None:
         detail += f" + Pages {fmt_num(pages_total)}"
-    if note:
-        detail += f"（{note}）"
+    detail = esc(detail) + (f"（⚠️ {esc(note)}）" if note else "")
 
-    lines = ["⚡ Workers & Pages · 今日"]
-    lines += quota("请求", pct, fmt_num(total), fmt_num(CF_WORKERS_DAILY_LIMIT),
-                   fmt_num(max(CF_WORKERS_DAILY_LIMIT - total, 0)))
-    lines.append(f"🔄 {reset_h:.0f}小时后重置 · {detail}")
+    lines = [hdr("⚡ Workers & Pages", "今日"),
+             bq(quota("请求", pct, fmt_num(total), fmt_num(CF_WORKERS_DAILY_LIMIT),
+                      fmt_num(max(CF_WORKERS_DAILY_LIMIT - total, 0)))
+                + [f"└ {detail}"]),
+             f"🔄 {reset_h:.0f}小时后重置"]
 
     # 账期汇总：对应控制台 Usage 页下方的 Requests / CPU time 卡片
     try:
         p_start, p_end, p_req, p_cpu = cf_period_usage(now)
-        period_line = f"📅 账期 {fmt_date(p_start)} – {fmt_date(p_end)} · 请求 {fmt_num(p_req)}"
+        period_line = f"📅 账期 <i>{fmt_date(p_start)} – {fmt_date(p_end)}</i> · 请求 <b>{fmt_num(p_req)}</b>"
         if p_cpu is not None:
-            period_line += f" · CPU {fmt_ms(p_cpu)}"
+            period_line += f" · CPU <b>{fmt_ms(p_cpu)}</b>"
         lines.append(period_line)
     except CFError as e:
         logger.warning("账期用量查询失败：%s", e)
 
     top = sorted(per_script.items(), key=lambda kv: kv[1], reverse=True)[:3]
     if len(per_script) > 1:
-        lines.append("🏆 " + " · ".join(f"{k} {fmt_num(v)}" for k, v in top))
+        lines.append("🏆 " + " · ".join(f"<code>{esc(k)}</code> {fmt_num(v)}" for k, v in top))
     metric = Metric("cloudflare:workers", "Cloudflare Workers/Pages 今日请求", pct,
                     start.strftime("%Y-%m-%d"), f"{total:,} / {CF_WORKERS_DAILY_LIMIT:,}")
     return lines, [metric]
@@ -667,7 +700,7 @@ def cf_r2_buckets():
 
 def cf_r2_block(now: datetime):
     month = now.strftime("%Y-%m")
-    empty = ["🪣 R2", "无存储桶实例"]
+    empty = [hdr("🪣 R2"), "无存储桶实例"]
 
     # 先问账号里有没有存储桶：没有就不用查（也避免已删除存储桶的历史数据混进来）
     buckets = cf_r2_buckets()
@@ -675,7 +708,7 @@ def cf_r2_block(now: datetime):
         return empty, []
     names = set(buckets) if buckets else None  # None = 列不出来，只能靠分析数据推断
 
-    lines, metrics = ["🪣 R2 · 本月"], []
+    box, extra, metrics = [], [], []  # box：额度（放引用块）；extra：明细和提示
 
     # --- 存储：取每个 bucket 最新的一条快照（payload + metadata）
     try:
@@ -695,15 +728,15 @@ def cf_r2_block(now: datetime):
         total = sum(v[1] for v in latest.values())
         limit_bytes = CF_R2_STORAGE_GB * 1e9  # 1GB 按 10^9 字节，偏保守
         pct = total / limit_bytes * 100
-        lines += quota("存储", pct, fmt_bytes(total), f"{CF_R2_STORAGE_GB:g}GB",
-                       fmt_bytes(max(limit_bytes - total, 0)))
+        box += quota("存储", pct, fmt_bytes(total), f"{CF_R2_STORAGE_GB:g}GB",
+                     fmt_bytes(max(limit_bytes - total, 0)))
         if len(latest) > 1:
             top = sorted(latest.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
-            lines.append("📦 " + " · ".join(f"{b} {fmt_bytes(v[1])}" for b, v in top))
+            extra.append("📦 " + " · ".join(f"<code>{esc(b)}</code> {fmt_bytes(v[1])}" for b, v in top))
         metrics.append(Metric("cloudflare:r2_storage", "R2 存储", pct, month,
                               f"{fmt_bytes(total)} / {CF_R2_STORAGE_GB:g}GB"))
     except CFError as e:
-        lines.append(f"❌ 存储查询失败：{e}{cf_hint(str(e))}")
+        extra.append(err(f"存储查询失败：{e}{cf_hint(str(e))}"))
 
     # --- 操作次数：本月累计，按 Class A / B 归类
     try:
@@ -742,20 +775,20 @@ def cf_r2_block(now: datetime):
             if rdims.get("actionStatus", "success") != "success":
                 failed += n
         pa, pb = a / CF_R2_CLASS_A * 100, b / CF_R2_CLASS_B * 100
-        lines += quota("Class A", pa, fmt_num(a), fmt_num(CF_R2_CLASS_A), fmt_num(max(CF_R2_CLASS_A - a, 0)))
-        lines += quota("Class B", pb, fmt_num(b), fmt_num(CF_R2_CLASS_B), fmt_num(max(CF_R2_CLASS_B - b, 0)))
+        box += quota("Class A", pa, fmt_num(a), fmt_num(CF_R2_CLASS_A), fmt_num(max(CF_R2_CLASS_A - a, 0)))
+        box += quota("Class B", pb, fmt_num(b), fmt_num(CF_R2_CLASS_B), fmt_num(max(CF_R2_CLASS_B - b, 0)))
         if per_action:
             top = sorted(per_action.items(), key=lambda kv: kv[1], reverse=True)[:4]
-            lines.append("🔍 " + " · ".join(f"{k} {fmt_num(v)}" for k, v in top))
+            extra.append("🔍 " + " · ".join(f"<code>{esc(k)}</code> {fmt_num(v)}" for k, v in top))
         if failed:
-            lines.append(f"⚠️ 其中 {fmt_num(failed)} 次为失败请求（如访问不存在的文件）")
+            extra.append(f"⚠️ 其中 <b>{fmt_num(failed)}</b> 次为失败请求（如访问不存在的文件）")
         if other:
-            lines.append(f"❔ 另有 {fmt_num(other)} 次操作未能归类，未计入")
+            extra.append(f"❔ 另有 {fmt_num(other)} 次操作未能归类，未计入")
         metrics.append(Metric("cloudflare:r2_a", "R2 Class A 操作", pa, month, f"{a:,} / {CF_R2_CLASS_A:,}"))
         metrics.append(Metric("cloudflare:r2_b", "R2 Class B 操作", pb, month, f"{b:,} / {CF_R2_CLASS_B:,}"))
     except CFError as e:
-        lines.append(f"❌ 操作次数查询失败：{e}{cf_hint(str(e))}")
-    return lines, metrics
+        extra.append(err(f"操作次数查询失败：{e}{cf_hint(str(e))}"))
+    return [hdr("🪣 R2", "本月"), bq(box)] + extra, metrics
 
 
 def cf_d1_databases():
@@ -785,7 +818,7 @@ def cf_d1_block(now: datetime):
     today = now.strftime("%Y-%m-%d")
     dbs = cf_d1_databases()
     if dbs is not None and not dbs:
-        return ["🗄 D1", "无数据库"], []
+        return [hdr("🗄 D1"), "无数据库"], []
     names = {k: v[0] for k, v in (dbs or {}).items()}
 
     # --- 今日读写行数（整个账号合计，按数据库细分）
@@ -821,34 +854,38 @@ def cf_d1_block(now: datetime):
         except CFError as e:
             logger.warning("D1 存储数据查询失败：%s", e)
     if dbs is None and not per_db and not sizes:
-        return ["🗄 D1", "无数据库（或近 3 天没有任何数据）"], []
+        return [hdr("🗄 D1"), "无数据库（或近 3 天没有任何数据）"], []
 
     storage = sum(sizes.values())
-    lines, metrics = ["🗄 D1 · 今日（全账号共享）"], []
+    metrics = []
     pr, pw = read / CF_D1_ROWS_READ * 100, written / CF_D1_ROWS_WRITTEN * 100
-    lines += quota("读取行", pr, fmt_num(read), fmt_num(CF_D1_ROWS_READ), fmt_num(max(CF_D1_ROWS_READ - read, 0)))
-    lines += quota("写入行", pw, fmt_num(written), fmt_num(CF_D1_ROWS_WRITTEN),
-                   fmt_num(max(CF_D1_ROWS_WRITTEN - written, 0)))
+    box = quota("读取行", pr, fmt_num(read), fmt_num(CF_D1_ROWS_READ), fmt_num(max(CF_D1_ROWS_READ - read, 0)))
+    box += quota("写入行", pw, fmt_num(written), fmt_num(CF_D1_ROWS_WRITTEN),
+                 fmt_num(max(CF_D1_ROWS_WRITTEN - written, 0)))
     limit_bytes = CF_D1_STORAGE_GB * 1e9
     ps = storage / limit_bytes * 100
-    lines += quota("存储", ps, fmt_bytes(storage), f"{CF_D1_STORAGE_GB:g}GB", fmt_bytes(max(limit_bytes - storage, 0)))
+    box += quota("存储", ps, fmt_bytes(storage), f"{CF_D1_STORAGE_GB:g}GB", fmt_bytes(max(limit_bytes - storage, 0)))
     reset_h = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - now).total_seconds() / 3600
-    lines.append(f"🔄 读写 {reset_h:.0f}小时后重置 · 超额当天查询会报错，不扣费")
+    lines = [hdr("🗄 D1", "今日 · 全账号共享"), bq(box),
+             f"🔄 读写 {reset_h:.0f}小时后重置 <i>· 超额当天查询会报错，不扣费</i>"]
 
     # 每个数据库一行：今日读/写行数、查询次数、大小（单库上限 500MB）
     db_max = CF_D1_DB_MAX_MB * 1e6
+    per_lines = []
     for dbid in sorted(set(per_db) | set(sizes) | set(names),
                        key=lambda k: -(per_db.get(k, [0])[0])):
         r_, w_, rq, wq = per_db.get(dbid, [0, 0, 0, 0])
         size = sizes.get(dbid)
         size_txt = f"{fmt_bytes(size)}/{CF_D1_DB_MAX_MB:g}MB" if size is not None else "大小未知"
-        lines.append(f"📁 {names.get(dbid, dbid[:8])} · 读 {fmt_num(r_)} · 写 {fmt_num(w_)} · "
-                     f"查询 {fmt_num(rq + wq)} · {size_txt}")
+        per_lines.append(f"📁 <b>{esc(names.get(dbid, dbid[:8]))}</b> · 读 {fmt_num(r_)} · 写 {fmt_num(w_)} · "
+                         f"查询 {fmt_num(rq + wq)} · <code>{esc(size_txt)}</code>")
         if size is not None:
             metrics.append(Metric(f"cloudflare:d1_db:{dbid}", f"D1 {names.get(dbid, dbid[:8])} 大小",
                                   size / db_max * 100, "size", f"{fmt_bytes(size)} / {CF_D1_DB_MAX_MB:g}MB"))
+    if per_lines:  # 每库明细默认折叠
+        lines.append(bq(per_lines, expandable=len(per_lines) > 2))
     if dbs is None:
-        lines.append("ℹ️ Token 没有 D1 Read 权限，数据库名用 ID 前 8 位显示")
+        lines.append("<i>ℹ️ Token 没有 D1 Read 权限，数据库名用 ID 前 8 位显示</i>")
 
     metrics += [
         Metric("cloudflare:d1_read", "D1 今日读取行", pr, today, f"{read:,} / {CF_D1_ROWS_READ:,}"),
@@ -922,33 +959,35 @@ def zone_traffic(zid: str, now: datetime):
 
 
 def cf_cdn_block(now: datetime):
-    lines = ["📈 CDN · 本月（免费计划无上限，仅供参考）"]
+    lines = [hdr("📈 CDN", "本月 · 免费计划无上限，仅供参考")]
     zones = cf_zone_list()
     if not zones:
         return lines + [
             "❔ 没有找到域名。可能原因：① 账号下没有托管域名（只用 pages.dev / R2 就没有 CDN 流量可查）；"
             "② Token 缺少 Zone Read 权限，或 Zone Resources 没包含域名。"
-            "不想加权限的话，在配置里填 CLOUDFLARE_ZONES=名称=ZoneID 即可"
+            "不想加权限的话，在配置里填 <code>CLOUDFLARE_ZONES=名称=ZoneID</code> 即可"
         ], []
     tot_req = tot_bytes = 0
+    box = []
     for label, zid in zones:
         try:
             m_req, m_bytes, t_req, t_bytes = zone_traffic(zid, now)
         except CFError as e:
-            lines.append(f"❌ {label}：查询失败 {e}{cf_hint(str(e))}")
+            box.append(err(f"{label}：查询失败 {e}{cf_hint(str(e))}"))
             continue
         tot_req += m_req
         tot_bytes += m_bytes
-        lines.append(f"🌍 {label} · 请求 {fmt_num(m_req)} · 流量 {fmt_bytes(m_bytes)}")
-        lines.append(f"└ 今日 {fmt_num(t_req)} · {fmt_bytes(t_bytes)}")
+        box.append(f"🌍 <b>{esc(label)}</b> · 请求 <b>{fmt_num(m_req)}</b> · 流量 <b>{fmt_bytes(m_bytes)}</b>")
+        box.append(f"└ 今日 {fmt_num(t_req)} · {fmt_bytes(t_bytes)}")
+    lines.append(bq(box, expandable=len(zones) > 3))
     if len(zones) > 1:
-        lines.append(f"Σ 合计 · 请求 {fmt_num(tot_req)} · 流量 {fmt_bytes(tot_bytes)}")
+        lines.append(f"Σ 合计 · 请求 <b>{fmt_num(tot_req)}</b> · 流量 <b>{fmt_bytes(tot_bytes)}</b>")
     return lines, []
 
 
 def get_cloudflare_data() -> Section:
     if not HEX32.match(CLOUDFLARE_ACCOUNT_ID):
-        return Section("🟠 Cloudflare\n❌ CLOUDFLARE_ACCOUNT_ID 格式不对（应为 32 位十六进制）")
+        return Section(hdr("🟠 Cloudflare") + "\n" + err("CLOUDFLARE_ACCOUNT_ID 格式不对（应为 32 位十六进制）"))
     now = datetime.now(timezone.utc)
     blocks, metrics = [], []
     for name, block in (("Workers & Pages", cf_workers_block), ("R2", cf_r2_block), ("D1", cf_d1_block),
@@ -958,11 +997,11 @@ def get_cloudflare_data() -> Section:
             blocks.append("\n".join(blk_lines))
             metrics += blk_metrics
         except CFError as e:
-            blocks.append(f"❌ {name} 查询失败：{e}{cf_hint(str(e))}")
+            blocks.append(err(f"{name} 查询失败：{e}{cf_hint(str(e))}"))
         except Exception as e:
             logger.exception("Cloudflare %s 查询异常", name)
-            blocks.append(f"❌ {name} 查询异常：{type(e).__name__}")
-    return Section("🟠 Cloudflare\n\n" + "\n\n".join(blocks), metrics)
+            blocks.append(err(f"{name} 查询异常：{type(e).__name__}"))
+    return Section("<b>🟠 Cloudflare</b>  ━━━━━━━━\n\n" + "\n\n".join(blocks), metrics)
 
 
 # ---------------------------------------------------------------- Oracle Cloud
@@ -994,11 +1033,11 @@ def oci_hint(e) -> str:
 
 
 def get_oracle_data() -> Section:
-    title = f"🔴 Oracle Cloud · {OCI_REGION}"
+    title = hdr("🔴 Oracle Cloud", OCI_REGION)
     try:
         import oci
     except ImportError:
-        return Section(f"{title}\n❌ 未安装 oci 库，请重新运行 install.sh")
+        return Section(f"{title}\n" + err("未安装 oci 库，请重新运行 install.sh"))
 
     try:
         cfg = {"user": OCI_USER, "fingerprint": OCI_FINGERPRINT, "tenancy": OCI_TENANCY,
@@ -1022,7 +1061,7 @@ def get_oracle_data() -> Section:
                 if va.lifecycle_state == "ATTACHED":
                     vnic_owner[va.vnic_id] = va.instance_id
         if not instances:
-            return Section(f"{title}\n没有找到实例（若有实例，请检查 OCI_REGION）")
+            return Section(f"{title}\n没有找到实例（若有实例，请检查 <code>OCI_REGION</code>）")
 
         now = datetime.now(timezone.utc)
         start, next_reset = month_start(now), next_month_start(now)
@@ -1068,17 +1107,18 @@ def get_oracle_data() -> Section:
         limit_bytes = OCI_EGRESS_LIMIT_TB * 1e12
         out_total = sum(egress.values())
         pct = out_total / limit_bytes * 100
-        lines += quota("出站流量", pct, fmt_bytes(out_total), f"{OCI_EGRESS_LIMIT_TB:g}TB",
-                       fmt_bytes(max(limit_bytes - out_total, 0)))
+        lines.append(bq(quota("出站流量", pct, fmt_bytes(out_total), f"{OCI_EGRESS_LIMIT_TB:g}TB",
+                              fmt_bytes(max(limit_bytes - out_total, 0)))))
         metrics.append(Metric("oci:egress", "Oracle 出站流量", pct, period,
                               f"{fmt_bytes(out_total)} / {OCI_EGRESS_LIMIT_TB:g}TB"))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置({fmt_date(next_reset)}) · "
-                     f"出站日均可用 {fmt_bytes(max(limit_bytes - out_total, 0) / remain_days)}")
+        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i> · "
+                     f"出站日均可用 <b>{fmt_bytes(max(limit_bytes - out_total, 0) / remain_days)}</b>")
 
         # --- 闲置回收检测（默认隐藏，OCI_IDLE_CHECK=1 开启）
         if OCI_IDLE_CHECK:
             lines.append("")
-            lines.append(f"💤 闲置检测 · 近 7 天（回收线 {OCI_IDLE_LINE:g}%）")
+            lines.append(hdr("💤 闲置检测", f"近 7 天 · 回收线 {OCI_IDLE_LINE:g}%"))
+            idle = []  # 每台实例几行，放进引用块
             today = now.strftime("%Y-%m-%d")
             for i in sorted(instances, key=lambda x: x.display_name):
                 name = i.display_name
@@ -1089,9 +1129,10 @@ def get_oracle_data() -> Section:
                     shape = "AMD Micro"
                 else:
                     shape = i.shape
-                out_line = f"   本月出站 {fmt_bytes(egress.get(i.id, 0))}"
+                out_line = f"└ 本月出站 {fmt_bytes(egress.get(i.id, 0))}"
+                who = f"<b>{esc(name)}</b> <i>{esc(shape)}</i>"
                 if i.lifecycle_state != "RUNNING":
-                    lines.append(f"⏸ {name}（{shape}）状态 {i.lifecycle_state}")
+                    idle.append(f"⏸ {who} · 状态 <code>{esc(i.lifecycle_state)}</code>")
                     continue
 
                 # 网络利用率 = 每 5 分钟收/发中较大的那个，换算成 bps 后除以实例带宽
@@ -1106,29 +1147,31 @@ def get_oracle_data() -> Section:
 
                 if cpu95 is None:
                     why = "CPU 无数据" if not samples else "CPU 数据不足 1 天"
-                    lines.append(f"❔ {name}（{shape}）{why} · {net_txt}{young}")
-                    lines.append("   Cloud Agent 的 Compute Instance Monitoring 插件没在上报，无法判断")
-                    lines.append(out_line)
+                    idle.append(f"❔ {who} · {why} · {net_txt}{young}")
+                    idle.append("└ Cloud Agent 的 Compute Instance Monitoring 插件没在上报，无法判断")
+                    idle.append(out_line)
                     continue
 
                 net_low = net95 is None or net95 < OCI_IDLE_LINE
                 at_risk = cpu95 < OCI_IDLE_WARN and net_low   # A1 的内存没监控，按最坏情况（偏低）处理
                 icon = "🚨" if at_risk and cpu95 < OCI_IDLE_LINE else ("⚠️" if at_risk else "✅")
-                lines.append(f"{icon} {name}（{shape}）CPU p95 {cpu95:.1f}% · {net_txt}{young}")
-                lines.append(out_line)
+                cpu_txt = f"<b>{cpu95:.1f}%</b>" if not at_risk else f"<u><b>{cpu95:.1f}%</b></u>"
+                idle.append(f"{icon} {who} · CPU p95 {cpu_txt} · {net_txt}{young}")
+                idle.append(out_line)
                 text = ""
                 if at_risk:
                     where = f"已低于 {OCI_IDLE_LINE:g}% 回收线" if cpu95 < OCI_IDLE_LINE else f"接近 {OCI_IDLE_LINE:g}% 回收线"
-                    text = (f"💤 Oracle {name}（{shape}）近 7 天 CPU p95 只有 {cpu95:.1f}%，{where}，"
-                            f"有被当作闲置实例回收的风险。可以跑点持续负载把 CPU 拉上去")
+                    text = (f"💤 <b>Oracle {esc(name)}</b>（{esc(shape)}）近 7 天 CPU p95 只有 <b>{cpu95:.1f}%</b>，"
+                            f"<u>{where}</u>，有被当作闲置实例回收的风险。可以跑点持续负载把 CPU 拉上去")
                 # 有风险时每天提醒一次；恢复后记录清零
                 metrics.append(Metric(f"oci_idle:{i.id}", f"Oracle {name} 闲置", 100 if at_risk else 0,
                                       today, "", text))
-            lines.append("ℹ️ 回收需 CPU、网络（A1 还有内存）同时偏低；内存未监控，A1 按最坏情况算")
+            lines.append(bq(idle))
+            lines.append("<i>ℹ️ 回收需 CPU、网络（A1 还有内存）同时偏低；内存未监控，A1 按最坏情况算</i>")
         return Section("\n".join(lines), metrics)
     except Exception as e:
         logger.exception("Oracle 查询失败")
-        return Section(f"{title}\n❌ 查询失败：{oci_hint(e)}")
+        return Section(f"{title}\n" + err(f"查询失败：{oci_hint(e)}"))
 
 
 # ---------------------------------------------------------------- 阿里云 CDT
@@ -1138,17 +1181,17 @@ def cdt_enabled() -> bool:
 
 def get_aliyun_data() -> Section:
     """读 cdt-guard 的状态快照（不调阿里云 API）。熔断/保活事件由 cdt-guard 自己推送，这里只做展示和额度告警"""
-    title = "🟧 Aliyun CDT"
+    title = hdr("🟧 Aliyun CDT")
     try:
         with open(CDT_STATE_PATH, encoding="utf-8") as f:
             st = json.load(f)
     except PermissionError:
-        return Section(f"{title}\n❌ bot 读不了 {CDT_STATE_PATH}（应为 644，目录 755）")
+        return Section(f"{title}\n" + err(f"bot 读不了 {CDT_STATE_PATH}（应为 644，目录 755）"))
     except (OSError, ValueError) as e:
-        return Section(f"{title}\n❌ 读取状态失败：{type(e).__name__}")
+        return Section(f"{title}\n" + err(f"读取状态失败：{type(e).__name__}"))
     if "used_gb" not in st:
-        err = st.get("last_error", "")
-        return Section(f"{title}\n❔ cdt-guard 还没成功查询过" + (f"\n❌ {err[:120]}" if err else ""))
+        err_msg = st.get("last_error", "")
+        return Section(f"{title}\n❔ cdt-guard 还没成功查询过" + (f"\n❌ {esc(err_msg[:120])}" if err_msg else ""))
 
     now = datetime.now(timezone.utc)
     used, quota_gb, limit = float(st["used_gb"]), float(st["quota_gb"]), float(st["limit_gb"])
@@ -1169,31 +1212,32 @@ def get_aliyun_data() -> Section:
     mode = "关机" if st.get("mode") == "stop" else "安全组封禁"
     pool = "海外/香港" if st.get("cls") == "international" else "中国内地"
 
-    lines = [f"{title} · 本月 · {pool}"]
-    lines += quota("流量", pct, fmt_gb(used), fmt_gb(quota_gb), fmt_gb(max(quota_gb - used, 0)))
-    lines.append(f"🛡 {guard} · 熔断线 {limit:g}GB（{mode}）· 距熔断 {fmt_gb(remain_to_limit)}")
+    lines = [hdr("🟧 Aliyun CDT", f"本月 · {pool}")]
+    lines.append(bq(quota("流量", pct, fmt_gb(used), fmt_gb(quota_gb), fmt_gb(max(quota_gb - used, 0)))
+                    + [f"🛡 <b>{esc(guard)}</b> · 熔断线 {limit:g}GB（{esc(mode)}）· 距熔断 <b>{fmt_gb(remain_to_limit)}</b>"]))
     host = st.get("name") or st.get("instance", "?")
-    lines.append(f"🖥 {host} · {st.get('status', '?')} · {st.get('ip') or '无公网IP'} · "
-                 f"速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
+    ip = st.get("ip")
+    lines.append(f"🖥 <b>{esc(host)}</b> · {esc(st.get('status', '?'))} · "
+                 f"{f'<code>{esc(ip)}</code>' if ip else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
     if len(st.get("by_region") or {}) > 1:
-        lines.append("🗺 " + " · ".join(f"{r} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
-    lines.append(f"🔄 {fmt_reset(next_reset)}后重置({fmt_date(next_reset.astimezone(REPORT_TZ))}) · "
-                 f"日均可用 {fmt_gb(remain_to_limit / remain_days)}")
+        lines.append("🗺 " + " · ".join(f"{esc(r)} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
+    lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset.astimezone(REPORT_TZ))})</i> · "
+                 f"日均可用 <b>{fmt_gb(remain_to_limit / remain_days)}</b>")
     cost_limit = float(st.get("cost_limit") or 0)
     cost_pct = None
     if cost_limit and st.get("cost_cycle") == cn_now.strftime("%Y-%m"):
         cost, cur = float(st.get("cost") or 0), st.get("currency", "USD")
         cost_pct = cost / cost_limit * 100
-        lines.append(f"💰 本月应付 {cost:.2f} / 熔断 {cost_limit:g} {cur}（账单有几小时延迟）")
+        lines.append(f"💰 本月应付 <b>{cost:.2f}</b> / 熔断 {cost_limit:g} {esc(cur)} <i>（账单有几小时延迟）</i>")
     if st.get("cost_error"):
-        lines.append(f"⚠️ 账单查询失败，费用熔断暂时失效：{str(st['cost_error'])[:80]}")
+        lines.append(f"⚠️ <b>账单查询失败，费用熔断暂时失效</b>：{esc(str(st['cost_error'])[:80])}")
 
     age_min = (time.time() - float(st.get("updated", 0))) / 60
     stale = age_min >= CDT_STALE_MIN
     if st.get("fail"):
-        lines.append(f"⚠️ cdt-guard 最近 {st['fail']} 次查询失败：{str(st.get('last_error', ''))[:100]}")
+        lines.append(f"⚠️ <b>cdt-guard 最近 {esc(st['fail'])} 次查询失败</b>：{esc(str(st.get('last_error', ''))[:100])}")
     if stale:
-        lines.append(f"⚠️ 数据已 {age_min:.0f} 分钟未更新，检查 cdt-guard.timer")
+        lines.append(f"⚠️ <b>数据已 {age_min:.0f} 分钟未更新</b>，检查 <code>cdt-guard.timer</code>")
 
     period = cn_now.strftime("%Y-%m")
     metrics = [
@@ -1203,8 +1247,8 @@ def get_aliyun_data() -> Section:
           if cost_pct is not None else []),
         # 快照长时间不更新 = 熔断失效，每天提醒一次
         Metric("aliyun:cdt_stale", "cdt-guard 状态", 100 if stale else 0, now.strftime("%Y-%m-%d"), "",
-               f"⚠️ cdt-guard 已 {age_min:.0f} 分钟没有更新状态，阿里云 CDT 熔断可能失效。"
-               f"在服务器上运行 bash init.sh status 检查" if stale else ""),
+               f"⚠️ <b>cdt-guard 已 {age_min:.0f} 分钟没有更新状态</b>，阿里云 CDT 熔断可能失效。"
+               f"在服务器上运行 <code>bash init.sh status</code> 检查" if stale else ""),
     ]
     return Section("\n".join(lines), metrics)
 
@@ -1238,27 +1282,78 @@ async def collect_sections(max_age: float = 30) -> list:
         return _cache["data"]
 
 
+def attention(sections: list) -> str:
+    """报告开头的摘要：越过最低告警线的指标全部列出来；都正常时只给一行"""
+    line = min(ALERT_THRESHOLDS) if ALERT_THRESHOLDS else 80
+    ms = [m for s in sections for m in s.metrics if m.pct is not None]
+    hot = sorted((m for m in ms if m.pct >= line), key=lambda m: -m.pct)
+    if hot:
+        rows = []
+        for m in hot:
+            if m.text:  # 闲置、状态过期这类提醒，没有百分比可言
+                rows.append(f"⚠️ <b>{esc(m.label)}</b>")
+            else:
+                rows.append(f"{status_icon(m.pct)} <b>{esc(m.label)}</b> <u><b>{m.pct:.1f}%</b></u>"
+                            f" · <code>{esc(m.detail)}</code>")
+        return f"🔥 <b>需要关注 · {len(hot)} 项</b>\n" + bq(rows)
+    quotas = [m for m in ms if not m.text]
+    if not quotas:
+        return ""
+    top = max(quotas, key=lambda m: m.pct)
+    return f"✅ <b>全部额度正常</b> · <i>最高 {esc(top.label)} {top.pct:.1f}%</i>"
+
+
+SEP = "\n\n"
+
+
 async def build_report(title: str = "📊 用量报告", max_age: float = 30) -> str:
     sections = await collect_sections(max_age)
     now = datetime.now(REPORT_TZ)
-    head = f"{title} · {fmt_date(now)} {now:%H:%M} {now.tzname()}"
+    head = f"<b>{esc(title)}</b>\n<i>{fmt_date(now)} {now:%H:%M} {esc(now.tzname())}</i>"
+    summary = attention(sections)
     interval = f"{REPORT_INTERVAL_SEC / 3600:g}小时" if REPORT_INTERVAL_SEC > 0 else "已关闭"
     alerts = "/".join(f"{t:g}%" for t in ALERT_THRESHOLDS)
-    foot = f"⏱ 播报间隔 {interval} · 告警线 {alerts}"
-    return head + "\n\n" + "\n\n".join(s.text for s in sections) + "\n\n" + foot
+    foot = f"<i>⏱ 播报间隔 {interval} · 告警线 {alerts}</i>"
+    return SEP.join([head] + ([summary] if summary else []) + [s.text for s in sections] + [foot])
+
+
+def strip_html(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
 def chunk_text(text: str, limit: int = 3900) -> list:
-    """Telegram 单条消息上限 4096 字符，按行拆分"""
+    """Telegram 单条消息上限 4096 字符。按空行分段拆，保证引用块、表格这些标签不会被拆开；
+    单独一段就超长时（极少见），去掉这段的标签再按行拆，免得出现不成对的标签"""
     chunks, cur = [], ""
-    for line in text.split("\n"):
-        if cur and len(cur) + len(line) + 1 > limit:
-            chunks.append(cur)
-            cur = ""
-        cur = f"{cur}\n{line}" if cur else line
+    for para in text.split(SEP):
+        pieces = [para]
+        if len(para) > limit:
+            pieces, buf = [], ""
+            for line in esc(strip_html(para)).split("\n"):
+                if buf and len(buf) + len(line) + 1 > limit:
+                    pieces.append(buf)
+                    buf = ""
+                buf = f"{buf}\n{line}" if buf else line[:limit]
+            pieces.append(buf)
+        for piece in pieces:
+            if cur and len(cur) + len(SEP) + len(piece) > limit:
+                chunks.append(cur)
+                cur = ""
+            cur = f"{cur}{SEP}{piece}" if cur else piece
     if cur:
         chunks.append(cur)
     return chunks or [""]
+
+
+async def send_html(send, text: str):
+    """用 HTML 格式发送；万一某处没转义干净导致 Telegram 解析失败，退回纯文本重发，消息不丢"""
+    try:
+        return await send(text, parse_mode=ParseMode.HTML)
+    except BadRequest as ex:
+        if "entit" not in str(ex).lower() and "tag" not in str(ex).lower():
+            raise
+        logger.warning("HTML 解析失败，改用纯文本发送：%s", ex)
+        return await send(strip_html(text))
 
 
 # ---------------------------------------------------------------- 告警
@@ -1300,7 +1395,8 @@ def evaluate_alerts(metrics: list, state: dict) -> list:
                 messages.append(m.text)
             else:
                 icon = "🚨" if level >= 95 else "⚠️"
-                messages.append(f"{icon} {m.label} 已用 {m.pct:.1f}%（{m.detail}），超过 {level:g}% 阈值")
+                messages.append(f"{icon} <b>{esc(m.label)}</b> 已用 <u><b>{m.pct:.1f}%</b></u>"
+                                f"（<code>{esc(m.detail)}</code>）· 超过 {level:g}% 阈值")
         state[m.key] = {"period": m.period, "level": level}
     return messages
 
@@ -1317,10 +1413,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
     delivered = not messages
     if messages:
-        text = "🚨 用量告警\n" + "\n".join(messages)
+        now = datetime.now(REPORT_TZ)
+        text = (f"🚨 <b>用量告警</b>  <i>{fmt_date(now)} {now:%H:%M}</i>\n"
+                + bq(messages) + "\n<i>发 /check 查看完整报告</i>")
         for chat_id in chats:
             try:
-                await context.bot.send_message(chat_id=chat_id, text=text)
+                await send_html(lambda t, **kw: context.bot.send_message(chat_id=chat_id, text=t, **kw), text)
                 delivered = True
             except Exception:
                 logger.exception("告警发送失败 chat_id=%s", chat_id)
@@ -1351,9 +1449,9 @@ def schedule_report(job_queue, chat_id: int):
 
 async def reply_long(update: Update, placeholder, text: str):
     chunks = chunk_text(text)
-    await placeholder.edit_text(chunks[0])
+    await send_html(placeholder.edit_text, chunks[0])
     for c in chunks[1:]:
-        await update.message.reply_text(c)
+        await send_html(update.message.reply_text, c)
 
 
 @restricted
@@ -1373,12 +1471,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("正在查询中...")
+    msg = await update.message.reply_text("⏳ 正在查询中...")
     await reply_long(update, msg, await build_report(max_age=10))
 
 
 async def _single(update: Update, label: str, fn):
-    msg = await update.message.reply_text(f"正在查询 {label}...")
+    msg = await update.message.reply_text(f"⏳ 正在查询 {label}...")
     section = await asyncio.to_thread(fn)
     await reply_long(update, msg, section.text)
 
@@ -1420,8 +1518,9 @@ async def aliyun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_auto_report(context: ContextTypes.DEFAULT_TYPE):
     report = await build_report("🔔 定时播报")
+    chat_id = context.job.chat_id
     for c in chunk_text(report):
-        await context.bot.send_message(chat_id=context.job.chat_id, text=c)
+        await send_html(lambda t, **kw: context.bot.send_message(chat_id=chat_id, text=t, **kw), c)
 
 
 @restricted
