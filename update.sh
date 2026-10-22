@@ -5,7 +5,8 @@
 #   sudo ./update.sh --status   只看每个工具的仓库版本、已部署版本、运行状态
 #   sudo ./update.sh --no-pull  不同步 git，直接部署磁盘上的代码
 #
-# 是否已安装按部署目录判断：/opt/cdt-guard、/opt/traffic-bot、/opt/cfst-ddns。没装的跳过，不会帮你新装。
+# 是否已安装：程序文件（/opt/<应用>/…）和配置文件（/etc/<应用>.env）都在才算。没装的跳过，不会帮你新装；
+# 只有其中一个（没装完 / 卸载残留）的会提示出来，同样跳过。
 # 影响：会重启本机的 traffic-bot（断开几秒），cdt-guard 会立即执行一次检查，cfst-ddns 的 timer 会重启。
 # 只更新其中一个：sudo ./<目录>/update.sh
 # ==== 公共部分 v1（各仓库的 update.sh 里这一段完全相同，改的时候一起改）====
@@ -107,21 +108,32 @@ restarted() {
 
 need_root
 cd "$(dirname "$SELF")"
-TOOLS=(CDT-Management:/opt/cdt-guard/cdt_guard.py traffic-bot:/opt/traffic-bot/bot.py cfst-ddns:/opt/cfst-ddns/cfst-ddns.sh)
+# 目录:程序文件:配置文件 —— 两个都在才算已安装（和各子目录 update.sh 的判断一致）
+TOOLS=(CDT-Management:/opt/cdt-guard/cdt_guard.py:/etc/cdt-guard.env
+       traffic-bot:/opt/traffic-bot/bot.py:/etc/traffic-bot.env
+       cfst-ddns:/opt/cfst-ddns/cfst-ddns.sh:/etc/cfst-ddns.env)
 
-found=()
-for t in "${TOOLS[@]}"; do [[ -f "${t#*:}" ]] && found+=("${t%%:*}"); done
+found=() leftover=()
+for t in "${TOOLS[@]}"; do
+  IFS=: read -r dir prog conf <<<"$t"
+  if [[ -f "$prog" && -f "$conf" ]]; then found+=("$dir")
+  elif [[ -f "$prog" ]]; then leftover+=("$dir（有 $prog，没有 $conf）")
+  elif [[ -f "$conf" ]]; then leftover+=("$dir（有 $conf，没有 $prog）")
+  fi
+done
 
 if (( STATUS )); then
   git fetch -q origin "$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || warn "fetch 失败，远端版本可能不是最新"
   echo "仓库   $(git rev-parse --abbrev-ref HEAD) @ $(short) · 远端 $(git rev-parse --short '@{u}' 2>/dev/null || echo ?)"
   for d in "${found[@]}"; do echo; bash "$d/update.sh" --status; done
+  for l in "${leftover[@]}"; do echo; warn "残留：$l"; done
   (( ${#found[@]} )) || echo "本机一个都没装"
   exit 0
 fi
 
 (( ${#found[@]} )) || die "本机没有安装任何一个工具（/opt/cdt-guard、/opt/traffic-bot、/opt/cfst-ddns 都不存在）"
 echo "本机已安装：${found[*]}"
+for l in "${leftover[@]}"; do warn "跳过 $l：像是没装完或卸载后的残留，不是这台机器上在用的工具"; done
 
 step "同步代码"
 sync_repo
