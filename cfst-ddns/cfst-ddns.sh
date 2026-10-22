@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.22.2"
+VERSION="2026.10.22.3"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -326,14 +326,23 @@ sonde_report() {
              group: .[4], src: .[5], mark: .[6]})') || top="[]"
   fi
   # 巡检只测当前 IP，没有榜单：沿用上一次复测 / 全量扫描的榜单和延迟筛选，面板上的卡片保持同样的行数
-  local scan params last="$WORK/sonde_last.json" top_ts
+  local scan params last="$WORK/sonde_last.json" top_ts cmp
   scan=$(scrub "$SCAN_NOTE"); params=$(scrub "$(sed -E 's/ -url [^ ]+//' <<<"$(config_brief)")")
   top_ts=$(date +%s)
+  cmp=$(scrub "$(sed 's/（[^）]*）//g' <<<"$COMPARE")")
   if [[ "$MODE" != check && "$top" != "[]" ]]; then
-    jq -nc --argjson top "$top" --arg scan "$scan" --argjson ts "$top_ts" '{top: $top, scan: $scan, ts: $ts}' > "$last" 2>/dev/null || true
+    jq -nc --argjson top "$top" --arg scan "$scan" --arg cmp "$cmp" --argjson ts "$top_ts" \
+      '{top: $top, scan: $scan, compare: $cmp, ts: $ts}' > "$last" 2>/dev/null || true
   elif [[ -s "$last" ]]; then
     top=$(jq -c '.top' "$last" 2>/dev/null || echo '[]'); scan=$(jq -r '.scan' "$last" 2>/dev/null || echo "$scan")
+    [[ -n "$cmp" ]] || cmp=$(jq -r '.compare // ""' "$last" 2>/dev/null || echo "")
     top_ts=$(jq -r '.ts' "$last" 2>/dev/null || echo "$top_ts")
+  fi
+  # 还没有保存过榜单（更新后第一次只跑了巡检）：至少把这次测的当前 IP 放进去
+  if [[ "$top" == "[]" && -n "$IP" && "$KIND" != failed ]]; then
+    top=$(jq -nc --arg c "$cur" --arg lat "$LAT" --arg sp "$SPEED" --arg loss "$LOSS" --arg g "$GROUP" --arg src "$(src_name "$SRC")" \
+      '[{colo: $c, lat: ($lat | tonumber? // 0), speed: ($sp | tonumber? // 0), loss: ($loss | tonumber? // 0),
+         group: ($g | sub(" ?段$"; "") | sub("ms"; "")), src: $src, mark: "pick"}]')
   fi
   series="{}"
   if [[ "$KIND" != failed && -n "$IP" ]]; then
@@ -346,7 +355,7 @@ sonde_report() {
     --arg label "$TARGET_LABEL" --arg kind "$KIND" --arg path "$PATH_DESC" --arg colo "$cur" --arg old "$old" \
     --arg metric "$METRIC" --arg speed "$SPEED" --arg lat "$LAT" --arg loss "$LOSS" --arg group "$GROUP" \
     --arg src "$(src_name "$SRC")" --arg why "$(scrub "$WHY")" --arg reason "$(scrub "$REASON")" \
-    --arg compare "$(scrub "$(sed 's/（[^）]*）//g' <<<"$COMPARE")")" --arg ver "$VERSION" \
+    --arg compare "$cmp" --arg ver "$VERSION" \
     --arg host "$(cat /proc/sys/kernel/hostname)" --argjson t "${t:-0}" --arg peak "$(is_peak && echo 1)" \
     --arg scan "$scan" --arg params "$params" --argjson top_ts "$top_ts" --arg mode "$MODE" \
     '{source: $source, ts: now | floor, interval: $iv, series: $series,
