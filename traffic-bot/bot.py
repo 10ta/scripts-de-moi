@@ -42,6 +42,7 @@ BWH_API_KEY = os.getenv("BWH_API_KEY", "")
 BWH_VEID = os.getenv("BWH_VEID", "")
 
 BWH_TOTAL_GB = float(os.getenv("BWH_TOTAL_GB", "2000"))
+BWH_NAME = os.getenv("BWH_NAME", "")  # Sonde 面板上的名称（如 Megabox）；留空则用 API 返回的套餐名，再没有就是 VPS
 LIGHTSAIL_REGION = os.getenv("LIGHTSAIL_REGION", "ap-northeast-1")
 # AWS 账单（CloudWatch 账单指标，需在 Billing preferences 开启 Receive CloudWatch Billing Alerts）
 AWS_BILL = os.getenv("AWS_BILL", "1") not in ("0", "false", "no", "")
@@ -134,6 +135,8 @@ class Section:
     text: str
     metrics: list = field(default_factory=list)
     name: str = ""  # 来源名，collect_sections 填写（Sonde 面板用）
+    group: str = ""  # Sonde 面板上的第一层名称（厂商），如 AWS、Cloudflare
+    label: str = ""  # Sonde 面板上的第二层名称；查询函数可以自己定（如 BWH 的套餐名），否则用 PROVIDERS 里的
     empty: bool = False  # 没有任何实例 / 资源（Sonde 面板上不显示这张卡）
     parts: list = field(default_factory=list)  # 拆成几张卡上报：[(名称, 文本, 指标, 是否为空)]，目前只有 Cloudflare 用
     bill: dict = None  # 本月已产生的费用（Sonde 顶部汇总用）：{name, amount, currency, tz, ts}
@@ -275,6 +278,11 @@ def quota(name: str, pct: float, used: str, total: str, remain: str) -> list:
             f"└ <code>{esc(used)}</code> / {esc(total)} · 剩 <b>{esc(remain)}</b>"]
 
 
+def fmt_dt(dt: datetime) -> str:
+    """Oct.27 22:59:59 —— 重置时刻精确到秒（按 dt 自带的时区显示）"""
+    return f"{fmt_date(dt)} {dt:%H:%M:%S}"
+
+
 def fmt_reset(dt: datetime) -> str:
     """距重置还有多久"""
     hours = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
@@ -303,10 +311,12 @@ def get_bwh_data() -> Section:
 
         lines = [hdr("🖥 BWH", "本周期"),
                  bq(quota("流量", pct, fmt_gb(used_gb), fmt_gb(BWH_TOTAL_GB), fmt_gb(remain_gb))),
-                 f"🔄 {fmt_reset(reset_dt)}后重置 <i>({fmt_date(reset_dt.astimezone(REPORT_TZ))})</i> · "
+                 f"🔄 {fmt_reset(reset_dt)}后重置 <i>({fmt_dt(reset_dt.astimezone(REPORT_TZ))})</i> · "
                  f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]
         metric = Metric("bwh", "BWH 流量", pct, str(reset_ts), f"{used_gb:.1f} / {BWH_TOTAL_GB:.0f}GB")
-        return Section("\n".join(lines), [metric])
+        sec = Section("\n".join(lines), [metric])
+        sec.label = BWH_NAME or str(data.get("plan") or "").strip()[:24] or "VPS"
+        return sec
     except Exception as e:
         # 异常信息里可能带有含 api_key 的 URL，必须脱敏后再记录/回显
         safe = str(e).replace(BWH_API_KEY, "***") if BWH_API_KEY else str(e)
@@ -355,7 +365,7 @@ def get_aws_data() -> Section:
                             + [f"└ 日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]))
             metrics.append(Metric(f"lightsail:{name}", f"Lightsail {name} 流量", pct,
                                   now.strftime("%Y-%m"), f"{used_gb:.1f} / {quota_gb}GB"))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i>")
+        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i>")
         return Section("\n".join(lines), metrics)
     except Exception as e:
         logger.exception("AWS 查询失败")
@@ -407,7 +417,7 @@ def get_cloudfront_data() -> Section:
                  bq(quota("流量", gb_pct, fmt_gb(used_gb), fmt_gb(CLOUDFRONT_LIMIT_GB), fmt_gb(remain_gb))
                     + quota("请求", req_pct, fmt_num(used_req), fmt_num(CLOUDFRONT_LIMIT_REQUESTS),
                             fmt_num(remain_req))),
-                 f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i> · "
+                 f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
                  f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b> / <b>{fmt_num(remain_req / remain_days)}</b>次"]
         if elapsed >= 86400:  # 第 1 天数据太少，不外推
             k = month_sec / elapsed
@@ -1148,7 +1158,7 @@ def get_oracle_data() -> Section:
                               fmt_bytes(max(limit_bytes - out_total, 0)))))
         metrics.append(Metric("oci:egress", "Oracle 出站流量", pct, period,
                               f"{fmt_bytes(out_total)} / {OCI_EGRESS_LIMIT_TB:g}TB"))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset)})</i> · "
+        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
                      f"出站日均可用 <b>{fmt_bytes(max(limit_bytes - out_total, 0) / remain_days)}</b>")
 
         # --- 闲置回收检测（默认隐藏，OCI_IDLE_CHECK=1 开启）
@@ -1257,7 +1267,7 @@ def get_aliyun_data() -> Section:
                  f"{'有公网IP' if st.get('ip') else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
     if len(st.get("by_region") or {}) > 1:
         lines.append("🗺 " + " · ".join(f"{esc(r)} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
-    lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_date(next_reset.astimezone(REPORT_TZ))})</i> · "
+    lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
                  f"日均可用 <b>{fmt_gb(remain_to_limit / remain_days)}</b>")
     cost_limit = float(st.get("cost_limit") or 0)
     cost_pct = None
@@ -1290,14 +1300,14 @@ def get_aliyun_data() -> Section:
 
 
 # ---------------------------------------------------------------- 汇总 / 缓存
-PROVIDERS = [  # (是否启用, 查询函数, 名称)
-    (lambda: bool(BWH_API_KEY and BWH_VEID), get_bwh_data, "BWH"),
-    (lambda: True, get_aws_data, "Lightsail"),
-    (lambda: True, get_cloudfront_data, "CloudFront"),
-    (lambda: AWS_BILL, get_aws_bill_data, "AWS 账单"),
-    (lambda: bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), get_cloudflare_data, "Cloudflare"),
-    (oci_enabled, get_oracle_data, "Oracle Cloud"),
-    (cdt_enabled, get_aliyun_data, "Aliyun CDT"),
+PROVIDERS = [  # (是否启用, 查询函数, 名称, Sonde 面板上的「厂商: 名称」)
+    (lambda: bool(BWH_API_KEY and BWH_VEID), get_bwh_data, "BWH", ("BandwagonHost", "VPS")),
+    (lambda: True, get_aws_data, "Lightsail", ("AWS", "Lightsail")),
+    (lambda: True, get_cloudfront_data, "CloudFront", ("AWS", "CloudFront")),
+    (lambda: AWS_BILL, get_aws_bill_data, "AWS 账单", ("AWS", "账单")),
+    (lambda: bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), get_cloudflare_data, "Cloudflare", ("Cloudflare", "")),
+    (oci_enabled, get_oracle_data, "Oracle Cloud", ("OracleCloud", "用量")),
+    (cdt_enabled, get_aliyun_data, "Aliyun CDT", ("AlibabaCloud", "CDT")),
 ]
 
 _cache = {"ts": 0.0, "data": []}
@@ -1313,10 +1323,11 @@ async def collect_sections(max_age: float = 30) -> list:
         if _cache["data"] and time.monotonic() - _cache["ts"] < max_age:
             return _cache["data"]
         # 几类查询都是阻塞 IO，放到线程里并发执行，避免卡住 bot 事件循环
-        active = [(fn, name) for enabled, fn, name in PROVIDERS if enabled()]
-        results = await asyncio.gather(*(asyncio.to_thread(fn) for fn, _ in active))
-        for sec, (_, name) in zip(results, active):
-            sec.name = name
+        active = [(fn, name, gl) for enabled, fn, name, gl in PROVIDERS if enabled()]
+        results = await asyncio.gather(*(asyncio.to_thread(fn) for fn, _, _ in active))
+        for sec, (_, name, (group, label)) in zip(results, active):
+            sec.name, sec.group = name, group
+            sec.label = sec.label or label
         _cache["ts"], _cache["data"] = time.monotonic(), list(results)
         return _cache["data"]
 
@@ -1416,9 +1427,9 @@ def sonde_report(sections: list) -> None:
     for s in sections:
         if s.parts:  # Cloudflare：每一块单独一张卡
             for pname, text, mlist, empty in s.parts:
-                card(f"{s.name} · {pname}", s.name, text, mlist, empty)
+                card(pname, s.group or s.name, text, mlist, empty)
         else:
-            card(s.name or "?", "", s.text, s.metrics, s.empty)
+            card(s.label or s.name or "?", s.group, s.text, s.metrics, s.empty)
     bills = [s.bill for s in sections if s.bill]
     for b in bills:  # 账单走势也画曲线
         series[f"bill:{b['name']}"] = b["amount"]

@@ -385,6 +385,8 @@ SONDE_URL=https://sonde-api.example.com
 SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
 ```
 
+面板上的卡片名称是「厂商 · 名称」两层，如 AWS · CloudFront、Cloudflare · D1；BandwagonHost 的名称默认用 API 返回的套餐名，可以用 `BWH_NAME=Megabox` 指定。
+
 上报内容和 Telegram 消息一样脱敏（不含 IP、域名、网址、实例 ID）；不填就不上报，上报失败只记一行日志，不影响本来的工作。
 
 ## 更新与维护
