@@ -85,7 +85,11 @@ OCI_IDLE_WARN = float(os.getenv("OCI_IDLE_WARN", "25"))   # CPU p95 低于它就
 # 阿里云 CDT：只读 cdt-guard（scripts-de-moi/script/CDT-Management）每 5 分钟写出的状态快照
 CDT_STATE_PATH = os.getenv("CDT_STATE_PATH", "/var/lib/cdt-guard/state.json")
 CDT_STALE_MIN = float(os.getenv("CDT_STALE_MIN", "15"))  # 快照超过这么多分钟没更新就提醒（cdt-guard 可能停了）
-CDT_TZ = ZoneInfo("Asia/Shanghai")  # CDT 免费额度按北京时间自然月重置
+CDT_TZ = ZoneInfo("Asia/Shanghai")
+
+# Sonde 面板（可选）：填了就在每次告警检查后上报一份用量（和 TG 消息一样脱敏），失败不影响 bot
+SONDE_URL = os.getenv("SONDE_URL", "").rstrip("/")
+SONDE_TOKEN = os.getenv("SONDE_TOKEN", "")  # CDT 免费额度按北京时间自然月重置
 
 # 定时播报间隔（小时，0 = 关闭）。兼容旧变量 REPORT_INTERVAL（秒）
 if os.getenv("REPORT_INTERVAL_HOURS"):
@@ -129,6 +133,7 @@ class Metric:
 class Section:
     text: str
     metrics: list = field(default_factory=list)
+    name: str = ""  # 来源名，collect_sections 填写（Sonde 面板用）
 
 
 def aws_client(service: str, region: str):
@@ -1273,14 +1278,14 @@ def get_aliyun_data() -> Section:
 
 
 # ---------------------------------------------------------------- 汇总 / 缓存
-PROVIDERS = [
-    (lambda: bool(BWH_API_KEY and BWH_VEID), get_bwh_data),
-    (lambda: True, get_aws_data),
-    (lambda: True, get_cloudfront_data),
-    (lambda: AWS_BILL, get_aws_bill_data),
-    (lambda: bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), get_cloudflare_data),
-    (oci_enabled, get_oracle_data),
-    (cdt_enabled, get_aliyun_data),
+PROVIDERS = [  # (是否启用, 查询函数, 名称)
+    (lambda: bool(BWH_API_KEY and BWH_VEID), get_bwh_data, "BWH"),
+    (lambda: True, get_aws_data, "Lightsail"),
+    (lambda: True, get_cloudfront_data, "CloudFront"),
+    (lambda: AWS_BILL, get_aws_bill_data, "AWS 账单"),
+    (lambda: bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), get_cloudflare_data, "Cloudflare"),
+    (oci_enabled, get_oracle_data, "Oracle Cloud"),
+    (cdt_enabled, get_aliyun_data, "Aliyun CDT"),
 ]
 
 _cache = {"ts": 0.0, "data": []}
@@ -1296,7 +1301,10 @@ async def collect_sections(max_age: float = 30) -> list:
         if _cache["data"] and time.monotonic() - _cache["ts"] < max_age:
             return _cache["data"]
         # 几类查询都是阻塞 IO，放到线程里并发执行，避免卡住 bot 事件循环
-        results = await asyncio.gather(*(asyncio.to_thread(fn) for enabled, fn in PROVIDERS if enabled()))
+        active = [(fn, name) for enabled, fn, name in PROVIDERS if enabled()]
+        results = await asyncio.gather(*(asyncio.to_thread(fn) for fn, _ in active))
+        for sec, (_, name) in zip(results, active):
+            sec.name = name
         _cache["ts"], _cache["data"] = time.monotonic(), list(results)
         return _cache["data"]
 
@@ -1376,6 +1384,31 @@ async def send_html(send, text: str):
         return await send(strip_html(text))
 
 
+# ---------------------------------------------------------------- Sonde 上报
+def sonde_report(sections: list) -> None:
+    if not (SONDE_URL and SONDE_TOKEN):
+        return
+    providers, series = [], {}
+    for s in sections:
+        metrics = []
+        for m in s.metrics:
+            alert = bool(m.text)  # 闲置、状态过期这类提醒：只有触发 / 未触发
+            metrics.append({"key": m.key, "label": m.label, "pct": round(float(m.pct or 0), 2),
+                            "detail": scrub(m.detail), "alert": alert})
+            if not alert and len(series) < 40:
+                series[m.key] = round(float(m.pct or 0), 2)
+        providers.append({"name": s.name or "?", "ok": "❌" not in s.text, "metrics": metrics, "html": scrub(s.text)})
+    body = {"source": "traffic-bot", "ts": int(time.time()), "interval": ALERT_CHECK_SEC,
+            "data": {"providers": providers, "thresholds": ALERT_THRESHOLDS}, "series": series}
+    try:
+        r = requests.post(f"{SONDE_URL}/ingest", json=body, timeout=5,
+                          headers={"Authorization": f"Bearer {SONDE_TOKEN}"})
+        if r.status_code != 200:
+            logger.warning("Sonde 上报失败：HTTP %s", r.status_code)
+    except requests.RequestException as e:
+        logger.warning("Sonde 上报失败：%s", type(e).__name__)
+
+
 # ---------------------------------------------------------------- 告警
 def load_state() -> dict:
     try:
@@ -1426,6 +1459,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     if not chats:
         return
     sections = await collect_sections(max_age=30)
+    await asyncio.to_thread(sonde_report, sections)
     metrics = [m for s in sections for m in s.metrics]
     old = load_state()
     state = json.loads(json.dumps(old))

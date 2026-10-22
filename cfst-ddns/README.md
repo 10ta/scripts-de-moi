@@ -398,6 +398,17 @@ sudo systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
   [上传 2/10] 104.17.x.x          65.40ms <150ms 段  失败：服务器返回 HTTP 403
 ```
 
+## Sonde 面板（可选）
+
+在 `/etc/cfst-ddns.env` 里填上 [Sonde](https://github.com/10ta/Sonde) 的 API 地址和上报密钥，之后每次真正测速后上报一次（IP 换成机房代码，种子不带域名），网页上就会出现这里的状态：
+
+```bash
+SONDE_URL=https://sonde-api.example.com
+SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
+```
+
+上报内容和 Telegram 消息一样脱敏（不含 IP、域名、网址、实例 ID）；不填就不上报，上报失败只记一行日志，不影响本来的工作。
+
 ## 日常运维
 
 模式后面加 `:目标` 只跑这一个目标，例如 `sudo systemctl start cfst-ddns@full:cloudfront`；不加就按 `TARGETS` 依次跑所有目标。

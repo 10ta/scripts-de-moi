@@ -78,6 +78,8 @@ class Config:
         self.site = env.get("ALI_SITE", "intl")  # intl = 国际站（alibabacloud.com），cn = 中国站
         self.bss_host = "business.ap-southeast-1.aliyuncs.com" if self.site == "intl" else "business.aliyuncs.com"
         self.endpoint = env.get("ALI_ENDPOINT_OVERRIDE", "")  # 仅测试用
+        self.sonde_url = env.get("SONDE_URL", "").rstrip("/")  # Sonde 面板的 Worker 地址，留空不上报
+        self.sonde_token = env.get("SONDE_TOKEN", "")
         if self.mode not in ("stop", "sg"):
             raise SystemExit("GUARD_MODE 只能是 stop 或 sg")
 
@@ -247,18 +249,47 @@ _SCRUB = [re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"）)]*"),
                      r"|one|uk|jp|kr|hk|tw|us|de|fr)\b")]
 
 
+def _redact(text):
+    for rx in _SCRUB:
+        text = rx.sub("***", text)
+    return text
+
+
 def notify(cfg, text):
     print(text)
     if not (cfg.tg_token and cfg.tg_chat):
         return
-    for rx in _SCRUB:
-        text = rx.sub("***", text)
+    text = _redact(text)
     for chat in (c.strip() for c in cfg.tg_chat.split(",") if c.strip()):
         try:
             body = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
             urllib.request.urlopen(f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage", data=body, timeout=15).read()
         except Exception as e:
             print(f"[tg] 发送到 {chat} 失败: {type(e).__name__}", file=sys.stderr)  # 不打印 e，URL 里有 token
+
+
+def sonde_report(cfg, st):
+    """把当前状态上报到 Sonde 面板（可选，失败只打日志）。只报展示需要的字段，不含 IP、实例 ID"""
+    if not (cfg.sonde_url and cfg.sonde_token):
+        return
+    scrub = lambda t: _redact(str(t))[:160]
+    cycle_ok = st.get("cost_cycle") == bill_cycle(time.time())
+    data = {k: st.get(k) for k in ("name", "status", "cls", "mode", "region", "used_gb", "quota_gb", "limit_gb",
+                                   "rate_gbh", "locked", "cost_locked", "hold", "cost_limit", "currency", "fail")}
+    data["by_region"] = st.get("by_region") or {}
+    data["cost"] = st.get("cost", 0.0) if cycle_ok else 0.0
+    data["cost_error"] = scrub(st["cost_error"]) if st.get("cost_error") else ""
+    data["last_error"] = scrub(st["last_error"]) if st.get("last_error") else ""
+    series = {k: float(data[k]) for k in ("used_gb", "rate_gbh", "cost") if isinstance(data.get(k), (int, float))}
+    body = json.dumps({"source": "cdt-guard", "ts": int(time.time()), "interval": 300,
+                       "data": data, "series": series}).encode()
+    req = urllib.request.Request(cfg.sonde_url + "/ingest", data=body, method="POST", headers={
+        "Authorization": f"Bearer {cfg.sonde_token}", "Content-Type": "application/json",
+        "User-Agent": "cdt-guard"})
+    try:
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        print(f"[sonde] 上报失败: {type(e).__name__}: {getattr(e, 'code', '')}", file=sys.stderr)
 
 
 def rate_per_hour(samples, now, bw_mbps=0):
@@ -305,6 +336,7 @@ def check(cfg):
         if st["fail"] == 3:
             notify(cfg, f"⚠️ {tag} 连续 3 次查询阿里云失败，守护暂停动作\n{e}")
         save_state(cfg, st)
+        sonde_report(cfg, st)
         print(f"query failed: {e}", file=sys.stderr)
         return 1
     if st.get("fail", 0) >= 3:
@@ -415,6 +447,7 @@ def check(cfg):
         "cost_limit": cfg.cost_limit, "cost_locked": cost_locked,
     })
     save_state(cfg, st)
+    sonde_report(cfg, st)
     for ev in events:
         notify(cfg, ev)
     print(f"{datetime.now():%F %T} used={used:.3f}GB rate={rate:.2f}GB/h proj={projected:.2f} status={status} "

@@ -202,6 +202,17 @@ journalctl -u cdt-guard -f                     # 看日志
 
 ---
 
+## Sonde 面板（可选）
+
+在 `/etc/cdt-guard.env` 里填上 [Sonde](https://github.com/10ta/Sonde) 的 API 地址和上报密钥，下一次检查（5 分钟内）起每次检查后上报一次，网页上就会出现这里的状态：
+
+```bash
+SONDE_URL=https://sonde-api.example.com
+SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
+```
+
+上报内容和 Telegram 消息一样脱敏（不含 IP、域名、网址、实例 ID）；不填就不上报，上报失败只记一行日志，不影响本来的工作。
+
 ## 文件说明
 
 | 文件 | 作用 |

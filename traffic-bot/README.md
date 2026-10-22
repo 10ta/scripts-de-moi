@@ -376,6 +376,17 @@ sudo bash install.sh
 
 ---
 
+## Sonde 面板（可选）
+
+在 `/etc/traffic-bot.env` 里填上 [Sonde](https://github.com/10ta/Sonde) 的 API 地址和上报密钥，`systemctl restart traffic-bot` 后每次告警检查（默认 10 分钟）上报一次，网页上就会出现这里的状态：
+
+```bash
+SONDE_URL=https://sonde-api.example.com
+SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
+```
+
+上报内容和 Telegram 消息一样脱敏（不含 IP、域名、网址、实例 ID）；不填就不上报，上报失败只记一行日志，不影响本来的工作。
+
 ## 更新与维护
 
 ```bash

@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.21.2"
+VERSION="2026.10.22.1"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -155,6 +155,8 @@ TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 TG_NOTIFY="${TG_NOTIFY:-all}"            # all=每次都发  change=只在 IP 变化或失败时发  off=不发
 TG_NOTIFY_CHECK="${TG_NOTIFY_CHECK:-off}"  # on=巡检结果正常时也发一条  off=不发
+SONDE_URL="${SONDE_URL:-}"               # Sonde 面板的 Worker 地址，留空不上报（每次真正测速后上报一份，已脱敏）
+SONDE_TOKEN="${SONDE_TOKEN:-}"
 WORK="$STATE_DIRECTORY/$CFST_TARGET"     # systemd 下是 /var/lib/cfst-ddns/<目标>
 API="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
 export TZ="$TIMEZONE"
@@ -298,6 +300,56 @@ notify() {
   fi
 }
 
+# ---------- Sonde 面板上报（和简报一样脱敏：IP 换成机房代码，种子不带域名）----------
+sonde_report() {
+  [[ -n "$SONDE_URL" && -n "$SONDE_TOKEN" ]] || return 0
+  [[ "$KIND" == skip || -z "$KIND" ]] && return 0
+  local top="[]" cur="" old="" body series iv
+  [[ -n "$IP" ]] && cur=$(colo_of "$IP")
+  [[ -n "$OLD_IP" ]] && old=$(colo_of "$OLD_IP")
+  [[ "$KIND" == failed && -z "$cur" ]] && cur=$old
+  if [[ "$KIND" != healthy && -s "$WORK/result.csv" ]]; then
+    top=$(awk -F, -v s="$LATENCY_SPLIT" -v pick="$IP" -v cur="$OLD_IP" -v kind="$KIND" '
+      FILENAME == ARGV[1] { lab[$1] = $2; next }
+      FNR > 1 && FNR <= 6 {
+        cc = $7; sub(/\r$/, "", cc); if (cc == "" || cc == "N/A") cc = "?"
+        g = (s + 0 > 0) ? (($5 + 0 < s + 0) ? "<" s : "≥" s) : ""
+        l = ($1 in lab) ? lab[$1] : "官方"
+        if (l ~ /^种子/) l = (l ~ /\(段外\)$/) ? "种子（段外）" : "种子"
+        mk = ""; if (kind != "failed" && $1 == pick) mk = "pick"; else if ($1 == cur) mk = "old"
+        sp = $6; sub(/\r$/, "", sp)
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", cc, $5 + 0, sp + 0, $4 + 0, g, l, mk }' \
+      "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null \
+      | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t")
+          | {colo: .[0], lat: (.[1] | tonumber), speed: (.[2] | tonumber), loss: (.[3] | tonumber),
+             group: .[4], src: .[5], mark: .[6]})') || top="[]"
+  fi
+  series="{}"
+  if [[ "$KIND" != failed && -n "$IP" ]]; then
+    series=$(jq -nc --arg l "$LAT" --arg sp "$SPEED" --arg m "$METRIC" \
+      '{lat: ($l | tonumber? // empty)} + (if $m != "" then {speed: ($sp | tonumber? // 0)} else {} end)')
+  fi
+  iv=$(( (PEAK_EVERY > OFFPEAK_EVERY ? PEAK_EVERY : OFFPEAK_EVERY) * 60 ))
+  body=$(jq -nc \
+    --arg source "cfst-ddns:$CFST_TARGET" --argjson iv "$iv" --argjson series "$series" --argjson top "$top" \
+    --arg label "$TARGET_LABEL" --arg kind "$KIND" --arg path "$PATH_DESC" --arg colo "$cur" --arg old "$old" \
+    --arg metric "$METRIC" --arg speed "$SPEED" --arg lat "$LAT" --arg loss "$LOSS" --arg group "$GROUP" \
+    --arg src "$(src_name "$SRC")" --arg why "$(scrub "$WHY")" --arg reason "$(scrub "$REASON")" \
+    --arg compare "$(scrub "$(sed 's/（[^）]*）//g' <<<"$COMPARE")")" --arg ver "$VERSION" \
+    --arg host "$(cat /proc/sys/kernel/hostname)" --argjson t "${t:-0}" --arg peak "$(is_peak && echo 1)" \
+    '{source: $source, ts: now | floor, interval: $iv, series: $series,
+      data: {label: $label, kind: $kind, path: $path, colo: $colo, old_colo: $old, metric: $metric,
+             speed: ($speed | tonumber? // null), lat: ($lat | tonumber? // null), loss: ($loss | tonumber? // null),
+             group: $group, src: $src, why: $why, reason: $reason, compare: $compare, top: $top,
+             version: $ver, host: $host, elapsed: $t, peak: ($peak == "1")}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
+  if curl "${CURL_BASE[@]}" --retry 0 -m 8 -o /dev/null -w '%{http_code}' -X POST "$SONDE_URL/ingest" \
+       -H "Authorization: Bearer $SONDE_TOKEN" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
+    echo "已上报 Sonde"
+  else
+    echo "警告: Sonde 上报失败" >&2
+  fi
+}
+
 # ---------- 收尾：无论成功失败都走这里 ----------
 die() { REASON="$*"; echo "失败: $*" >&2; exit 1; }
 finish() {
@@ -309,6 +361,7 @@ finish() {
     [[ -n "$REASON" ]] || REASON="脚本异常退出（退出码 $rc），详见 journalctl -u 'cfst-ddns@*'"
   fi
   notify || true
+  sonde_report || true
 }
 trap finish EXIT
 trap 'REASON="被终止（超时或手动停止）"; exit 143' TERM INT

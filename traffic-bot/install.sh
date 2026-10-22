@@ -113,6 +113,10 @@ ALERT_CHECK_MINUTES="10"
 #REPORT_TZ="America/Los_Angeles"
 # 阿里云 CDT：装了 cdt-guard（scripts-de-moi/script/CDT-Management）就会自动显示，bot 不需要阿里云 AK
 #CDT_STATE_PATH="/var/lib/cdt-guard/state.json"
+
+# Sonde 面板（可选）：填了就每次告警检查后上报一份用量（已脱敏）
+#SONDE_URL="https://sonde.example.com"
+#SONDE_TOKEN=""
 #CDT_STALE_MIN="15"
 #LIGHTSAIL_REGION="ap-northeast-1"
 #BWH_TOTAL_GB="2000"
