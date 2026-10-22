@@ -378,7 +378,7 @@ sudo bash install.sh
 
 ## Sonde 面板（可选）
 
-在 `/etc/traffic-bot.env` 里填上 [Sonde](https://github.com/10ta/Sonde) 的 API 地址和上报密钥，`systemctl restart traffic-bot` 后每次告警检查（默认 10 分钟）上报一次，网页上就会出现这里的状态：
+在 `/etc/traffic-bot.env` 里填上 [Sonde](https://github.com/10ta/Sonde) 的 API 地址和上报密钥，`systemctl restart traffic-bot` 后：启动 15 秒后上报一次，之后每次告警检查（默认 10 分钟）、`/check` 和定时播报时都会上报（共用同一次查询，不会多调云厂商的 API）。日志里能看到 `已上报 Sonde`，网页上就会出现这里的状态：
 
 ```bash
 SONDE_URL=https://sonde-api.example.com

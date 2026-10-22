@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.22.1"
+VERSION="2026.10.22.2"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -208,6 +208,7 @@ colo_of() {     # IP → 机房代码（cfst 结果第 7 列「地区码」）
   local r cc
   r=$(row_of "$1" result.csv 2>/dev/null); [[ -n "$r" ]] || r=$(row_of "$1" latency.all.csv 2>/dev/null)
   IFS=, read -r _ _ _ _ _ _ cc _ <<<"$r"; cc=${cc%$'\r'}
+  [[ -z "$cc" || "$cc" == N/A ]] && cc=$(colo_cached "$1")
   [[ -n "$cc" && "$cc" != N/A ]] && echo "$cc" || echo "?"
 }
 
@@ -324,6 +325,16 @@ sonde_report() {
           | {colo: .[0], lat: (.[1] | tonumber), speed: (.[2] | tonumber), loss: (.[3] | tonumber),
              group: .[4], src: .[5], mark: .[6]})') || top="[]"
   fi
+  # 巡检只测当前 IP，没有榜单：沿用上一次复测 / 全量扫描的榜单和延迟筛选，面板上的卡片保持同样的行数
+  local scan params last="$WORK/sonde_last.json" top_ts
+  scan=$(scrub "$SCAN_NOTE"); params=$(scrub "$(sed -E 's/ -url [^ ]+//' <<<"$(config_brief)")")
+  top_ts=$(date +%s)
+  if [[ "$MODE" != check && "$top" != "[]" ]]; then
+    jq -nc --argjson top "$top" --arg scan "$scan" --argjson ts "$top_ts" '{top: $top, scan: $scan, ts: $ts}' > "$last" 2>/dev/null || true
+  elif [[ -s "$last" ]]; then
+    top=$(jq -c '.top' "$last" 2>/dev/null || echo '[]'); scan=$(jq -r '.scan' "$last" 2>/dev/null || echo "$scan")
+    top_ts=$(jq -r '.ts' "$last" 2>/dev/null || echo "$top_ts")
+  fi
   series="{}"
   if [[ "$KIND" != failed && -n "$IP" ]]; then
     series=$(jq -nc --arg l "$LAT" --arg sp "$SPEED" --arg m "$METRIC" \
@@ -337,11 +348,13 @@ sonde_report() {
     --arg src "$(src_name "$SRC")" --arg why "$(scrub "$WHY")" --arg reason "$(scrub "$REASON")" \
     --arg compare "$(scrub "$(sed 's/（[^）]*）//g' <<<"$COMPARE")")" --arg ver "$VERSION" \
     --arg host "$(cat /proc/sys/kernel/hostname)" --argjson t "${t:-0}" --arg peak "$(is_peak && echo 1)" \
+    --arg scan "$scan" --arg params "$params" --argjson top_ts "$top_ts" --arg mode "$MODE" \
     '{source: $source, ts: now | floor, interval: $iv, series: $series,
       data: {label: $label, kind: $kind, path: $path, colo: $colo, old_colo: $old, metric: $metric,
              speed: ($speed | tonumber? // null), lat: ($lat | tonumber? // null), loss: ($loss | tonumber? // null),
              group: $group, src: $src, why: $why, reason: $reason, compare: $compare, top: $top,
-             version: $ver, host: $host, elapsed: $t, peak: ($peak == "1")}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
+             version: $ver, host: $host, elapsed: $t, peak: ($peak == "1"),
+             scan: $scan, params: $params, top_ts: $top_ts, mode: $mode}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
   if curl "${CURL_BASE[@]}" --retry 0 -m 8 -o /dev/null -w '%{http_code}' -X POST "$SONDE_URL/ingest" \
        -H "Authorization: Bearer $SONDE_TOKEN" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
     echo "已上报 Sonde"
@@ -673,6 +686,7 @@ speed_test() {
       echo "下载测速: ${n} 个 IP"
       run_cfst result.csv "${LAT_ARGS[@]}" -f candidates.txt -dn "$n" ;;   # 候选已按限制条件筛过，这里不让 cfst 再筛一遍
   esac
+  fill_colo
   [[ $(rows result.csv) -ge 1 && -n "$METRIC" ]] || return 0
   # 按速度从高到低排序（表头保持在第一行）
   { head -n1 result.csv; tail -n +2 result.csv | sort -t, -k6,6gr -s; } > result.tmp && mv result.tmp result.csv
@@ -688,6 +702,55 @@ speed_test() {
         print row[pick]; for (i = 1; i <= n; i++) if (i != pick) print row[i]
       }' result.csv > result.tmp && mv result.tmp result.csv
   fi
+}
+
+# ---------- 机房代码 ----------
+# cfst 只在下载测速时记下机房（结果第 7 列「地区码」），按上传测速或只看延迟时这一列是 N/A。
+# 这里对缺机房的 IP 发一个 HEAD 请求，从响应头读：Cloudflare 的 cf-ray（…-LAX），CloudFront 的 x-amz-cf-pop（HKG62-C1）。
+# 结果缓存在 colo.cache（6 小时）：任播 IP 的机房很少变，巡检时基本不用再发请求。
+COLO_TTL=21600
+colo_target() {   # 输出 "host port"：用测速地址的域名；没有就用 speed.cloudflare.com（只对 Cloudflare 有效）
+  local u="" rest hostport host port
+  if [[ "$RANK_BY" == upload && -n "$UPLOAD_URL" ]]; then u=$UPLOAD_URL
+  else u=$(grep -oE -- '-url [^ ]+' <<<" $CFST_ARGS " | cut -d' ' -f2 || true); fi
+  [[ -n "$u" ]] || { [[ "$CFST_TARGET" == cloudflare ]] && u="https://speed.cloudflare.com/" || return 1; }
+  rest=${u#*://}; hostport=${rest%%/*}; host=${hostport%%:*}; port=${hostport#*:}
+  [[ "$port" == "$hostport" ]] && { [[ "$u" == http://* ]] && port=80 || port=443; }
+  echo "$host $port $([[ "$u" == http://* ]] && echo http || echo https)"
+}
+colo_cached() { awk -F, -v ip="$1" -v now="$(date +%s)" -v ttl="$COLO_TTL" '$1 == ip && now - $3 < ttl { c = $2 } END { if (c != "") print c }' colo.cache 2>/dev/null || true; }
+colo_lookup() {   # colo_lookup IP host port scheme → 机房代码（失败输出空）
+  local ip=$1 addr hdr c
+  [[ "$ip" == *:* ]] && addr="[$ip]" || addr="$ip"
+  hdr=$(curl -sS -I --noproxy '*' --connect-timeout 3 -m 5 --resolve "$2:$3:$addr" "$4://$2/" 2>/dev/null | tr -d '\r') || true
+  c=$(sed -nE 's/^[Cc][Ff]-[Rr][Aa][Yy]: *[0-9a-f]+-([A-Z]{3}).*/\1/p; s/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Pp][Oo][Pp]: *([A-Z]{3}).*/\1/p' <<<"$hdr" | head -n1)
+  echo "$c"
+}
+fill_colo() {
+  [[ -s result.csv ]] || return 0
+  local t host port scheme ip cc n=0 miss
+  touch colo.cache
+  # 结果里已有机房的（下载测速）直接记进缓存
+  awk -F, -v OFS=, -v now="$(date +%s)" 'NR > 1 { c = $7; sub(/\r$/, "", c); if (c != "" && c != "N/A") print $1, c, now }' result.csv >> colo.cache
+  miss=$(awk -F, 'NR > 1 { c = $7; sub(/\r$/, "", c); if (c == "" || c == "N/A") print $1 }' result.csv | head -n 20)
+  [[ -n "$OLD_IP" ]] && miss+=$'\n'"$OLD_IP"
+  if [[ -n "$miss" ]] && t=$(colo_target); then
+    read -r host port scheme <<<"$t"
+    while IFS= read -r ip; do
+      [[ -n "$ip" && -z "$(colo_cached "$ip")" ]] || continue
+      cc=$(colo_lookup "$ip" "$host" "$port" "$scheme")
+      [[ -n "$cc" ]] && { echo "$ip,$cc,$(date +%s)" >> colo.cache; n=$((n + 1)); }
+    done <<<"$miss"
+  fi
+  # 写回结果第 7 列（简报、面板、日志都从这里读）
+  awk -F, -v OFS=, -v now="$(date +%s)" -v ttl="$COLO_TTL" '
+    FILENAME == ARGV[1] { if (now - $3 < ttl) m[$1] = $2; next }
+    FNR == 1 { print; next }
+    { c = $7; sub(/\r$/, "", c); if ((c == "" || c == "N/A") && ($1 in m)) $7 = m[$1]; print }' colo.cache result.csv > result.tmp && mv result.tmp result.csv
+  # 缓存只留每个 IP 最新的一条，最多 2000 条
+  tac colo.cache | awk -F, '!s[$1]++' | head -n 2000 | tac > colo.tmp && mv colo.tmp colo.cache
+  (( n )) && echo "  机房：查到 $n 个 IP 的机房代码"
+  return 0
 }
 
 print_results() {

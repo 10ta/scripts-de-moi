@@ -1404,7 +1404,9 @@ def sonde_report(sections: list) -> None:
         r = requests.post(f"{SONDE_URL}/ingest", json=body, timeout=5,
                           headers={"Authorization": f"Bearer {SONDE_TOKEN}"})
         if r.status_code != 200:
-            logger.warning("Sonde 上报失败：HTTP %s", r.status_code)
+            logger.warning("Sonde 上报失败：HTTP %s%s", r.status_code, "（SONDE_TOKEN 不对）" if r.status_code == 401 else "")
+        else:
+            logger.info("已上报 Sonde（%d 个来源）", len(providers))
     except requests.RequestException as e:
         logger.warning("Sonde 上报失败：%s", type(e).__name__)
 
@@ -1454,12 +1456,23 @@ def evaluate_alerts(metrics: list, state: dict) -> list:
     return messages
 
 
+async def push_sonde(sections: list) -> None:
+    """有完整数据（全部来源）时上报 Sonde；只查单个来源的指令不报，免得面板上其他来源消失"""
+    if SONDE_URL and SONDE_TOKEN:
+        await asyncio.to_thread(sonde_report, sections)
+
+
+async def sonde_job(context: ContextTypes.DEFAULT_TYPE):
+    """启动后上报一次，面板上马上有数据（之后跟着告警检查每 ALERT_CHECK_MINUTES 分钟一次）"""
+    await push_sonde(await collect_sections(max_age=30))
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    sections = await collect_sections(max_age=30)
+    await push_sonde(sections)  # 和告警共用一次查询；没有聊天对象时也照常上报
     chats = ALLOWED_CHAT_IDS or context.application.bot_data.get("chats", set())
     if not chats:
         return
-    sections = await collect_sections(max_age=30)
-    await asyncio.to_thread(sonde_report, sections)
     metrics = [m for s in sections for m in s.metrics]
     old = load_state()
     state = json.loads(json.dumps(old))
@@ -1527,6 +1540,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ 正在查询中...")
     await reply_long(update, msg, await build_report(max_age=10))
+    await push_sonde(await collect_sections(max_age=60))  # 刚查过，直接用缓存
 
 
 async def _single(update: Update, label: str, fn):
@@ -1572,6 +1586,7 @@ async def aliyun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_auto_report(context: ContextTypes.DEFAULT_TYPE):
     report = await build_report("🔔 定时播报")
+    await push_sonde(await collect_sections(max_age=60))
     chat_id = context.job.chat_id
     for c in chunk_text(report):
         await send_html(lambda t, **kw: context.bot.send_message(chat_id=chat_id, text=t, **kw), c)
@@ -1613,6 +1628,9 @@ def main():
     for chat_id in ALLOWED_CHAT_IDS:
         schedule_report(app.job_queue, chat_id)
     app.job_queue.run_repeating(alert_job, interval=ALERT_CHECK_SEC, first=60, name="alerts")
+    if SONDE_URL and SONDE_TOKEN:
+        app.job_queue.run_once(sonde_job, when=15, name="sonde-startup")
+        logger.info("Sonde 上报已开启：启动 15 秒后一次，之后每 %d 分钟（随告警检查）", ALERT_CHECK_SEC // 60)
 
     app.run_polling(allowed_updates=[Update.MESSAGE])
 
