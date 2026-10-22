@@ -136,6 +136,7 @@ class Section:
     name: str = ""  # 来源名，collect_sections 填写（Sonde 面板用）
     empty: bool = False  # 没有任何实例 / 资源（Sonde 面板上不显示这张卡）
     parts: list = field(default_factory=list)  # 拆成几张卡上报：[(名称, 文本, 指标, 是否为空)]，目前只有 Cloudflare 用
+    bill: dict = None  # 本月已产生的费用（Sonde 顶部汇总用）：{name, amount, currency, tz, ts}
 
 
 def aws_client(service: str, region: str):
@@ -494,7 +495,9 @@ def get_aws_bill_data() -> Section:
         if total_ts:
             lines.append(f"<i>🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
                          f"{total_ts.astimezone(REPORT_TZ):%H:%M} · 税前预估，AWS 每天更新几次</i>")
-        sec = Section("\n".join(lines), metrics_out)
+        sec = Section("\n".join(lines), metrics_out,
+                      bill={"name": "AWS", "amount": round(float(total), 4), "currency": "USD", "tz": "UTC",
+                            "ts": int(total_ts.timestamp()) if total_ts else int(now.timestamp())})
         _bill_cache.update(ts=time.monotonic(), section=sec)
         return sec
     except Exception as e:
@@ -1416,8 +1419,11 @@ def sonde_report(sections: list) -> None:
                 card(f"{s.name} · {pname}", s.name, text, mlist, empty)
         else:
             card(s.name or "?", "", s.text, s.metrics, s.empty)
+    bills = [s.bill for s in sections if s.bill]
+    for b in bills:  # 账单走势也画曲线
+        series[f"bill:{b['name']}"] = b["amount"]
     body = {"source": "traffic-bot", "ts": int(time.time()), "interval": ALERT_CHECK_SEC,
-            "data": {"providers": providers, "thresholds": ALERT_THRESHOLDS}, "series": series}
+            "data": {"providers": providers, "thresholds": ALERT_THRESHOLDS, "bills": bills}, "series": series}
     try:
         r = requests.post(f"{SONDE_URL}/ingest", json=body, timeout=5,
                           headers={"Authorization": f"Bearer {SONDE_TOKEN}"})
