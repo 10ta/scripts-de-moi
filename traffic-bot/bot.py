@@ -134,6 +134,8 @@ class Section:
     text: str
     metrics: list = field(default_factory=list)
     name: str = ""  # 来源名，collect_sections 填写（Sonde 面板用）
+    empty: bool = False  # 没有任何实例 / 资源（Sonde 面板上不显示这张卡）
+    parts: list = field(default_factory=list)  # 拆成几张卡上报：[(名称, 文本, 指标, 是否为空)]，目前只有 Cloudflare 用
 
 
 def aws_client(service: str, region: str):
@@ -327,7 +329,7 @@ def get_aws_data() -> Section:
             if not token:
                 break
         if not instances:
-            return Section(hdr("☁️ Lightsail") + "\n无活跃实例（若有实例，请检查 <code>LIGHTSAIL_REGION</code>）")
+            return Section(hdr("☁️ Lightsail") + "\n无活跃实例（若有实例，请检查 <code>LIGHTSAIL_REGION</code>）", empty=True)
 
         remain_days = max(math.ceil((next_reset - now).total_seconds() / 86400), 1)
 
@@ -372,7 +374,7 @@ def get_cloudfront_data() -> Section:
         for page in cf.get_paginator("list_distributions").paginate():
             dist_ids += [d["Id"] for d in page.get("DistributionList", {}).get("Items", [])]
         if not dist_ids:
-            return Section(hdr("🌐 CloudFront") + "\n没有找到任何 Distribution")
+            return Section(hdr("🌐 CloudFront") + "\n没有找到任何 Distribution", empty=True)
 
         cw = aws_client("cloudwatch", "us-east-1")
         totals = {"Requests": 0.0, "BytesDownloaded": 0.0}
@@ -1014,19 +1016,26 @@ def get_cloudflare_data() -> Section:
     if not HEX32.match(CLOUDFLARE_ACCOUNT_ID):
         return Section(hdr("🟠 Cloudflare") + "\n" + err("CLOUDFLARE_ACCOUNT_ID 格式不对（应为 32 位十六进制）"))
     now = datetime.now(timezone.utc)
-    blocks, metrics = [], []
+    blocks, metrics, parts = [], [], {}
     for name, block in (("Workers & Pages", cf_workers_block), ("R2", cf_r2_block), ("D1", cf_d1_block),
-                        ("CDN 流量", cf_cdn_block)):
+                        ("CDN", cf_cdn_block)):
         try:
             blk_lines, blk_metrics = block(now)
-            blocks.append("\n".join(blk_lines))
+            text = "\n".join(blk_lines)
             metrics += blk_metrics
+            # R2 / D1 没有存储桶、数据库时只有两行（标题 + 「无…」），面板上不显示
+            parts[name] = (name, text, blk_metrics, not blk_metrics and len(blk_lines) == 2 and "无" in blk_lines[1])
         except CFError as e:
-            blocks.append(err(f"{name} 查询失败：{e}{cf_hint(str(e))}"))
+            text = err(f"{name} 查询失败：{e}{cf_hint(str(e))}")
+            parts[name] = (name, text, [], False)
         except Exception as e:
             logger.exception("Cloudflare %s 查询异常", name)
-            blocks.append(err(f"{name} 查询异常：{type(e).__name__}"))
-    return Section("<b>🟠 Cloudflare</b>  ━━━━━━━━\n\n" + "\n\n".join(blocks), metrics)
+            text = err(f"{name} 查询异常：{type(e).__name__}")
+            parts[name] = (name, text, [], False)
+        blocks.append(text)
+    # 面板上拆成几张卡：CDN 流量放最前，其次 D1、Workers & Pages、R2（TG 消息里的顺序不变）
+    order = [parts[k] for k in ("CDN", "D1", "Workers & Pages", "R2")]
+    return Section("<b>🟠 Cloudflare</b>  ━━━━━━━━\n\n" + "\n\n".join(blocks), metrics, parts=order)
 
 
 # ---------------------------------------------------------------- Oracle Cloud
@@ -1086,7 +1095,7 @@ def get_oracle_data() -> Section:
                 if va.lifecycle_state == "ATTACHED":
                     vnic_owner[va.vnic_id] = va.instance_id
         if not instances:
-            return Section(f"{title}\n没有找到实例（若有实例，请检查 <code>OCI_REGION</code>）")
+            return Section(f"{title}\n没有找到实例（若有实例，请检查 <code>OCI_REGION</code>）", empty=True)
 
         now = datetime.now(timezone.utc)
         start, next_reset = month_start(now), next_month_start(now)
@@ -1389,15 +1398,24 @@ def sonde_report(sections: list) -> None:
     if not (SONDE_URL and SONDE_TOKEN):
         return
     providers, series = [], {}
-    for s in sections:
+
+    def card(name, group, text, metric_list, empty):
         metrics = []
-        for m in s.metrics:
+        for m in metric_list:
             alert = bool(m.text)  # 闲置、状态过期这类提醒：只有触发 / 未触发
             metrics.append({"key": m.key, "label": m.label, "pct": round(float(m.pct or 0), 2),
                             "detail": scrub(m.detail), "alert": alert})
             if not alert and len(series) < 40:
                 series[m.key] = round(float(m.pct or 0), 2)
-        providers.append({"name": s.name or "?", "ok": "❌" not in s.text, "metrics": metrics, "html": scrub(s.text)})
+        providers.append({"name": name, "group": group, "ok": "❌" not in text, "empty": empty,
+                          "metrics": metrics, "html": scrub(text)})
+
+    for s in sections:
+        if s.parts:  # Cloudflare：每一块单独一张卡
+            for pname, text, mlist, empty in s.parts:
+                card(f"{s.name} · {pname}", s.name, text, mlist, empty)
+        else:
+            card(s.name or "?", "", s.text, s.metrics, s.empty)
     body = {"source": "traffic-bot", "ts": int(time.time()), "interval": ALERT_CHECK_SEC,
             "data": {"providers": providers, "thresholds": ALERT_THRESHOLDS}, "series": series}
     try:
