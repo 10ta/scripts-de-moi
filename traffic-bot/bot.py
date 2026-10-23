@@ -128,6 +128,11 @@ class Metric:
     period: str   # 周期标识（天/月/重置时间），变化后告警记录自动清零
     detail: str   # 例如 "12,345 / 100,000"
     text: str = ""  # 自定义告警文本（如闲置提醒）；留空则用通用的"已用 x%"格式
+    # 以下几项只给 Sonde 面板画「近 7 天每天用了多少」用
+    kind: str = "cycle"  # cycle = 周期内累计（按月 / 账期重置）；level = 当前水位（按天重置的用量、存储大小）
+    days: float = 0      # cycle 的周期长度（天），面板据此算「均匀用完时每天该用多少」
+    limit: float = 0     # 额度的数值（和 unit 一起把百分比换算回用量）
+    unit: str = ""       # GB / B / 次 / 行 / USD
 
 
 @dataclass
@@ -138,8 +143,13 @@ class Section:
     group: str = ""  # Sonde 面板上的第一层名称（厂商），如 AWS、Cloudflare
     label: str = ""  # Sonde 面板上的第二层名称；查询函数可以自己定（如 BWH 的套餐名），否则用 PROVIDERS 里的
     empty: bool = False  # 没有任何实例 / 资源（Sonde 面板上不显示这张卡）
-    parts: list = field(default_factory=list)  # 拆成几张卡上报：[(名称, 文本, 指标, 是否为空)]，目前只有 Cloudflare 用
+    parts: list = field(default_factory=list)  # 拆成几张卡上报：[{name, text, metrics, empty, sub, detail, notes}]，目前只有 Cloudflare 用
     bill: dict = None  # 本月已产生的费用（Sonde 顶部汇总用）：{name, amount, currency, tz, ts}
+    # Sonde 卡片的三层：指标（metrics，画成进度条）→ 明细（detail，组成上面那些数的各部分，放引用块）
+    # → 状态（notes，重置时间、日均可用、数据时间、提示）。都是 TG 同款的 HTML 行，和 text 分开给，面板不用再解析 text
+    sub: str = ""
+    detail: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
 
 
 def aws_client(service: str, region: str):
@@ -158,6 +168,13 @@ def month_start(dt: datetime) -> datetime:
 
 def next_month_start(dt: datetime) -> datetime:
     return datetime(dt.year + (dt.month == 12), dt.month % 12 + 1, 1, tzinfo=timezone.utc)
+
+
+def cycle_days(end: datetime) -> float:
+    """按月重置的周期长度（天）：从上个月同一天同一时刻到 end"""
+    y, m = (end.year - 1, 12) if end.month == 1 else (end.year, end.month - 1)
+    start = end.replace(year=y, month=m, day=min(end.day, calendar.monthrange(y, m)[1]))
+    return round((end - start).total_seconds() / 86400, 3)
 
 
 def billing_period(now: datetime, day: int):
@@ -309,12 +326,14 @@ def get_bwh_data() -> Section:
         remain_days = max(math.ceil((reset_ts - time.time()) / 86400), 1)
         pct = used_gb / BWH_TOTAL_GB * 100
 
+        reset_line = (f"🔄 {fmt_reset(reset_dt)}后重置 <i>({fmt_dt(reset_dt.astimezone(REPORT_TZ))})</i> · "
+                      f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>")
         lines = [hdr("🖥 BWH", "本周期"),
                  bq(quota("流量", pct, fmt_gb(used_gb), fmt_gb(BWH_TOTAL_GB), fmt_gb(remain_gb))),
-                 f"🔄 {fmt_reset(reset_dt)}后重置 <i>({fmt_dt(reset_dt.astimezone(REPORT_TZ))})</i> · "
-                 f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]
-        metric = Metric("bwh", "BWH 流量", pct, str(reset_ts), f"{used_gb:.1f} / {BWH_TOTAL_GB:.0f}GB")
-        sec = Section("\n".join(lines), [metric])
+                 reset_line]
+        metric = Metric("bwh", "BWH 流量", pct, str(reset_ts), f"{used_gb:.1f} / {BWH_TOTAL_GB:.0f}GB",
+                        days=cycle_days(reset_dt), limit=BWH_TOTAL_GB, unit="GB")
+        sec = Section("\n".join(lines), [metric], sub="本周期", notes=[reset_line])
         sec.label = BWH_NAME or str(data.get("plan") or "").strip()[:24] or "VPS"
         return sec
     except Exception as e:
@@ -351,22 +370,30 @@ def get_aws_data() -> Section:
             )
             return sum(p.get("Sum", 0) for p in res.get("metricData", []))
 
-        lines, metrics = [hdr("☁️ Lightsail", "本月")], []
+        lines, metrics, detail, daily = [hdr("☁️ Lightsail", "本月")], [], [], []
         for inst in instances:
             name = inst["name"]
             quota_gb = inst["networking"]["monthlyTransfer"]["gbPerMonthAllocated"]
             used_gb = (metric_sum(name, "NetworkIn") + metric_sum(name, "NetworkOut")) / 1024**3
             if not quota_gb:
                 lines.append(f"<b>{esc(name)}</b>：已用 <b>{fmt_gb(used_gb)}</b>（无额度信息）")
+                detail.append(f"🖥 <b>{esc(name)}</b> · 已用 <b>{fmt_gb(used_gb)}</b> · 无额度信息")
                 continue
             remain_gb = max(quota_gb - used_gb, 0)
             pct = used_gb / quota_gb * 100
             lines.append(bq(quota(name, pct, fmt_gb(used_gb), fmt_gb(quota_gb), fmt_gb(remain_gb))
                             + [f"└ 日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b>"]))
             metrics.append(Metric(f"lightsail:{name}", f"Lightsail {name} 流量", pct,
-                                  now.strftime("%Y-%m"), f"{used_gb:.1f} / {quota_gb}GB"))
-        lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i>")
-        return Section("\n".join(lines), metrics)
+                                  now.strftime("%Y-%m"), f"{used_gb:.1f} / {quota_gb}GB",
+                                  days=(next_reset - start).days, limit=float(quota_gb), unit="GB"))
+            daily.append((name, fmt_gb(remain_gb / remain_days)))
+        reset_line = f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i>"
+        lines.append(reset_line)
+        if len(daily) == 1:  # 只有一台：日均可用并进重置那一行
+            notes = [f"{reset_line} · 日均可用 <b>{daily[0][1]}</b>"]
+        else:
+            notes = [reset_line] + [f"📅 <b>{esc(n)}</b> 日均可用 <b>{v}</b>" for n, v in daily]
+        return Section("\n".join(lines), metrics, sub="本月", detail=detail, notes=notes)
     except Exception as e:
         logger.exception("AWS 查询失败")
         return Section(hdr("☁️ Lightsail") + "\n" + err(f"查询失败：{type(e).__name__}: {e}"))
@@ -413,26 +440,32 @@ def get_cloudfront_data() -> Section:
         # 按本月已过时间线性外推月底用量（第 1 天数据太少，不外推）
         elapsed = (now - start).total_seconds()
         month_sec = (next_reset - start).total_seconds()
-        lines = [hdr("🌐 CloudFront", f"本月 · {len(dist_ids)} 个分发"),
+        reset_line = (f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
+                      f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b> / <b>{fmt_num(remain_req / remain_days)}</b>次")
+        sub = f"本月 · {len(dist_ids)} 个分发"
+        lines = [hdr("🌐 CloudFront", sub),
                  bq(quota("流量", gb_pct, fmt_gb(used_gb), fmt_gb(CLOUDFRONT_LIMIT_GB), fmt_gb(remain_gb))
                     + quota("请求", req_pct, fmt_num(used_req), fmt_num(CLOUDFRONT_LIMIT_REQUESTS),
                             fmt_num(remain_req))),
-                 f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
-                 f"日均可用 <b>{fmt_gb(remain_gb / remain_days)}</b> / <b>{fmt_num(remain_req / remain_days)}</b>次"]
+                 reset_line]
+        notes = [reset_line]
         if elapsed >= 86400:  # 第 1 天数据太少，不外推
             k = month_sec / elapsed
             proj = used_gb * k / CLOUDFRONT_LIMIT_GB * 100
             warn = " ⚠️ <u>会超额</u>" if proj >= 100 else ""
             lines.append(f"📈 预计月底 <b>{fmt_gb(used_gb * k)}</b> / {fmt_num(used_req * k)}次{warn}")
+            notes.append(lines[-1])
         text = "\n".join(lines)
         period = now.strftime("%Y-%m")
+        days = (next_reset - start).days
         metrics = [
             Metric("cloudfront:gb", "CloudFront 出流量", gb_pct, period,
-                   f"{used_gb:.1f} / {CLOUDFRONT_LIMIT_GB:.0f}GB"),
+                   f"{used_gb:.1f} / {CLOUDFRONT_LIMIT_GB:.0f}GB", days=days, limit=CLOUDFRONT_LIMIT_GB, unit="GB"),
             Metric("cloudfront:req", "CloudFront 请求数", req_pct, period,
-                   f"{used_req:,.0f} / {CLOUDFRONT_LIMIT_REQUESTS:,}"),
+                   f"{used_req:,.0f} / {CLOUDFRONT_LIMIT_REQUESTS:,}", days=days,
+                   limit=CLOUDFRONT_LIMIT_REQUESTS, unit="次"),
         ]
-        return Section(text, metrics)
+        return Section(text, metrics, sub=sub, notes=notes)
     except Exception as e:
         logger.exception("CloudFront 查询失败")
         return Section(hdr("🌐 CloudFront") + "\n" + err(f"查询失败：{type(e).__name__}: {e}"))
@@ -458,8 +491,9 @@ def get_aws_bill_data() -> Section:
         for page in cw.get_paginator("list_metrics").paginate(Namespace="AWS/Billing", MetricName="EstimatedCharges"):
             metrics += page.get("Metrics", [])
         if not metrics:
-            sec = Section(f"{title}\n❔ 没有账单数据。到 Billing → Billing preferences → Alert preferences "
-                          "勾选 <b>Receive CloudWatch Billing Alerts</b>，约 15 分钟后生效")
+            hint = ("❔ 没有账单数据。到 Billing → Billing preferences → Alert preferences "
+                    "勾选 <b>Receive CloudWatch Billing Alerts</b>，约 15 分钟后生效")
+            sec = Section(f"{title}\n{hint}", sub="本月预估", notes=[hint])
             _bill_cache.update(ts=time.monotonic(), section=sec)
             return sec
 
@@ -495,17 +529,24 @@ def get_aws_bill_data() -> Section:
         else:
             box.append("└ 没有收费项目")
         lines = [title, bq(box)]
+        # 面板：总额已经是上面那条「本月账单」，明细只放各项服务；没设告警线（没有那条）时总额放进状态行
+        detail = [f"🧾 {esc(name)} · <code>USD {val:.2f}</code>" for name, val in sorted(items, key=lambda x: -x[1])] \
+            or ["没有收费项目"]
+        notes = [] if AWS_BILL_LIMIT_USD > 0 else [f"💰 总额 <b>USD {total:.2f}</b> <i>· 没设告警线</i>"]
 
         metrics_out = []
         if AWS_BILL_LIMIT_USD > 0:
             pct = total / AWS_BILL_LIMIT_USD * 100
             lines.append(f"🛡 告警线 USD {AWS_BILL_LIMIT_USD:g} · 已到 {status_icon(pct)} <b>{pct:.0f}%</b>")
             metrics_out.append(Metric("aws:bill", "AWS 本月账单", pct, now.strftime("%Y-%m"),
-                                      f"USD {total:.2f} / {AWS_BILL_LIMIT_USD:g}"))
+                                      f"USD {total:.2f} / {AWS_BILL_LIMIT_USD:g}",
+                                      days=(next_month_start(now) - start).days, limit=AWS_BILL_LIMIT_USD, unit="USD"))
         if total_ts:
             lines.append(f"<i>🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
                          f"{total_ts.astimezone(REPORT_TZ):%H:%M} · 税前预估，AWS 每天更新几次</i>")
-        sec = Section("\n".join(lines), metrics_out,
+            notes.append(f"🕒 数据时间 {fmt_date(total_ts.astimezone(REPORT_TZ))} "
+                         f"{total_ts.astimezone(REPORT_TZ):%H:%M} <i>· 税前预估，AWS 每天更新几次</i>")
+        sec = Section("\n".join(lines), metrics_out, sub="本月预估", detail=detail, notes=notes,
                       bill={"name": "AWS", "amount": round(float(total), 4), "currency": "USD", "tz": "UTC",
                             "ts": int(total_ts.timestamp()) if total_ts else int(now.timestamp())})
         _bill_cache.update(ts=time.monotonic(), section=sec)
@@ -702,6 +743,7 @@ def cf_workers_block(now: datetime):
                       fmt_num(max(CF_WORKERS_DAILY_LIMIT - total, 0)))
                 + [f"└ {detail}"]),
              f"🔄 {reset_h:.0f}小时后重置"]
+    panel = {"sub": "今日", "detail": [f"🧮 {detail}"], "notes": [lines[-1]]}
 
     # 账期汇总：对应控制台 Usage 页下方的 Requests / CPU time 卡片
     try:
@@ -710,15 +752,18 @@ def cf_workers_block(now: datetime):
         if p_cpu is not None:
             period_line += f" · CPU <b>{fmt_ms(p_cpu)}</b>"
         lines.append(period_line)
+        panel["notes"].append(period_line)
     except CFError as e:
         logger.warning("账期用量查询失败：%s", e)
 
     top = sorted(per_script.items(), key=lambda kv: kv[1], reverse=True)[:3]
     if len(per_script) > 1:
         lines.append("🏆 " + " · ".join(f"<code>{esc(k)}</code> {fmt_num(v)}" for k, v in top))
+        panel["detail"] += [f"⚡ <code>{esc(k)}</code> · {fmt_num(v)}" for k, v in top]
     metric = Metric("cloudflare:workers", "Cloudflare Workers/Pages 今日请求", pct,
-                    start.strftime("%Y-%m-%d"), f"{total:,} / {CF_WORKERS_DAILY_LIMIT:,}")
-    return lines, [metric]
+                    start.strftime("%Y-%m-%d"), f"{total:,} / {CF_WORKERS_DAILY_LIMIT:,}",
+                    kind="level", limit=CF_WORKERS_DAILY_LIMIT, unit="次")
+    return lines, [metric], panel
 
 
 def cf_r2_buckets():
@@ -739,14 +784,16 @@ def cf_r2_buckets():
 def cf_r2_block(now: datetime):
     month = now.strftime("%Y-%m")
     empty = [hdr("🪣 R2"), "无存储桶实例"]
+    empty_panel = {"empty": True}
 
     # 先问账号里有没有存储桶：没有就不用查（也避免已删除存储桶的历史数据混进来）
     buckets = cf_r2_buckets()
     if buckets is not None and not buckets:
-        return empty, []
+        return empty, [], empty_panel
     names = set(buckets) if buckets else None  # None = 列不出来，只能靠分析数据推断
 
     box, extra, metrics = [], [], []  # box：额度（放引用块）；extra：明细和提示
+    detail, notes = [], []  # 面板：明细（各存储桶、各操作）/ 状态（失败、未归类、查询出错）
 
     # --- 存储：取每个 bucket 最新的一条快照（payload + metadata）
     try:
@@ -762,7 +809,7 @@ def cf_r2_block(now: datetime):
             if bucket not in latest or dt > latest[bucket][0]:
                 latest[bucket] = (dt, size)
         if names is None and not latest:  # 列不出存储桶，且近 7 天没有任何存储快照 → 视为没有存储桶
-            return empty, []
+            return empty, [], empty_panel
         total = sum(v[1] for v in latest.values())
         limit_bytes = CF_R2_STORAGE_GB * 1e9  # 1GB 按 10^9 字节，偏保守
         pct = total / limit_bytes * 100
@@ -771,10 +818,13 @@ def cf_r2_block(now: datetime):
         if len(latest) > 1:
             top = sorted(latest.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
             extra.append("📦 " + " · ".join(f"<code>{esc(b)}</code> {fmt_bytes(v[1])}" for b, v in top))
+            detail += [f"📦 <code>{esc(b)}</code> · {fmt_bytes(v[1])}" for b, v in top]
         metrics.append(Metric("cloudflare:r2_storage", "R2 存储", pct, month,
-                              f"{fmt_bytes(total)} / {CF_R2_STORAGE_GB:g}GB"))
+                              f"{fmt_bytes(total)} / {CF_R2_STORAGE_GB:g}GB",
+                              kind="level", limit=limit_bytes, unit="B"))
     except CFError as e:
         extra.append(err(f"存储查询失败：{e}{cf_hint(str(e))}"))
+        notes.append(extra[-1])
 
     # --- 操作次数：本月累计，按 Class A / B 归类
     try:
@@ -818,15 +868,24 @@ def cf_r2_block(now: datetime):
         if per_action:
             top = sorted(per_action.items(), key=lambda kv: kv[1], reverse=True)[:4]
             extra.append("🔍 " + " · ".join(f"<code>{esc(k)}</code> {fmt_num(v)}" for k, v in top))
+            detail += [f"🔍 <code>{esc(k)}</code> · {fmt_num(v)}" for k, v in top]
         if failed:
             extra.append(f"⚠️ 其中 <b>{fmt_num(failed)}</b> 次为失败请求（如访问不存在的文件）")
+            notes.append(extra[-1])
         if other:
             extra.append(f"❔ 另有 {fmt_num(other)} 次操作未能归类，未计入")
-        metrics.append(Metric("cloudflare:r2_a", "R2 Class A 操作", pa, month, f"{a:,} / {CF_R2_CLASS_A:,}"))
-        metrics.append(Metric("cloudflare:r2_b", "R2 Class B 操作", pb, month, f"{b:,} / {CF_R2_CLASS_B:,}"))
+            notes.append(extra[-1])
+        p_end = next_month_start(now)
+        days = (p_end - month_start(now)).days
+        metrics.append(Metric("cloudflare:r2_a", "R2 Class A 操作", pa, month, f"{a:,} / {CF_R2_CLASS_A:,}",
+                              days=days, limit=CF_R2_CLASS_A, unit="次"))
+        metrics.append(Metric("cloudflare:r2_b", "R2 Class B 操作", pb, month, f"{b:,} / {CF_R2_CLASS_B:,}",
+                              days=days, limit=CF_R2_CLASS_B, unit="次"))
+        notes.insert(0, f"🔄 操作次数 {fmt_reset(p_end)}后重置 <i>({fmt_dt(p_end)})</i>")
     except CFError as e:
         extra.append(err(f"操作次数查询失败：{e}{cf_hint(str(e))}"))
-    return [hdr("🪣 R2", "本月"), bq(box)] + extra, metrics
+        notes.append(extra[-1])
+    return [hdr("🪣 R2", "本月"), bq(box)] + extra, metrics, {"sub": "本月", "detail": detail, "notes": notes}
 
 
 def cf_d1_databases():
@@ -856,7 +915,7 @@ def cf_d1_block(now: datetime):
     today = now.strftime("%Y-%m-%d")
     dbs = cf_d1_databases()
     if dbs is not None and not dbs:
-        return [hdr("🗄 D1"), "无数据库"], []
+        return [hdr("🗄 D1"), "无数据库"], [], {"empty": True}
     names = {k: v[0] for k, v in (dbs or {}).items()}
 
     # --- 今日读写行数（整个账号合计，按数据库细分）
@@ -892,7 +951,7 @@ def cf_d1_block(now: datetime):
         except CFError as e:
             logger.warning("D1 存储数据查询失败：%s", e)
     if dbs is None and not per_db and not sizes:
-        return [hdr("🗄 D1"), "无数据库（或近 3 天没有任何数据）"], []
+        return [hdr("🗄 D1"), "无数据库（或近 3 天没有任何数据）"], [], {"empty": True}
 
     storage = sum(sizes.values())
     metrics = []
@@ -906,6 +965,7 @@ def cf_d1_block(now: datetime):
     reset_h = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - now).total_seconds() / 3600
     lines = [hdr("🗄 D1", "今日 · 全账号共享"), bq(box),
              f"🔄 读写 {reset_h:.0f}小时后重置 <i>· 超额当天查询会报错，不扣费</i>"]
+    panel = {"sub": "今日 · 全账号共享", "detail": [], "notes": [lines[-1]]}
 
     # 每个数据库一行：今日读/写行数、查询次数、大小（单库上限 500MB）
     db_max = CF_D1_DB_MAX_MB * 1e6
@@ -917,20 +977,28 @@ def cf_d1_block(now: datetime):
         size_txt = f"{fmt_bytes(size)}/{CF_D1_DB_MAX_MB:g}MB" if size is not None else "大小未知"
         per_lines.append(f"📁 <b>{esc(names.get(dbid, dbid[:8]))}</b> · 读 {fmt_num(r_)} · 写 {fmt_num(w_)} · "
                          f"查询 {fmt_num(rq + wq)} · <code>{esc(size_txt)}</code>")
+        # 面板上每个库的大小已经是一条进度条，这里只留今日读写
+        panel["detail"].append(f"📁 <b>{esc(names.get(dbid, dbid[:8]))}</b> · 读 {fmt_num(r_)} · 写 {fmt_num(w_)} · "
+                               f"查询 {fmt_num(rq + wq)}" + ("" if size is not None else " · 大小未知"))
         if size is not None:
             metrics.append(Metric(f"cloudflare:d1_db:{dbid}", f"D1 {names.get(dbid, dbid[:8])} 大小",
-                                  size / db_max * 100, "size", f"{fmt_bytes(size)} / {CF_D1_DB_MAX_MB:g}MB"))
+                                  size / db_max * 100, "size", f"{fmt_bytes(size)} / {CF_D1_DB_MAX_MB:g}MB",
+                                  kind="level", limit=db_max, unit="B"))
     if per_lines:  # 每库明细默认折叠
         lines.append(bq(per_lines, expandable=len(per_lines) > 2))
     if dbs is None:
         lines.append("<i>ℹ️ Token 没有 D1 Read 权限，数据库名用 ID 前 8 位显示</i>")
+        panel["notes"].append("ℹ️ Token 没有 D1 Read 权限，数据库名用 ID 前 8 位显示")
 
     metrics += [
-        Metric("cloudflare:d1_read", "D1 今日读取行", pr, today, f"{read:,} / {CF_D1_ROWS_READ:,}"),
-        Metric("cloudflare:d1_write", "D1 今日写入行", pw, today, f"{written:,} / {CF_D1_ROWS_WRITTEN:,}"),
-        Metric("cloudflare:d1_storage", "D1 存储", ps, "size", f"{fmt_bytes(storage)} / {CF_D1_STORAGE_GB:g}GB"),
+        Metric("cloudflare:d1_read", "D1 今日读取行", pr, today, f"{read:,} / {CF_D1_ROWS_READ:,}",
+               kind="level", limit=CF_D1_ROWS_READ, unit="行"),
+        Metric("cloudflare:d1_write", "D1 今日写入行", pw, today, f"{written:,} / {CF_D1_ROWS_WRITTEN:,}",
+               kind="level", limit=CF_D1_ROWS_WRITTEN, unit="行"),
+        Metric("cloudflare:d1_storage", "D1 存储", ps, "size", f"{fmt_bytes(storage)} / {CF_D1_STORAGE_GB:g}GB",
+               kind="level", limit=limit_bytes, unit="B"),
     ]
-    return lines, metrics
+    return lines, metrics, panel
 
 
 def cf_zone_list():
@@ -997,16 +1065,16 @@ def zone_traffic(zid: str, now: datetime):
 
 
 def cf_cdn_block(now: datetime):
-    lines = [hdr("📈 CDN", "本月 · 免费计划无上限，仅供参考")]
+    sub = "本月 · 免费计划无上限，仅供参考"
+    lines = [hdr("📈 CDN", sub)]
     zones = cf_zone_list()
     if not zones:
-        return lines + [
-            "❔ 没有找到域名。可能原因：① 账号下没有托管域名（只用 pages.dev / R2 就没有 CDN 流量可查）；"
-            "② Token 缺少 Zone Read 权限，或 Zone Resources 没包含域名。"
-            "不想加权限的话，在配置里填 <code>CLOUDFLARE_ZONES=名称=ZoneID</code> 即可"
-        ], []
+        hint = ("❔ 没有找到域名。可能原因：① 账号下没有托管域名（只用 pages.dev / R2 就没有 CDN 流量可查）；"
+                "② Token 缺少 Zone Read 权限，或 Zone Resources 没包含域名。"
+                "不想加权限的话，在配置里填 <code>CLOUDFLARE_ZONES=名称=ZoneID</code> 即可")
+        return lines + [hint], [], {"sub": sub, "notes": [hint]}
     tot_req = tot_bytes = 0
-    box = []
+    box, detail = [], []
     for n, (label, zid) in enumerate(zones, 1):
         if looks_like_host(label) or label == zid[:8]:  # 自动列出的是域名、没起名的是 ID 前缀，都不发
             label = "站点" if len(zones) == 1 else f"站点 {n}"
@@ -1014,15 +1082,20 @@ def cf_cdn_block(now: datetime):
             m_req, m_bytes, t_req, t_bytes = zone_traffic(zid, now)
         except CFError as e:
             box.append(err(f"{label}：查询失败 {e}{cf_hint(str(e))}"))
+            detail.append(box[-1])
             continue
         tot_req += m_req
         tot_bytes += m_bytes
         box.append(f"🌍 <b>{esc(label)}</b> · 请求 <b>{fmt_num(m_req)}</b> · 流量 <b>{fmt_bytes(m_bytes)}</b>")
         box.append(f"└ 今日 {fmt_num(t_req)} · {fmt_bytes(t_bytes)}")
+        detail.append(f"🌍 <b>{esc(label)}</b> · 请求 <b>{fmt_num(m_req)}</b> · 流量 <b>{fmt_bytes(m_bytes)}</b>"
+                      f" <i>· 今日 {fmt_num(t_req)} / {fmt_bytes(t_bytes)}</i>")
     lines.append(bq(box, expandable=len(zones) > 3))
+    notes = []
     if len(zones) > 1:
         lines.append(f"Σ 合计 · 请求 <b>{fmt_num(tot_req)}</b> · 流量 <b>{fmt_bytes(tot_bytes)}</b>")
-    return lines, []
+        notes.append(lines[-1])
+    return lines, [], {"sub": sub, "detail": detail, "notes": notes}
 
 
 def get_cloudflare_data() -> Section:
@@ -1033,21 +1106,22 @@ def get_cloudflare_data() -> Section:
     for name, block in (("Workers & Pages", cf_workers_block), ("R2", cf_r2_block), ("D1", cf_d1_block),
                         ("CDN", cf_cdn_block)):
         try:
-            blk_lines, blk_metrics = block(now)
+            blk_lines, blk_metrics, panel = block(now)
             text = "\n".join(blk_lines)
             metrics += blk_metrics
-            # R2 / D1 没有存储桶、数据库时只有两行（标题 + 「无…」），面板上不显示
-            parts[name] = (name, text, blk_metrics, not blk_metrics and len(blk_lines) == 2 and "无" in blk_lines[1])
         except CFError as e:
             text = err(f"{name} 查询失败：{e}{cf_hint(str(e))}")
-            parts[name] = (name, text, [], False)
+            blk_metrics, panel = [], {"notes": [text]}
         except Exception as e:
             logger.exception("Cloudflare %s 查询异常", name)
             text = err(f"{name} 查询异常：{type(e).__name__}")
-            parts[name] = (name, text, [], False)
+            blk_metrics, panel = [], {"notes": [text]}
+        # R2 / D1 没有存储桶、数据库时 empty=True，面板上不显示
+        parts[name] = {"name": name, "text": text, "metrics": blk_metrics, "empty": bool(panel.get("empty")),
+                       "sub": panel.get("sub", ""), "detail": panel.get("detail", []), "notes": panel.get("notes", [])}
         blocks.append(text)
     # 面板上拆成几张卡：CDN 流量放最前，其次 D1、Workers & Pages、R2（TG 消息里的顺序不变）
-    order = [parts[k] for k in ("CDN", "D1", "Workers & Pages", "R2")]
+    order = [parts[k] for k in ("CDN", "D1", "Workers & Pages", "R2")]  # dict 列表
     return Section("<b>🟠 Cloudflare</b>  ━━━━━━━━\n\n" + "\n\n".join(blocks), metrics, parts=order)
 
 
@@ -1157,9 +1231,15 @@ def get_oracle_data() -> Section:
         lines.append(bq(quota("出站流量", pct, fmt_bytes(out_total), f"{OCI_EGRESS_LIMIT_TB:g}TB",
                               fmt_bytes(max(limit_bytes - out_total, 0)))))
         metrics.append(Metric("oci:egress", "Oracle 出站流量", pct, period,
-                              f"{fmt_bytes(out_total)} / {OCI_EGRESS_LIMIT_TB:g}TB"))
+                              f"{fmt_bytes(out_total)} / {OCI_EGRESS_LIMIT_TB:g}TB",
+                              days=(next_reset - start).days, limit=limit_bytes, unit="B"))
         lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
                      f"出站日均可用 <b>{fmt_bytes(max(limit_bytes - out_total, 0) / remain_days)}</b>")
+        notes = [lines[-1]]
+        # 面板明细：每台实例一行（本月出站；开了闲置检测再加 CPU / 网络 p95）
+        detail = {}
+        for i in sorted(instances, key=lambda x: x.display_name):
+            detail[i.id] = f"🖥 <b>{esc(i.display_name)}</b> · 出站 {fmt_bytes(egress.get(i.id, 0))}"
 
         # --- 闲置回收检测（默认隐藏，OCI_IDLE_CHECK=1 开启）
         if OCI_IDLE_CHECK:
@@ -1180,6 +1260,7 @@ def get_oracle_data() -> Section:
                 who = f"<b>{esc(name)}</b> <i>{esc(shape)}</i>"
                 if i.lifecycle_state != "RUNNING":
                     idle.append(f"⏸ {who} · 状态 <code>{esc(i.lifecycle_state)}</code>")
+                    detail[i.id] = f"⏸ {who} · 状态 <code>{esc(i.lifecycle_state)}</code> · 出站 {fmt_bytes(egress.get(i.id, 0))}"
                     continue
 
                 # 网络利用率 = 每 5 分钟收/发中较大的那个，换算成 bps 后除以实例带宽
@@ -1197,6 +1278,7 @@ def get_oracle_data() -> Section:
                     idle.append(f"❔ {who} · {why} · {net_txt}{young}")
                     idle.append("└ Cloud Agent 的 Compute Instance Monitoring 插件没在上报，无法判断")
                     idle.append(out_line)
+                    detail[i.id] = f"❔ {who} · {why} · {net_txt} · 出站 {fmt_bytes(egress.get(i.id, 0))}{young}"
                     continue
 
                 net_low = net95 is None or net95 < OCI_IDLE_LINE
@@ -1205,6 +1287,8 @@ def get_oracle_data() -> Section:
                 cpu_txt = f"<b>{cpu95:.1f}%</b>" if not at_risk else f"<u><b>{cpu95:.1f}%</b></u>"
                 idle.append(f"{icon} {who} · CPU p95 {cpu_txt} · {net_txt}{young}")
                 idle.append(out_line)
+                detail[i.id] = (f"{icon} {who} · CPU p95 {cpu_txt} · {net_txt} · "
+                                f"出站 {fmt_bytes(egress.get(i.id, 0))}{young}")
                 text = ""
                 if at_risk:
                     where = f"已低于 {OCI_IDLE_LINE:g}% 回收线" if cpu95 < OCI_IDLE_LINE else f"接近 {OCI_IDLE_LINE:g}% 回收线"
@@ -1215,7 +1299,8 @@ def get_oracle_data() -> Section:
                                       today, "", text))
             lines.append(bq(idle))
             lines.append("<i>ℹ️ 回收需 CPU、网络（A1 还有内存）同时偏低；内存未监控，A1 按最坏情况算</i>")
-        return Section("\n".join(lines), metrics)
+            notes.append(f"💤 闲置检测 <i>· 近 7 天 p95 · 回收线 {OCI_IDLE_LINE:g}% · A1 内存未监控，按最坏情况算</i>")
+        return Section("\n".join(lines), metrics, sub=OCI_REGION, detail=list(detail.values()), notes=notes)
     except Exception as e:
         logger.exception("Oracle 查询失败")
         return Section(f"{title}\n" + err(f"查询失败：{oci_hint(e)}"))
@@ -1260,15 +1345,20 @@ def get_aliyun_data() -> Section:
     pool = "海外/香港" if st.get("cls") == "international" else "中国内地"
 
     lines = [hdr("🟧 Aliyun CDT", f"本月 · {pool}")]
+    guard_line = f"🛡 <b>{esc(guard)}</b> · 熔断线 {limit:g}GB（{esc(mode)}）· 距熔断 <b>{fmt_gb(remain_to_limit)}</b>"
     lines.append(bq(quota("流量", pct, fmt_gb(used), fmt_gb(quota_gb), fmt_gb(max(quota_gb - used, 0)))
-                    + [f"🛡 <b>{esc(guard)}</b> · 熔断线 {limit:g}GB（{esc(mode)}）· 距熔断 <b>{fmt_gb(remain_to_limit)}</b>"]))
+                    + [guard_line]))
     host = st.get("name") or "ECS"  # 只用实例名称，不显示实例 ID 和公网 IP
     lines.append(f"🖥 <b>{esc(host)}</b> · {esc(st.get('status', '?'))} · "
                  f"{'有公网IP' if st.get('ip') else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
+    notes = [guard_line, lines[-1]]
+    detail = []
     if len(st.get("by_region") or {}) > 1:
         lines.append("🗺 " + " · ".join(f"{esc(r)} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
+        detail = [f"🗺 {esc(r)} · {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())]
     lines.append(f"🔄 {fmt_reset(next_reset)}后重置 <i>({fmt_dt(next_reset)})</i> · "
                  f"日均可用 <b>{fmt_gb(remain_to_limit / remain_days)}</b>")
+    notes.append(lines[-1])
     cost_limit = float(st.get("cost_limit") or 0)
     cost_pct = None
     if cost_limit and st.get("cost_cycle") == cn_now.strftime("%Y-%m"):
@@ -1277,26 +1367,32 @@ def get_aliyun_data() -> Section:
         lines.append(f"💰 本月应付 <b>{cost:.2f}</b> / 熔断 {cost_limit:g} {esc(cur)} <i>（账单有几小时延迟）</i>")
     if st.get("cost_error"):
         lines.append(f"⚠️ <b>账单查询失败，费用熔断暂时失效</b>：{esc(str(st['cost_error'])[:80])}")
+        notes.append(lines[-1])
 
     age_min = (time.time() - float(st.get("updated", 0))) / 60
     stale = age_min >= CDT_STALE_MIN
     if st.get("fail"):
         lines.append(f"⚠️ <b>cdt-guard 最近 {esc(st['fail'])} 次查询失败</b>：{esc(str(st.get('last_error', ''))[:100])}")
+        notes.append(lines[-1])
     if stale:
         lines.append(f"⚠️ <b>数据已 {age_min:.0f} 分钟未更新</b>，检查 <code>cdt-guard.timer</code>")
+        notes.append(lines[-1])
 
     period = cn_now.strftime("%Y-%m")
+    days = cycle_days(next_reset)
     metrics = [
-        Metric("aliyun:cdt", "阿里云 CDT 流量", pct, period, f"{used:.1f} / {quota_gb:g}GB"),
+        Metric("aliyun:cdt", "阿里云 CDT 流量", pct, period, f"{used:.1f} / {quota_gb:g}GB",
+               days=days, limit=quota_gb, unit="GB"),
         *([Metric("aliyun:cost", "阿里云本月费用（相对费用熔断线）", cost_pct, period,
-                  f"{float(st.get('cost') or 0):.2f} / {cost_limit:g} {st.get('currency', 'USD')}")]
+                  f"{float(st.get('cost') or 0):.2f} / {cost_limit:g} {st.get('currency', 'USD')}",
+                  days=days, limit=cost_limit, unit=st.get("currency", "USD"))]
           if cost_pct is not None else []),
         # 快照长时间不更新 = 熔断失效，每天提醒一次
         Metric("aliyun:cdt_stale", "cdt-guard 状态", 100 if stale else 0, now.strftime("%Y-%m-%d"), "",
                f"⚠️ <b>cdt-guard 已 {age_min:.0f} 分钟没有更新状态</b>，阿里云 CDT 熔断可能失效。"
                f"在服务器上运行 <code>bash init.sh status</code> 检查" if stale else ""),
     ]
-    return Section("\n".join(lines), metrics)
+    return Section("\n".join(lines), metrics, sub=f"本月 · {pool}", detail=detail, notes=notes)
 
 
 # ---------------------------------------------------------------- 汇总 / 缓存
@@ -1413,23 +1509,32 @@ def sonde_report(sections: list) -> None:
         return
     providers, series = [], {}
 
-    def card(name, group, text, metric_list, empty):
+    def card(name, group, text, metric_list, empty, sub="", detail=(), notes=()):
         metrics = []
         for m in metric_list:
-            alert = bool(m.text)  # 闲置、状态过期这类提醒：只有触发 / 未触发
-            metrics.append({"key": m.key, "label": m.label, "pct": round(float(m.pct or 0), 2),
-                            "detail": scrub(m.detail), "alert": alert})
+            alert = bool(m.text) or not m.detail  # 闲置、状态过期这类提醒（没有用量数字）：只有触发 / 未触发
+            item = {"key": m.key, "label": m.label, "pct": round(float(m.pct or 0), 2),
+                    "detail": scrub(m.detail), "alert": alert}
+            if not alert:
+                item.update(kind=m.kind, days=m.days, limit=m.limit, unit=m.unit)
+            metrics.append(item)
             if not alert and len(series) < 40:
-                series[m.key] = round(float(m.pct or 0), 2)
+                series[m.key] = round(float(m.pct or 0), 3)
+        # sub / detail / notes：面板按「指标 → 明细（引用块）→ 状态」三层排；html 是 TG 原文，留给旧版面板
         providers.append({"name": name, "group": group, "ok": "❌" not in text, "empty": empty,
-                          "metrics": metrics, "html": scrub(text)})
+                          "metrics": metrics, "sub": scrub(sub),
+                          "detail": [scrub(x) for x in detail], "notes": [scrub(x) for x in notes],
+                          "html": scrub(text)})
 
     for s in sections:
         if s.parts:  # Cloudflare：每一块单独一张卡
-            for pname, text, mlist, empty in s.parts:
-                card(pname, s.group or s.name, text, mlist, empty)
+            for pt in s.parts:
+                card(pt["name"], s.group or s.name, pt["text"], pt["metrics"], pt["empty"],
+                     pt["sub"], pt["detail"], pt["notes"])
         else:
-            card(s.label or s.name or "?", s.group, s.text, s.metrics, s.empty)
+            # 查询失败时只有 text（一行错误），放进状态行
+            notes = s.notes or ([] if s.metrics or s.detail else s.text.split("\n")[1:])
+            card(s.label or s.name or "?", s.group, s.text, s.metrics, s.empty, s.sub, s.detail, notes)
     bills = [s.bill for s in sections if s.bill]
     for b in bills:  # 账单走势也画曲线
         series[f"bill:{b['name']}"] = b["amount"]
