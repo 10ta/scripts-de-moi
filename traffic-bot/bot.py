@@ -128,9 +128,9 @@ class Metric:
     period: str   # 周期标识（天/月/重置时间），变化后告警记录自动清零
     detail: str   # 例如 "12,345 / 100,000"
     text: str = ""  # 自定义告警文本（如闲置提醒）；留空则用通用的"已用 x%"格式
-    # 以下几项只给 Sonde 面板画「近 7 天每天用了多少」用
-    kind: str = "cycle"  # cycle = 周期内累计（按月 / 账期重置）；level = 当前水位（按天重置的用量、存储大小）
-    days: float = 0      # cycle 的周期长度（天），面板据此算「均匀用完时每天该用多少」
+    # 以下几项只给 Sonde 面板画「近 7 天的滚动 24 小时用量」和预算线用
+    kind: str = "cycle"  # cycle = 周期内累计（按月 / 账期重置）；daily = 按天（UTC）重置的用量；size = 存储大小（不重置）
+    days: float = 0      # cycle 的周期长度（天），面板据此算预算线「均匀用完时每天该用多少」
     limit: float = 0     # 额度的数值（和 unit 一起把百分比换算回用量）
     unit: str = ""       # GB / B / 次 / 行 / USD
 
@@ -762,7 +762,7 @@ def cf_workers_block(now: datetime):
         panel["detail"] += [f"⚡ <code>{esc(k)}</code> · {fmt_num(v)}" for k, v in top]
     metric = Metric("cloudflare:workers", "Cloudflare Workers/Pages 今日请求", pct,
                     start.strftime("%Y-%m-%d"), f"{total:,} / {CF_WORKERS_DAILY_LIMIT:,}",
-                    kind="level", limit=CF_WORKERS_DAILY_LIMIT, unit="次")
+                    kind="daily", limit=CF_WORKERS_DAILY_LIMIT, unit="次")
     return lines, [metric], panel
 
 
@@ -821,7 +821,7 @@ def cf_r2_block(now: datetime):
             detail += [f"📦 <code>{esc(b)}</code> · {fmt_bytes(v[1])}" for b, v in top]
         metrics.append(Metric("cloudflare:r2_storage", "R2 存储", pct, month,
                               f"{fmt_bytes(total)} / {CF_R2_STORAGE_GB:g}GB",
-                              kind="level", limit=limit_bytes, unit="B"))
+                              kind="size", limit=limit_bytes, unit="B"))
     except CFError as e:
         extra.append(err(f"存储查询失败：{e}{cf_hint(str(e))}"))
         notes.append(extra[-1])
@@ -983,7 +983,7 @@ def cf_d1_block(now: datetime):
         if size is not None:
             metrics.append(Metric(f"cloudflare:d1_db:{dbid}", f"D1 {names.get(dbid, dbid[:8])} 大小",
                                   size / db_max * 100, "size", f"{fmt_bytes(size)} / {CF_D1_DB_MAX_MB:g}MB",
-                                  kind="level", limit=db_max, unit="B"))
+                                  kind="size", limit=db_max, unit="B"))
     if per_lines:  # 每库明细默认折叠
         lines.append(bq(per_lines, expandable=len(per_lines) > 2))
     if dbs is None:
@@ -992,11 +992,11 @@ def cf_d1_block(now: datetime):
 
     metrics += [
         Metric("cloudflare:d1_read", "D1 今日读取行", pr, today, f"{read:,} / {CF_D1_ROWS_READ:,}",
-               kind="level", limit=CF_D1_ROWS_READ, unit="行"),
+               kind="daily", limit=CF_D1_ROWS_READ, unit="行"),
         Metric("cloudflare:d1_write", "D1 今日写入行", pw, today, f"{written:,} / {CF_D1_ROWS_WRITTEN:,}",
-               kind="level", limit=CF_D1_ROWS_WRITTEN, unit="行"),
+               kind="daily", limit=CF_D1_ROWS_WRITTEN, unit="行"),
         Metric("cloudflare:d1_storage", "D1 存储", ps, "size", f"{fmt_bytes(storage)} / {CF_D1_STORAGE_GB:g}GB",
-               kind="level", limit=limit_bytes, unit="B"),
+               kind="size", limit=limit_bytes, unit="B"),
     ]
     return lines, metrics, panel
 
