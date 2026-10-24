@@ -10,6 +10,7 @@
 | [`debian-note.md`](debian-note.md) | Debian 服务器笔记：重装、初始化、网络调优、代理服务、维护升级、PVE |
 | [`brutal-cn.sh`](brutal-cn.sh) | 用中国大陆 IP 段自动维护 TCP Brutal v2 规则，定时更新并自愈 |
 | [`upsing.sh`](upsing.sh) | 从 GitHub Release 下载并安装 sing-box 的 `.deb` 包 |
+| [`warp-keeper/`](warp-keeper/) | 给 sing-box 自动维护 Cloudflare WARP 出口：注册账户、生成 wireguard endpoint 片段、每小时检查并自愈，不需要 wireproxy |
 
 ---
 

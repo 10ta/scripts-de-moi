@@ -1,0 +1,11 @@
+[Unit]
+Description=warp-keeper：检查 sing-box 的 WARP 出口，不通就自愈
+Documentation=https://github.com/10ta/scripts-de-moi/tree/main/warp-keeper
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/warp-keeper/warp-keeper.sh check
+# 最坏情况：探测重试 + 重载 + 注册 + 再探测，几分钟内一定结束
+TimeoutStartSec=10min

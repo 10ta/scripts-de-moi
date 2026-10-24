@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # update.sh —— scripts-de-moi 一键更新：本机装了哪几个工具，就更新哪几个
 #
-#   sudo ./update.sh            同步代码 → 依次更新本机已安装的 cdt-guard、traffic-bot、cfst-ddns
+#   sudo ./update.sh            同步代码 → 依次更新本机已安装的 cdt-guard、traffic-bot、cfst-ddns、warp-keeper
 #   sudo ./update.sh --status   只看每个工具的仓库版本、已部署版本、运行状态
 #   sudo ./update.sh --no-pull  不同步 git，直接部署磁盘上的代码
 #
 # 是否已安装：程序文件（/opt/<应用>/…）和配置文件（/etc/<应用>.env）都在才算。没装的跳过，不会帮你新装；
 # 只有其中一个（没装完 / 卸载残留）的会提示出来，同样跳过。
-# 影响：会重启本机的 traffic-bot（断开几秒），cdt-guard 会立即执行一次检查，cfst-ddns 的 timer 会重启。
+# 影响：会重启本机的 traffic-bot（断开几秒），cdt-guard 会立即执行一次检查，cfst-ddns 的 timer 会重启；
+# warp-keeper 生成的 sing-box 片段有变化时会重载 sing-box（所有入站断开一下），没变化就不动。
 # 只更新其中一个：sudo ./<目录>/update.sh
 # ==== 公共部分 v1（各仓库的 update.sh 里这一段完全相同，改的时候一起改）====
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
@@ -111,7 +112,8 @@ cd "$(dirname "$SELF")"
 # 目录:程序文件:配置文件 —— 两个都在才算已安装（和各子目录 update.sh 的判断一致）
 TOOLS=(CDT-Management:/opt/cdt-guard/cdt_guard.py:/etc/cdt-guard.env
        traffic-bot:/opt/traffic-bot/bot.py:/etc/traffic-bot.env
-       cfst-ddns:/opt/cfst-ddns/cfst-ddns.sh:/etc/cfst-ddns.env)
+       cfst-ddns:/opt/cfst-ddns/cfst-ddns.sh:/etc/cfst-ddns.env
+       warp-keeper:/opt/warp-keeper/warp-keeper.sh:/etc/warp-keeper.env)
 
 found=() leftover=()
 for t in "${TOOLS[@]}"; do
@@ -131,7 +133,7 @@ if (( STATUS )); then
   exit 0
 fi
 
-(( ${#found[@]} )) || die "本机没有安装任何一个工具（/opt/cdt-guard、/opt/traffic-bot、/opt/cfst-ddns 都不存在）"
+(( ${#found[@]} )) || die "本机没有安装任何一个工具（/opt/cdt-guard、/opt/traffic-bot、/opt/cfst-ddns、/opt/warp-keeper 都不存在）"
 echo "本机已安装：${found[*]}"
 for l in "${leftover[@]}"; do warn "跳过 $l：像是没装完或卸载后的残留，不是这台机器上在用的工具"; done
 
