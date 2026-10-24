@@ -208,18 +208,21 @@ mod_ssh() {
 
   # 写入密钥文件
   [[ -e "$dir/$name" ]] && backup "$dir/$name" && backup "$dir/$name.pub"
-  printf '%s' "$priv" >"$dir/$name"
+  # 末尾必须有换行：$(...) 会吞掉末尾换行，缺了它 OpenSSL 3 会报 "error in libcrypto"
+  printf '%s\n' "$priv" >"$dir/$name"
   printf '%s\n' "$pub" >"$dir/$name.pub"
   chmod 600 "$dir/$name"; chmod 644 "$dir/$name.pub"
 
-  # 校验私钥和公钥是否配对（有口令的私钥跳过校验）
-  local derived
-  if derived="$(ssh-keygen -y -P "" -f "$dir/$name" 2>/dev/null)"; then
-    [[ "$(awk '{print $1,$2}' <<<"$derived")" == "$(awk '{print $1,$2}' <<<"$pub")" ]] \
+  # 校验私钥和公钥是否配对：只有口令导致的失败才跳过，其他解析失败直接报错
+  local out
+  if out="$(ssh-keygen -y -P "" -f "$dir/$name" 2>&1)"; then
+    [[ "$(awk '{print $1,$2}' <<<"$out")" == "$(awk '{print $1,$2}' <<<"$pub")" ]] \
       || die "私钥和公钥不配对，请检查粘贴内容"
     ok "私钥与公钥配对校验通过"
+  elif [[ "$out" == *passphrase* ]]; then
+    warn "私钥设有口令，跳过配对校验"
   else
-    warn "私钥可能设有口令，跳过配对校验"
+    die "私钥无法解析：${out}"
   fi
 
   # authorized_keys：追加（不覆盖已有的其他公钥）
