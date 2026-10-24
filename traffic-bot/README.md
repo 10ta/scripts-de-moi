@@ -13,7 +13,7 @@
 | ☁️ AWS Lightsail | 每台实例的流量（入+出）/ 套餐额度 | UTC 自然月 |
 | 🌐 AWS CloudFront | 出流量 / 1TB，请求数 / 1000 万，月底预测 | UTC 自然月 |
 | 💵 AWS 账单 | 本月预估总额、每个收费服务的金额，可设金额告警 | UTC 自然月 |
-| ⚡ Cloudflare Workers & Pages | 今日请求 / 10 万，账期内请求数与 CPU 时间 | 每天 00:00 UTC |
+| ⚡ Cloudflare Workers & Pages | 今日请求 / 10 万，账期内请求数与 CPU 时间；各 Worker 近 24 小时的 CPU P50 / P90 / P99（对比每次 10ms 的上限）、平均子请求、被平台终止的次数 | 请求每天 00:00 UTC；CPU 不重置 |
 | 🪣 Cloudflare R2 | 存储 / 10GB，Class A / 100 万，Class B / 1000 万 | 自然月 |
 | 🗄 Cloudflare D1 | 今日读取行 / 500 万，写入行 / 10 万，存储 / 5GB，每个库的大小 / 500MB | 每天 00:00 UTC |
 | 📈 Cloudflare CDN | 每个域名本月的请求数和流量（免费计划无上限，仅供参考） | 自然月 |
@@ -362,6 +362,7 @@ sudo bash install.sh
 | `CLOUDFLARE_BILLING_DAY` | `8` | Workers 账期起始日 |
 | `CLOUDFLARE_PAGES_FUNCTIONS` | `1` | 是否把 Pages Functions 计入 Workers 请求数 |
 | `CF_WORKERS_DAILY_LIMIT` | `100000` | Workers 每日免费请求数 |
+| `CF_WORKERS_CPU_MS` | `10` | 每次调用的 CPU 上限（毫秒），免费版 10；各 Worker 的 CPU P90 越过它的 80% / 95% 时告警，有调用因超 CPU / 资源限制被终止时也告警（每天一次） |
 | `CF_R2_STORAGE_GB` / `CF_R2_CLASS_A` / `CF_R2_CLASS_B` | `10` / `1000000` / `10000000` | R2 免费额度 |
 | `CF_D1_ROWS_READ` / `CF_D1_ROWS_WRITTEN` | `5000000` / `100000` | D1 每日免费读写行数 |
 | `CF_D1_STORAGE_GB` / `CF_D1_DB_MAX_MB` | `5` / `500` | D1 账号总存储 / 单库上限 |

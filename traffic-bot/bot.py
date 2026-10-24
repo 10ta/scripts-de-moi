@@ -62,6 +62,8 @@ CLOUDFLARE_PAGES_FUNCTIONS = os.getenv("CLOUDFLARE_PAGES_FUNCTIONS", "1") not in
 # 账期起始日（UTC）：控制台 Workers & Pages → Usage 里显示 "Oct 8 - Nov 8" 就填 8，用来统计账期内的请求数 / CPU 时间
 CLOUDFLARE_BILLING_DAY = min(max(int(os.getenv("CLOUDFLARE_BILLING_DAY", "8")), 1), 31)
 CF_WORKERS_DAILY_LIMIT = int(os.getenv("CF_WORKERS_DAILY_LIMIT", "100000"))
+# 每次调用的 CPU 上限（毫秒）：免费版 10ms（HTTP 请求和 Cron 都是），付费版默认 30 秒
+CF_WORKERS_CPU_MS = float(os.getenv("CF_WORKERS_CPU_MS", "10"))
 CF_R2_STORAGE_GB = float(os.getenv("CF_R2_STORAGE_GB", "10"))
 CF_R2_CLASS_A = int(os.getenv("CF_R2_CLASS_A", "1000000"))
 CF_R2_CLASS_B = int(os.getenv("CF_R2_CLASS_B", "10000000"))
@@ -581,6 +583,25 @@ Q_WORKERS = """query { viewer { accounts(filter: {accountTag: "__ACC__"}) {
     dimensions { scriptName }
   } } } }"""
 
+# 各 Worker 的健康状况，一次请求三段（GraphQL 别名）：近 24 小时 / 近 1 小时的调用次数、错误、子请求和 CPU 分位数，
+# 以及近 24 小时按结果（status）分的次数。分位数单位是微秒
+Q_WORKER_HEALTH = """query { viewer { accounts(filter: {accountTag: "__ACC__"}) {
+  day: workersInvocationsAdaptive(limit: 1000, filter: {datetime_geq: "__DAY__", datetime_leq: "__END__"}) {
+    sum { requests errors subrequests }
+    quantiles { __Q__ }
+    dimensions { scriptName }
+  }
+  hour: workersInvocationsAdaptive(limit: 1000, filter: {datetime_geq: "__HOUR__", datetime_leq: "__END__"}) {
+    sum { requests }
+    quantiles { __Q__ }
+    dimensions { scriptName }
+  }
+  status: workersInvocationsAdaptive(limit: 1000, filter: {datetime_geq: "__DAY__", datetime_leq: "__END__"}) {
+    sum { requests }
+    dimensions { scriptName status }
+  }
+} } }"""
+
 Q_PAGES = """query { viewer { accounts(filter: {accountTag: "__ACC__"}) {
   pagesFunctionsInvocationsAdaptiveGroups(limit: 10000, filter: {datetime_geq: "__START__", datetime_leq: "__END__"}) {
     sum { __FIELDS__ }
@@ -709,6 +730,75 @@ def cf_period_usage(now: datetime):
     return p_start, p_end, req, (cpu_us if cpu_known else None)
 
 
+# 调用结果（status）里算作出错的：被平台终止（CPU / 内存等超限）和代码抛异常；客户端断开不算
+STATUS_TEXT = {"exceededCpu": "超 CPU", "exceededResources": "超资源限制", "exceededMemory": "超内存",
+               "scriptThrewException": "异常", "internalError": "平台内部错误"}
+
+
+def cf_worker_health(now: datetime):
+    """各 Worker 近 24 小时的 CPU 分位数、调用次数、子请求、出错次数。
+    返回 (TG 行, 指标, 面板明细, 面板状态行)；CPU P90 按脚本各一条指标（近 1 小时，调用太少时用近 24 小时），
+    上限 CF_WORKERS_CPU_MS；被平台以超 CPU / 资源限制终止过的，另加一条提醒"""
+    params = dict(acc=CLOUDFLARE_ACCOUNT_ID, day=iso(now - timedelta(days=1)), hour=iso(now - timedelta(hours=1)), end=iso(now))
+    gauge = "cpuTimeP90"
+    try:
+        acc = cf_account(cf_graphql(Q_WORKER_HEALTH, q="cpuTimeP50 cpuTimeP90 cpuTimeP99", **params))
+    except CFError as e:  # 万一 P90 这个字段不存在：退回 P50 / P99，用 P99 比上限（更保守）
+        logger.info("cpuTimeP90 不可用（%s），改用 P99", e)
+        gauge = "cpuTimeP99"
+        acc = cf_account(cf_graphql(Q_WORKER_HEALTH, q="cpuTimeP50 cpuTimeP99", **params))
+    gname = "P90" if gauge == "cpuTimeP90" else "P99"
+
+    def by_script(rows):
+        return {(r.get("dimensions") or {}).get("scriptName") or "?": r for r in rows or []}
+    day, hour = by_script(acc.get("day")), by_script(acc.get("hour"))
+    bad = {}  # 脚本 -> {status: 次数}
+    for r in acc.get("status") or []:
+        d = r.get("dimensions") or {}
+        st = d.get("status") or ""
+        if st in STATUS_TEXT:
+            n = int((r.get("sum") or {}).get("requests") or 0)
+            if n:
+                bad.setdefault(d.get("scriptName") or "?", {})[st] = n
+
+    today = now.strftime("%Y-%m-%d")
+    ms = lambda us: float(us or 0) / 1000  # noqa: E731
+    fmt = lambda v: f"{v:.1f}".rstrip("0").rstrip(".") if v < 100 else f"{v:.0f}"  # noqa: E731
+    tg, metrics, detail = [], [], []
+    for name, r in sorted(day.items(), key=lambda kv: -int((kv[1].get("sum") or {}).get("requests") or 0))[:6]:
+        sm, q = r.get("sum") or {}, r.get("quantiles") or {}
+        req = int(sm.get("requests") or 0)
+        if not req:
+            continue
+        h = hour.get(name)
+        recent = h if h and int((h.get("sum") or {}).get("requests") or 0) >= 10 else None
+        g = ms(((recent or r).get("quantiles") or {}).get(gauge))
+        pct = g / CF_WORKERS_CPU_MS * 100
+        win = "近 1 小时" if recent else "近 24 小时"
+        metrics.append(Metric(f"cloudflare:cpu:{name}", f"{name} CPU {gname}（{win}）", pct, today,
+                              f"{fmt(g)} / {CF_WORKERS_CPU_MS:g}ms", kind="gauge", limit=CF_WORKERS_CPU_MS, unit="ms"))
+        errs = bad.get(name, {})
+        killed = sum(n for st, n in errs.items() if st.startswith("exceeded"))
+        if killed:  # 被平台终止：每天提醒一次
+            metrics.append(Metric(f"cloudflare:killed:{name}", f"{name} 被终止 {killed} 次", 100, today, "",
+                                  f"🛑 <b>Worker {esc(name)} 近 24 小时有 {killed} 次调用因超出 CPU / 资源限制被终止</b>"
+                                  f"（CPU {gname} {fmt(g)}ms，上限 {CF_WORKERS_CPU_MS:g}ms）"))
+        quant = " / ".join(fmt(ms(q.get(k))) for k in ("cpuTimeP50", "cpuTimeP90", "cpuTimeP99") if k in q)
+        sub = int(sm.get("subrequests") or 0) / req
+        err_txt = " · ".join(f"{STATUS_TEXT[st]} {fmt_num(n)}" for st, n in errs.items())
+        warn = " ⚠️" if pct >= 100 else ""
+        detail.append(f"⚡ <code>{esc(name)}</code> · {fmt_num(req)} 次 · CPU <b>{quant}</b>ms{warn} · 子请求 {sub:.1f}/次"
+                      + (f" · 🛑 {err_txt}" if err_txt else ""))
+        g24 = ms(q.get(gauge))
+        tg.append(f"└ <code>{esc(name)}</code> {fmt_num(req)} 次 · CPU {gname} <b>{fmt(g24)}ms</b>{' ⚠️' if g24 >= CF_WORKERS_CPU_MS else ''}"
+                  + (f" · 🛑 {err_txt}" if err_txt else ""))
+    notes = [f"ℹ️ 各 Worker：近 24 小时调用次数 · CPU P50 / P90 / P99 · 平均每次子请求 <i>· 免费版每次调用 CPU 上限 "
+             f"{CF_WORKERS_CPU_MS:g}ms、子请求 50 个</i>"] if detail else []
+    if tg:
+        tg.insert(0, f"🧠 <b>CPU</b> <i>近 24 小时 · 上限 {CF_WORKERS_CPU_MS:g}ms/次</i>")
+    return tg, metrics, detail, notes
+
+
 def cf_workers_block(now: datetime):
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = dict(acc=CLOUDFLARE_ACCOUNT_ID, start=iso(start), end=iso(now))
@@ -759,11 +849,22 @@ def cf_workers_block(now: datetime):
     top = sorted(per_script.items(), key=lambda kv: kv[1], reverse=True)[:3]
     if len(per_script) > 1:
         lines.append("🏆 " + " · ".join(f"<code>{esc(k)}</code> {fmt_num(v)}" for k, v in top))
-        panel["detail"] += [f"⚡ <code>{esc(k)}</code> · {fmt_num(v)}" for k, v in top]
     metric = Metric("cloudflare:workers", "Cloudflare Workers/Pages 今日请求", pct,
                     start.strftime("%Y-%m-%d"), f"{total:,} / {CF_WORKERS_DAILY_LIMIT:,}",
                     kind="daily", limit=CF_WORKERS_DAILY_LIMIT, unit="次")
-    return lines, [metric], panel
+    metrics = [metric]
+
+    # 各 Worker 的 CPU、子请求、出错（面板上每个 Worker 一行明细 + 一条 CPU 指标）；查不到不影响上面的请求数
+    try:
+        h_tg, h_metrics, h_detail, h_notes = cf_worker_health(now)
+        lines += h_tg
+        metrics += h_metrics
+        panel["detail"] += h_detail
+        panel["notes"] += h_notes
+    except CFError as e:
+        logger.warning("Worker CPU / 出错数据查询失败：%s", e)
+        panel["notes"].append(err(f"各 Worker 的 CPU 查询失败：{e}"))
+    return lines, metrics, panel
 
 
 def cf_r2_buckets():
