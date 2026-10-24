@@ -16,7 +16,7 @@
 #   · 一条规则：这个入站的流量全部走上面的 endpoint
 # sing-box 按文件名合并目录里的所有 .json，主配置一行不用改。
 # 配置在 /etc/warp-keeper.env，状态在 /var/lib/warp-keeper/。
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -uo pipefail
@@ -308,12 +308,13 @@ restore_fragment() {
 
 # ---------- 探测：经本机 mixed 入站访问 Cloudflare trace ----------
 # 目标直接写 IP，不依赖 DNS；延迟取「TLS 握手完成 → 收到第一个字节」，约等于一个往返
-declare -A P_WARP P_COLO P_LOC P_RTT
+declare -A P_WARP P_COLO P_LOC P_RTT P_IP
 probe_one() {   # probe_one 4|6
   local url out t meta
   [[ $1 == 4 ]] && url='https://1.1.1.1/cdn-cgi/trace' || url='https://[2606:4700:4700::1111]/cdn-cgi/trace'
   out=$(curl -gsS -m 12 --proxy "socks5://127.0.0.1:$LOCAL_PORT" -w $'\n__T %{time_appconnect} %{time_starttransfer}' "$url" 2>/dev/null) || out=""
   P_WARP[$1]=$(sed -n 's/^warp=//p' <<<"$out"); P_COLO[$1]=$(sed -n 's/^colo=//p' <<<"$out"); P_LOC[$1]=$(sed -n 's/^loc=//p' <<<"$out")
+  P_IP[$1]=$(sed -n 's/^ip=//p' <<<"$out" | grep -E '^[0-9a-fA-F.:]{2,45}$')   # WARP 出口 IP（只用在 Telegram 和本机日志里）
   meta=$(sed -n 's/^__T //p' <<<"$out")
   t=$(awk '{ if ($2 > 0 && $2 >= $1) printf "%d", ($2 - $1) * 1000 + 0.5 }' <<<"$meta")
   P_RTT[$1]=$t
@@ -365,11 +366,13 @@ ago() {
 acct_label() { is_plus && echo "WARP+" || echo "WARP"; }
 acct_days() { local c; c=$(acc created); [[ -n "$c" ]] && echo $(( (NOW - c) / 86400 )) || echo 0; }
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { if (b > 0) printf "%.1f%%", a * 100 / b; else printf "–" }'; }
-stack_line() {   # IPv4 一行：状态 · 出口机房 · 延迟
-  local s=$1 w=${P_WARP[$1]:-}
+stack_line() {   # IPv4 一行：状态 · 出口机房 · 延迟 · 出口 IP
+  # 第二个参数是 tg 时 IP 先写成占位符：Telegram 消息发出去前要过 scrub（会抹掉所有 IP），抹完再换回来
+  local s=$1 w=${P_WARP[$1]:-} ip=${P_IP[$1]:-}
+  [[ -n "$ip" && "${2:-}" == tg ]] && ip="⟦IP$s⟧"
   case "$w" in
-    plus) printf 'IPv%s ✅ WARP+ · 出口 %s（%s）· %s ms' "$s" "${P_COLO[$s]:-?}" "${P_LOC[$s]:-?}" "${P_RTT[$s]:-?}" ;;
-    on)   printf 'IPv%s ✅ WARP · 出口 %s（%s）· %s ms' "$s" "${P_COLO[$s]:-?}" "${P_LOC[$s]:-?}" "${P_RTT[$s]:-?}" ;;
+    plus) printf 'IPv%s ✅ WARP+ · 出口 %s（%s）· %s ms%s' "$s" "${P_COLO[$s]:-?}" "${P_LOC[$s]:-?}" "${P_RTT[$s]:-?}" "${ip:+ · $ip}" ;;
+    on)   printf 'IPv%s ✅ WARP · 出口 %s（%s）· %s ms%s' "$s" "${P_COLO[$s]:-?}" "${P_LOC[$s]:-?}" "${P_RTT[$s]:-?}" "${ip:+ · $ip}" ;;
     off)  printf 'IPv%s ⚠️ 走到了 Cloudflare 但不是 WARP（%s）' "$s" "${P_COLO[$s]:-?}" ;;
     *)    printf 'IPv%s ❌ 不通' "$s" ;;
   esac
@@ -381,6 +384,8 @@ tg_send() {   # tg_send HTML
   local msg resp why
   [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]] || return 0
   msg=$(scrub "$1")
+  # 唯一例外：WARP 出口 IP（Cloudflare 的地址，不是本机的）。scrub 之后再放回来，等宽显示方便复制
+  local s; for s in 4 6; do msg=${msg//"⟦IP$s⟧"/"<code>${P_IP[$s]:-}</code>"}; done
   resp=$(curl -sS -m 15 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
     -d parse_mode=HTML -d disable_web_page_preview=true 2>&1) || true
@@ -396,7 +401,7 @@ tg_send() {   # tg_send HTML
 }
 body_lines() {   # 引用块里的内容：每个栈一行 + 可用率 + 账户
   local s a b out="" up24 up7
-  for s in $(stacks); do out+="$(h "$(stack_line "$s")")"$'\n'; done
+  for s in $(stacks); do out+="$(h "$(stack_line "$s" tg)")"$'\n'; done
   read -r a b <<<"$(uptime_of 86400)"; up24="$(pct "$a" "$b")（${a}/${b}）"
   read -r a b <<<"$(uptime_of $((7 * 86400)))"; up7=$(pct "$a" "$b")
   out+="📈 可用率 24 小时 <b>${up24}</b> · 7 天 ${up7}"$'\n'
@@ -447,6 +452,8 @@ send_summary() {
 }
 
 # ---------- Sonde ----------
+# 面板上只讲 WARP 本身：文字里的 sing-box 统一写成「代理」
+plain() { scrub "$1" | sed -E -e 's/ sing-box /代理/g' -e 's/sing-box ?/代理/g'; }
 sonde_report() {
   [[ -n "$SONDE_URL" && -n "$SONDE_TOKEN" ]] || return 0
   local id up24 up7 a b series body s stk="[]" r4 r6
@@ -461,18 +468,18 @@ sonde_report() {
   series=$(jq -nc --arg r4 "$r4" --arg r6 "$r6" --argjson up "$([[ "$KIND" == ok || "$KIND" == recovered || "$KIND" == init || "$KIND" == renewed || "$KIND" == plus ]] && echo 1 || echo 0)" \
     '{up: $up} + (if $r4 != "" then {rtt4: ($r4 | tonumber)} else {} end) + (if $r6 != "" then {rtt6: ($r6 | tonumber)} else {} end)')
   body=$(jq -nc --arg source "warp-keeper:${id:-host}" --argjson series "$series" \
-    --arg name "$WARP_NAME" --arg host "$HOST" --arg kind "$KIND" --arg action "$(scrub "$ACTION")" --arg reason "$(scrub "$REASON")" \
-    --arg note "$(scrub "$NOTE")" --argjson stacks "$stk" --arg account "$(acct_label)" --argjson days "$(acct_days)" \
-    --argjson renews "$RENEW_TOTAL" --argjson last_renew "$LAST_RENEW" --argjson reloads "$RELOAD_TOTAL" \
+    --arg name "$WARP_NAME" --arg host "$HOST" --arg kind "$KIND" --arg action "$(plain "$ACTION")" --arg reason "$(plain "$REASON")" \
+    --arg note "$(plain "$NOTE")" --argjson stacks "$stk" --arg account "$(acct_label)" --argjson days "$(acct_days)" \
+    --argjson renews "$RENEW_TOTAL" --argjson last_renew "$LAST_RENEW" \
     --argjson fail_since "$FAIL_SINCE" --argjson last_ok "$LAST_OK" --argjson up24 "$up24" --argjson up7 "$up7" \
     --argjson last_fail "$(awk '$2 == 0 { t = $1 } END { print t + 0 }' "$HIST" 2>/dev/null || echo 0)" \
     --arg plus_mode "$( [[ "$WARP_PLUS" =~ ^(off|auto|tg|)$ ]] && echo "${WARP_PLUS:-off}" || echo key)" \
-    --arg sb "$(sb_version)" --arg ver "$VERSION" --argjson mtu "$MTU" --arg stack "$STACK" \
+    --arg ver "$VERSION" --arg stack "$STACK" \
     '{source: $source, ts: now | floor, interval: 3600, series: $series,
       data: {name: $name, host: $host, kind: $kind, action: $action, reason: $reason, note: $note,
              stacks: $stacks, account: $account, account_days: $days, renews: $renews, last_renew: $last_renew,
-             reloads: $reloads, fail_since: $fail_since, last_ok: $last_ok, last_fail: $last_fail, up24: $up24, up7: $up7,
-             plus_mode: $plus_mode, singbox: $sb, version: $ver, mtu: $mtu, stack: $stack}}') \
+             fail_since: $fail_since, last_ok: $last_ok, last_fail: $last_fail, up24: $up24, up7: $up7,
+             plus_mode: $plus_mode, version: $ver, stack: $stack}}') \
     || { warn "Sonde 上报数据生成失败"; return 0; }
   if curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "${SONDE_URL%/}/ingest" \
        -H "Authorization: Bearer $SONDE_TOKEN" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then

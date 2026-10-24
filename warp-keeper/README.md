@@ -154,7 +154,7 @@ sudo systemctl enable --now warp-keeper.timer
 
 ## 通知
 
-**Telegram**（`TG_BOT_TOKEN` + `TG_CHAT_ID`，可以和 traffic-bot、cfst-ddns 用同一个 bot）。和仓库里其他工具一样：消息里没有 IP、域名、网址，出口只写机房代码和国家。
+**Telegram**（`TG_BOT_TOKEN` + `TG_CHAT_ID`，可以和 traffic-bot、cfst-ddns 用同一个 bot）。每个栈一行：状态、出口机房和国家、延迟、**WARP 出口 IP**（等宽显示，点一下就能复制）。出口 IP 是 Cloudflare 分配的地址，不是本机的；除此之外和仓库里其他工具一样，消息里不会出现本机 IP、域名、网址。
 
 | `TG_NOTIFY` | 什么时候发 |
 |---|---|
@@ -164,7 +164,7 @@ sudo systemctl enable --now warp-keeper.timer
 
 另外每天 `TG_SUMMARY_HOUR` 点后的第一次检查发一条**日报**：每个栈的出口和延迟、24 小时 / 7 天可用率、24 小时平均延迟、账户类型和使用天数、换号和重载次数。留空不发。
 
-**Sonde**：填上 `SONDE_URL`、`SONDE_TOKEN`，每次检查后上报。来源名是 `warp-keeper:<WARP_NAME>`（小写），每台机器一张卡片；上报周期 1 小时，两小时没动静面板上就标离线。
+**Sonde**：填上 `SONDE_URL`、`SONDE_TOKEN`，每次检查后上报。来源名是 `warp-keeper:<WARP_NAME>`（小写）；面板把所有机器汇总在**同一张** WARP 卡片里，每台一行。上报周期 1 小时，两小时没动静那一行就标离线。Sonde 页面是公开的，所以上报里**不带出口 IP**，只有机房代码和国家。
 
 ## 命令
 
