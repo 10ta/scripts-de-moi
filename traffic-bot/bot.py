@@ -135,6 +135,7 @@ class Metric:
     days: float = 0      # cycle 的周期长度（天），面板据此算预算线「均匀用完时每天该用多少」
     limit: float = 0     # 额度的数值（和 unit 一起把百分比换算回用量）
     unit: str = ""       # GB / B / 次 / 行 / USD
+    notify: bool = True  # False：只在报告和面板上显示，不按 80% / 95% 阈值推送告警（如 CPU P90 这种会在上限附近来回波动的即时值）
 
 
 @dataclass
@@ -775,8 +776,16 @@ def cf_worker_health(now: datetime):
         g = ms(((recent or r).get("quantiles") or {}).get(gauge))
         pct = g / CF_WORKERS_CPU_MS * 100
         win = "近 1 小时" if recent else "近 24 小时"
+        # 面板上的这一条只显示、不推送：P90 会在上限附近来回波动，按 80% / 95% 告警会经常响却不代表出事。
+        # 推送只在两种情况：近 24 小时的 P90 也超过上限（长期超限），或者真有调用被终止（见下面）
         metrics.append(Metric(f"cloudflare:cpu:{name}", f"{name} CPU {gname}（{win}）", pct, today,
-                              f"{fmt(g)} / {CF_WORKERS_CPU_MS:g}ms", kind="gauge", limit=CF_WORKERS_CPU_MS, unit="ms"))
+                              f"{fmt(g)} / {CF_WORKERS_CPU_MS:g}ms", kind="gauge", limit=CF_WORKERS_CPU_MS, unit="ms",
+                              notify=False))
+        g_day = ms(q.get(gauge))
+        if g_day > CF_WORKERS_CPU_MS:  # 每天提醒一次
+            metrics.append(Metric(f"cloudflare:cpu_day:{name}", f"{name} 近 24 小时 CPU {gname} 超上限", 100, today, "",
+                                  f"⚠️ <b>Worker {esc(name)} 近 24 小时 CPU {gname} {fmt(g_day)}ms</b>，超过每次调用 "
+                                  f"{CF_WORKERS_CPU_MS:g}ms 的上限。偶尔超出会被容忍，长期如此可能被终止"))
         errs = bad.get(name, {})
         killed = sum(n for st, n in errs.items() if st.startswith("exceeded"))
         if killed:  # 被平台终止：每天提醒一次
@@ -1532,7 +1541,7 @@ async def collect_sections(max_age: float = 30) -> list:
 def attention(sections: list) -> str:
     """报告开头的摘要：越过最低告警线的指标全部列出来；都正常时只给一行"""
     line = min(ALERT_THRESHOLDS) if ALERT_THRESHOLDS else 80
-    ms = [m for s in sections for m in s.metrics if m.pct is not None]
+    ms = [m for s in sections for m in s.metrics if m.pct is not None and m.notify]
     hot = sorted((m for m in ms if m.pct >= line), key=lambda m: -m.pct)
     if hot:
         rows = []
@@ -1683,6 +1692,8 @@ def evaluate_alerts(metrics: list, state: dict) -> list:
     """已用比例首次越过更高一档阈值时返回告警文本；周期变化（新的一天/月）后记录清零。会原地更新 state"""
     messages = []
     for m in metrics:
+        if not m.notify:
+            continue
         prev = state.get(m.key) or {}
         prev_level = prev.get("level", 0) if prev.get("period") == m.period else 0
         level = pick_level(m.pct)

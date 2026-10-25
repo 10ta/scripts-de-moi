@@ -362,7 +362,7 @@ sudo bash install.sh
 | `CLOUDFLARE_BILLING_DAY` | `8` | Workers 账期起始日 |
 | `CLOUDFLARE_PAGES_FUNCTIONS` | `1` | 是否把 Pages Functions 计入 Workers 请求数 |
 | `CF_WORKERS_DAILY_LIMIT` | `100000` | Workers 每日免费请求数 |
-| `CF_WORKERS_CPU_MS` | `10` | 每次调用的 CPU 上限（毫秒），免费版 10；各 Worker 的 CPU P90 越过它的 80% / 95% 时告警，有调用因超 CPU / 资源限制被终止时也告警（每天一次） |
+| `CF_WORKERS_CPU_MS` | `10` | 每次调用的 CPU 上限（毫秒），免费版 10。面板和报告显示各 Worker 近 1 小时的 CPU P90 对比它（只显示，不按 80% / 95% 推送——P90 会在上限附近来回波动）；推送只在近 24 小时的 P90 也超过上限，或有调用因超 CPU / 资源限制被终止时（各每天一次） |
 | `CF_R2_STORAGE_GB` / `CF_R2_CLASS_A` / `CF_R2_CLASS_B` | `10` / `1000000` / `10000000` | R2 免费额度 |
 | `CF_D1_ROWS_READ` / `CF_D1_ROWS_WRITTEN` | `5000000` / `100000` | D1 每日免费读写行数 |
 | `CF_D1_STORAGE_GB` / `CF_D1_DB_MAX_MB` | `5` / `500` | D1 账号总存储 / 单库上限 |
