@@ -193,12 +193,10 @@ git am -3 *.patch && rm *.patch && git push && ./update.sh
 
 ```bash
 # 先把主配置里引用「🧩 <WARP>」的规则改掉（否则 remove 会拒绝），然后：
-warp-keeper remove
-systemctl disable --now warp-keeper.timer
-rm -f /etc/systemd/system/warp-keeper.{service,timer} /usr/local/bin/warp-keeper
-rm -rf /opt/warp-keeper /var/lib/warp-keeper /etc/warp-keeper.env
-systemctl daemon-reload
+sudo ./warp-keeper/uninstall.sh    # 或者根目录的 sudo ./uninstall.sh，在菜单里选
 ```
+
+先执行 `warp-keeper remove`（删片段 → 检查 → 重载 sing-box → 注销 WARP 账户），成功了才删 timer、服务、`/opt/warp-keeper` 和 `/usr/local/bin/warp-keeper`；remove 被拒绝时什么都不删。配置 `/etc/warp-keeper.env` 和状态 `/var/lib/warp-keeper` 保留，卸载完会打印彻底删除的命令。
 
 ## 注意事项
 

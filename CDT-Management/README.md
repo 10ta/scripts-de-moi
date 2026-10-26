@@ -167,7 +167,7 @@ bash init.sh
 ```bash
 bash init.sh status         # 定时器状态 + 最近日志 + 当前用量
 bash init.sh reconfigure    # 重新填写配置
-bash init.sh uninstall      # 卸载（sg 模式会先删掉安全组里的规则）
+bash init.sh uninstall      # 卸载（sg 模式会先删掉安全组里的规则；配置和状态保留，会打印彻底删除的命令）
 
 # 程序本身
 python3 /opt/cdt-guard/cdt_guard.py report     # 立刻查一次

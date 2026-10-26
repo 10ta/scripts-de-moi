@@ -416,6 +416,8 @@ sudo nano /etc/traffic-bot.env                  # 改配置（改完 restart）
 | `/var/lib/traffic-bot/alerts.json` | 告警去重记录 |
 | `/etc/systemd/system/traffic-bot.service` | systemd 服务 |
 
+卸载：`sudo ./traffic-bot/uninstall.sh`（或者根目录的 `sudo ./uninstall.sh`，在菜单里选）。删掉服务和 `/opt/traffic-bot`；配置、Oracle 私钥、告警记录和系统用户 `trafficbot` 保留，重新安装时直接沿用，卸载完会打印彻底删除它们的命令。
+
 ---
 
 ## 常见问题

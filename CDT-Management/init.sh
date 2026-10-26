@@ -263,10 +263,15 @@ cmd_uninstall() {
     rm -f "$UNIT_DIR/cdt-guard.service" "$UNIT_DIR/cdt-guard.timer"
     systemctl daemon-reload
     rm -rf "$APP_DIR"
-    local yn
-    ask yn "同时删除配置 $ENV_FILE 和状态 $STATE_DIR？(y/N)" "N"
-    [[ "$yn" =~ ^[Yy]$ ]] && rm -rf "$ENV_FILE" "$STATE_DIR"
-    info "已卸载。实例本身没有任何改动；如果当时处于关机熔断状态，需要自己去控制台开机"
+    info "已卸载（timer、服务、$APP_DIR）。实例本身没有任何改动；如果当时处于关机熔断状态，需要自己去控制台开机"
+    # 配置和状态保留（重新安装时直接沿用），不替你删
+    local p have=()
+    for p in "$ENV_FILE" "$STATE_DIR"; do [[ -e "$p" ]] && have+=("$p"); done
+    if (( ${#have[@]} )); then
+        echo "保留（重新安装时直接沿用）：${have[*]}"
+        echo "确定不再需要的话，手动删除："
+        echo "  rm -rf ${have[*]}"
+    fi
 }
 
 case "${1:-install}" in

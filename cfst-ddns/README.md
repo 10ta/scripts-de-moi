@@ -458,14 +458,10 @@ timer 每 5 分钟会启动一次 `cfst-ddns@auto`，没到时间时几毫秒就
 ## 卸载
 
 ```bash
-sudo systemctl disable --now cfst-ddns.timer
-sudo rm -f /etc/systemd/system/cfst-ddns.timer '/etc/systemd/system/cfst-ddns@.service'
-sudo systemctl daemon-reload
-sudo rm -rf /opt/cfst-ddns /var/lib/cfst-ddns /etc/cfst-ddns.env
-sudo userdel cfst-ddns
+sudo ./cfst-ddns/uninstall.sh      # 或者根目录的 sudo ./uninstall.sh，在菜单里选
 ```
 
-别忘了把 sing-box 配置里的 `exclude_uid` 一并删掉。
+删掉 timer、服务和 `/opt/cfst-ddns`。配置 `/etc/cfst-ddns.env`、测速历史 `/var/lib/cfst-ddns` 和系统用户 `cfst-ddns` 保留，重新安装时直接沿用；卸载完会打印彻底删除它们的命令（`rm -rf …`、`userdel cfst-ddns`）。删了用户的话，别忘了把 sing-box 配置里的 `exclude_uid` 一并删掉。DNS 记录停在最后一次写入的 IP。
 
 ## 致谢
 

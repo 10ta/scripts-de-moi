@@ -11,6 +11,8 @@
 | [`brutal-cn.sh`](brutal-cn.sh) | 用中国大陆 IP 段自动维护 TCP Brutal v2 规则，定时更新并自愈 |
 | [`upsing.sh`](upsing.sh) | 从 GitHub Release 下载并安装 sing-box 的 `.deb` 包 |
 | [`warp-keeper/`](warp-keeper/) | 给 sing-box 自动维护 Cloudflare WARP 出口：注册账户、生成 wireguard endpoint 片段、每小时检查并自愈，不需要 wireproxy |
+| [`update.sh`](update.sh) | 一键更新本机装了的工具（cdt-guard、traffic-bot、cfst-ddns、warp-keeper） |
+| [`uninstall.sh`](uninstall.sh) | 卸载本机装了的工具：列出来、选编号、确认后逐个卸载（含 brutal-cn）。只删程序、服务和定时器，配置、密钥、状态和专用用户保留，卸载完打印彻底删除的命令 |
 
 ---
 
