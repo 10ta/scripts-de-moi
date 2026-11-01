@@ -49,9 +49,9 @@ AWS_BILL = os.getenv("AWS_BILL", "1") not in ("0", "false", "no", "")
 AWS_BILL_LIMIT_USD = float(os.getenv("AWS_BILL_LIMIT_USD", "1"))   # 本月账单越过它的 80%/95% 时告警，0 = 不告警
 AWS_BILL_CACHE_MIN = float(os.getenv("AWS_BILL_CACHE_MIN", "60"))  # 账单数据每天只更新几次，不必每次都查
 
-# CloudFront 免费额度（按 UTC 自然月）。兼容旧变量名 CF_LIMIT_*
-CLOUDFRONT_LIMIT_GB = float(os.getenv("CLOUDFRONT_LIMIT_GB", os.getenv("CF_LIMIT_GB", "1024")))
-CLOUDFRONT_LIMIT_REQUESTS = int(os.getenv("CLOUDFRONT_LIMIT_REQUESTS", os.getenv("CF_LIMIT_REQUESTS", "10000000")))
+# CloudFront 免费额度（按 UTC 自然月）
+CLOUDFRONT_LIMIT_GB = float(os.getenv("CLOUDFRONT_LIMIT_GB", "1024"))
+CLOUDFRONT_LIMIT_REQUESTS = int(os.getenv("CLOUDFRONT_LIMIT_REQUESTS", "10000000"))
 
 # Cloudflare（变量名与 wrangler 一致）
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
@@ -85,7 +85,7 @@ OCI_IDLE_CHECK = os.getenv("OCI_IDLE_CHECK", "0") not in ("0", "false", "no", ""
 OCI_IDLE_LINE = float(os.getenv("OCI_IDLE_LINE", "20"))   # Oracle 的回收线：7 天 CPU p95 / 网络 < 20%
 OCI_IDLE_WARN = float(os.getenv("OCI_IDLE_WARN", "25"))   # CPU p95 低于它就提醒（比回收线高一点，留余量）
 
-# 阿里云 CDT：只读 cdt-guard（scripts-de-moi/script/CDT-Management）每 5 分钟写出的状态快照
+# 阿里云 CDT：只读 cdt-guard（scripts-de-moi/CDT-Management）每 5 分钟写出的状态快照
 CDT_STATE_PATH = os.getenv("CDT_STATE_PATH", "/var/lib/cdt-guard/state.json")
 CDT_STALE_MIN = float(os.getenv("CDT_STALE_MIN", "15"))  # 快照超过这么多分钟没更新就提醒（cdt-guard 可能停了）
 CDT_TZ = ZoneInfo("Asia/Shanghai")
@@ -94,16 +94,17 @@ CDT_TZ = ZoneInfo("Asia/Shanghai")
 SONDE_URL = os.getenv("SONDE_URL", "").rstrip("/")
 SONDE_TOKEN = os.getenv("SONDE_TOKEN", "")  # CDT 免费额度按北京时间自然月重置
 
-# 定时播报间隔（小时，0 = 关闭）。兼容旧变量 REPORT_INTERVAL（秒）
-if os.getenv("REPORT_INTERVAL_HOURS"):
-    REPORT_INTERVAL_SEC = int(float(os.environ["REPORT_INTERVAL_HOURS"]) * 3600)
-else:
-    REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL", "7200"))
+# 定时播报间隔（小时，0 = 关闭）
+REPORT_INTERVAL_SEC = int(float(os.getenv("REPORT_INTERVAL_HOURS", "2")) * 3600)
 REPORT_TZ = ZoneInfo(os.getenv("REPORT_TZ", "America/New_York"))  # 仅用于显示时间
 
 # 告警：已用比例首次越过某个阈值时立刻推送；每个周期（天/月）每个阈值只推一次
 ALERT_THRESHOLDS = sorted({float(x) for x in os.getenv("ALERT_THRESHOLDS", "80,95").split(",") if x.strip()})
 ALERT_CHECK_SEC = max(int(float(os.getenv("ALERT_CHECK_MINUTES", "10")) * 60), 60)
+# 单个来源最多查多久（秒）：超时的来源本轮显示「查询超时」，不拖住其他来源的报告和告警
+PROVIDER_TIMEOUT_SEC = float(os.getenv("PROVIDER_TIMEOUT_SEC", "90"))
+# 变化慢的数据缓存多久（分钟）：Cloudflare 账期累计用量、Oracle 的 compartment / 实例 / 网卡清单
+SLOW_CACHE_MIN = float(os.getenv("SLOW_CACHE_MIN", "60"))
 STATE_PATH = os.path.join(os.getenv("STATE_DIRECTORY", "."), "alerts.json")  # systemd 的 StateDirectory 会设置它
 
 # 允许使用 bot 的 chat id，逗号分隔；留空 = 不限制（不推荐）
@@ -241,6 +242,19 @@ def fmt_ms(us: float) -> str:
 def fmt_date(dt: datetime) -> str:
     """Nov.1 形式；不用 strftime('%b')，避免受系统语言环境影响"""
     return f"{MONTHS[dt.month - 1]}.{dt.day}"
+
+
+_slow_cache = {}  # key -> (monotonic 时间, 值)
+
+
+def cached(key: str, fn):
+    """变化慢的数据缓存 SLOW_CACHE_MIN 分钟；fn 抛异常时不缓存"""
+    hit = _slow_cache.get(key)
+    if hit and time.monotonic() - hit[0] < SLOW_CACHE_MIN * 60:
+        return hit[1]
+    val = fn()
+    _slow_cache[key] = (time.monotonic(), val)
+    return val
 
 
 def bar(pct: float, width: int = 10) -> str:
@@ -693,14 +707,20 @@ def cf_hint(msg: str) -> str:
     return ""
 
 
+_no_cpu = set()  # 已确认不支持 cpuTimeUs 的数据集，之后直接只查 requests，不再每轮先失败一次
+
+
 def cf_invocations(template: str, dataset: str, **params):
     """返回 (行列表, 是否带 CPU 时间)。优先同时取 cpuTimeUs；该字段不存在时退回只取 requests"""
-    try:
-        data, cpu_ok = cf_graphql(template, fields="requests cpuTimeUs", **params), True
-    except CFError as e:
-        logger.info("%s 不支持 cpuTimeUs（%s），退回只查请求数", dataset, e)
-        data, cpu_ok = cf_graphql(template, fields="requests", **params), False
-    return cf_account(data).get(dataset) or [], cpu_ok
+    if dataset not in _no_cpu:
+        try:
+            return cf_account(cf_graphql(template, fields="requests cpuTimeUs", **params)).get(dataset) or [], True
+        except CFError as e:
+            if "cpuTimeUs" not in str(e):  # 不是字段不存在（网络、权限问题）：不记，下轮照常先试
+                raise
+            logger.info("%s 不支持 cpuTimeUs（%s），之后只查请求数", dataset, e)
+            _no_cpu.add(dataset)
+    return cf_account(cf_graphql(template, fields="requests", **params)).get(dataset) or [], False
 
 
 def sum_field(rows: list, name: str) -> int:
@@ -708,7 +728,13 @@ def sum_field(rows: list, name: str) -> int:
 
 
 def cf_period_usage(now: datetime):
-    """账期内（控制台 Usage 页 "Oct 8 - Nov 8" 那一栏）的 (起, 止, 请求数, CPU 微秒或 None)"""
+    """账期内（控制台 Usage 页 "Oct 8 - Nov 8" 那一栏）的 (起, 止, 请求数, CPU 微秒或 None)。
+    要扫整个账期（最长 31 天）、变化又慢，所以缓存 SLOW_CACHE_MIN 分钟；换账期时自动重新查"""
+    p_start, _ = billing_period(now, CLOUDFLARE_BILLING_DAY)
+    return cached(f"cf_period:{p_start:%Y-%m-%d}", lambda: _cf_period_usage(now))
+
+
+def _cf_period_usage(now: datetime):
     p_start, p_end = billing_period(now, CLOUDFLARE_BILLING_DAY)
     params = dict(acc=CLOUDFLARE_ACCOUNT_ID, start=iso(p_start), end=iso(now))
     datasets = [(Q_WORKERS, "workersInvocationsAdaptive")]
@@ -736,17 +762,25 @@ STATUS_TEXT = {"exceededCpu": "超 CPU", "exceededResources": "超资源限制",
                "scriptThrewException": "异常", "internalError": "平台内部错误"}
 
 
+_p90_ok = True  # cpuTimeP90 字段可用；第一次查失败后改为 False
+
+
 def cf_worker_health(now: datetime):
     """各 Worker 近 24 小时的 CPU 分位数、调用次数、子请求、出错次数。
     返回 (TG 行, 指标, 面板明细, 面板状态行)；CPU P90 按脚本各一条指标（近 1 小时，调用太少时用近 24 小时），
     上限 CF_WORKERS_CPU_MS；被平台以超 CPU / 资源限制终止过的，另加一条提醒"""
+    global _p90_ok
     params = dict(acc=CLOUDFLARE_ACCOUNT_ID, day=iso(now - timedelta(days=1)), hour=iso(now - timedelta(hours=1)), end=iso(now))
-    gauge = "cpuTimeP90"
-    try:
-        acc = cf_account(cf_graphql(Q_WORKER_HEALTH, q="cpuTimeP50 cpuTimeP90 cpuTimeP99", **params))
-    except CFError as e:  # 万一 P90 这个字段不存在：退回 P50 / P99，用 P99 比上限（更保守）
-        logger.info("cpuTimeP90 不可用（%s），改用 P99", e)
-        gauge = "cpuTimeP99"
+    gauge = "cpuTimeP90" if _p90_ok else "cpuTimeP99"
+    if _p90_ok:
+        try:
+            acc = cf_account(cf_graphql(Q_WORKER_HEALTH, q="cpuTimeP50 cpuTimeP90 cpuTimeP99", **params))
+        except CFError as e:  # 万一 P90 这个字段不存在：退回 P50 / P99，用 P99 比上限（更保守），之后不再试
+            if "cpuTimeP90" not in str(e):  # 网络、权限这类问题照常抛出，下轮再试
+                raise
+            logger.info("cpuTimeP90 不可用（%s），之后改用 P99", e)
+            _p90_ok, gauge = False, "cpuTimeP99"
+    if not _p90_ok:
         acc = cf_account(cf_graphql(Q_WORKER_HEALTH, q="cpuTimeP50 cpuTimeP99", **params))
     gname = "P90" if gauge == "cpuTimeP90" else "P99"
 
@@ -812,7 +846,8 @@ def cf_workers_block(now: datetime):
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = dict(acc=CLOUDFLARE_ACCOUNT_ID, start=iso(start), end=iso(now))
 
-    rows, _ = cf_invocations(Q_WORKERS, "workersInvocationsAdaptive", **params)
+    # 今日只要请求数（CPU 时间在下面的账期汇总和各 Worker 健康里）
+    rows = cf_account(cf_graphql(Q_WORKERS, fields="requests", **params)).get("workersInvocationsAdaptive") or []
     per_script, workers_total = {}, 0
     for r in rows:
         n = int((r.get("sum") or {}).get("requests") or 0)
@@ -823,7 +858,8 @@ def cf_workers_block(now: datetime):
     pages_total, note = None, ""
     if CLOUDFLARE_PAGES_FUNCTIONS:
         try:
-            prow, _ = cf_invocations(Q_PAGES, "pagesFunctionsInvocationsAdaptiveGroups", **params)
+            prow = cf_account(cf_graphql(Q_PAGES, fields="requests", **params)) \
+                .get("pagesFunctionsInvocationsAdaptiveGroups") or []
             pages_total = sum_field(prow, "requests")
         except CFError as e:
             logger.warning("Pages Functions 数据集查询失败：%s", e)
@@ -1274,23 +1310,30 @@ def get_oracle_data() -> Section:
         cfg = {"user": OCI_USER, "fingerprint": OCI_FINGERPRINT, "tenancy": OCI_TENANCY,
                "region": OCI_REGION, "key_file": OCI_KEY_FILE}
         oci.config.validate_config(cfg)
-        kw = dict(timeout=(5, 30), retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        # SDK 默认的重试最多 8 次、累计 600 秒，Oracle 出问题时会把整轮报告拖住；这里限制为 3 次、60 秒
+        retry = oci.retry.RetryStrategyBuilder(max_attempts=3, total_elapsed_time_seconds=60).get_retry_strategy()
+        kw = dict(timeout=(5, 30), retry_strategy=retry)
         identity = oci.identity.IdentityClient(cfg, **kw)
         compute = oci.core.ComputeClient(cfg, **kw)
         monitoring = oci.monitoring.MonitoringClient(cfg, **kw)
         pager = oci.pagination.list_call_get_all_results
 
-        # --- 列出所有 compartment 里的实例，以及 VNIC -> 实例 的对应关系（网络指标按 VNIC 统计）
-        comps = [OCI_TENANCY] + [c.id for c in pager(
-            identity.list_compartments, OCI_TENANCY, compartment_id_in_subtree=True,
-            access_level="ANY", lifecycle_state="ACTIVE").data]
-        instances, vnic_owner = [], {}
-        for cid in comps:
-            instances += [i for i in pager(compute.list_instances, cid).data
+        # --- 列出所有 compartment 里的实例，以及 VNIC -> 实例 的对应关系（网络指标按 VNIC 统计）。
+        # 清单很少变，缓存 SLOW_CACHE_MIN 分钟（新建 / 删除的实例最多晚这么久出现；实例状态也按缓存显示）
+        def inventory():
+            comps = [OCI_TENANCY] + [c.id for c in pager(
+                identity.list_compartments, OCI_TENANCY, compartment_id_in_subtree=True,
+                access_level="ANY", lifecycle_state="ACTIVE").data]
+            insts, owner = [], {}
+            for cid in comps:
+                insts += [i for i in pager(compute.list_instances, cid).data
                           if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
-            for va in pager(compute.list_vnic_attachments, cid).data:
-                if va.lifecycle_state == "ATTACHED":
-                    vnic_owner[va.vnic_id] = va.instance_id
+                for va in pager(compute.list_vnic_attachments, cid).data:
+                    if va.lifecycle_state == "ATTACHED":
+                        owner[va.vnic_id] = va.instance_id
+            return insts, owner
+
+        instances, vnic_owner = cached(f"oci_inventory:{OCI_REGION}", inventory)
         if not instances:
             return Section(f"{title}\n没有找到实例（若有实例，请检查 <code>OCI_REGION</code>）", empty=True)
 
@@ -1520,6 +1563,18 @@ _cache = {"ts": 0.0, "data": []}
 _cache_lock = None
 
 
+async def run_provider(fn, name: str):
+    """在线程里跑一个来源的查询（都是阻塞 IO），最多等 PROVIDER_TIMEOUT_SEC 秒；返回 (Section, 耗时秒)。
+    超时后线程本身还会跑完，但结果不再等它"""
+    t0 = time.monotonic()
+    try:
+        sec = await asyncio.wait_for(asyncio.to_thread(fn), PROVIDER_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("%s 查询超过 %gs，本轮跳过", name, PROVIDER_TIMEOUT_SEC)
+        sec = Section(f"<b>{esc(name)}</b>\n" + err(f"查询超时（超过 {PROVIDER_TIMEOUT_SEC:g} 秒），本轮跳过"))
+    return sec, time.monotonic() - t0
+
+
 async def collect_sections(max_age: float = 30) -> list:
     """并发查询所有已启用的来源；max_age 秒内的结果复用，避免定时播报与告警检查撞车时重复请求"""
     global _cache_lock
@@ -1528,13 +1583,16 @@ async def collect_sections(max_age: float = 30) -> list:
     async with _cache_lock:
         if _cache["data"] and time.monotonic() - _cache["ts"] < max_age:
             return _cache["data"]
-        # 几类查询都是阻塞 IO，放到线程里并发执行，避免卡住 bot 事件循环
+        t0 = time.monotonic()
         active = [(fn, name, gl) for enabled, fn, name, gl in PROVIDERS if enabled()]
-        results = await asyncio.gather(*(asyncio.to_thread(fn) for fn, _, _ in active))
+        done = await asyncio.gather(*(run_provider(fn, name) for fn, name, _ in active))
+        results = [sec for sec, _ in done]
         for sec, (_, name, (group, label)) in zip(results, active):
             sec.name, sec.group = name, group
             sec.label = sec.label or label
-        _cache["ts"], _cache["data"] = time.monotonic(), list(results)
+        logger.info("本轮查询 %.1fs：%s", time.monotonic() - t0,
+                    " · ".join(f"{name} {dt:.1f}s" for (_, name, _), (_, dt) in zip(active, done)))
+        _cache["ts"], _cache["data"] = time.monotonic(), results
         return _cache["data"]
 
 
@@ -1630,11 +1688,10 @@ def sonde_report(sections: list) -> None:
             metrics.append(item)
             if not alert and len(series) < 40:
                 series[m.key] = round(float(m.pct or 0), 3)
-        # sub / detail / notes：面板按「指标 → 明细（引用块）→ 状态」三层排；html 是 TG 原文，留给旧版面板
+        # sub / detail / notes：面板按「指标 → 明细（引用块）→ 状态」三层排
         providers.append({"name": name, "group": group, "ok": "❌" not in text, "empty": empty,
                           "metrics": metrics, "sub": scrub(sub),
-                          "detail": [scrub(x) for x in detail], "notes": [scrub(x) for x in notes],
-                          "html": scrub(text)})
+                          "detail": [scrub(x) for x in detail], "notes": [scrub(x) for x in notes]})
 
     for s in sections:
         if s.parts:  # Cloudflare：每一块单独一张卡
@@ -1688,8 +1745,13 @@ def pick_level(pct: float) -> float:
     return max(reached) if reached else 0
 
 
-def evaluate_alerts(metrics: list, state: dict) -> list:
-    """已用比例首次越过更高一档阈值时返回告警文本；周期变化（新的一天/月）后记录清零。会原地更新 state"""
+STATE_KEEP_DAYS = 7  # 告警记录里这么多天没再出现的指标（实例删了、Worker 改名了）会被清掉
+
+
+def evaluate_alerts(metrics: list, state: dict, today: str = "") -> list:
+    """已用比例首次越过更高一档阈值时返回告警文本；周期变化（新的一天/月）后记录清零。会原地更新 state。
+    每条记录带 seen（最后出现的 UTC 日期），超过 STATE_KEEP_DAYS 天没出现就删掉，文件不会越积越大"""
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     messages = []
     for m in metrics:
         if not m.notify:
@@ -1704,7 +1766,10 @@ def evaluate_alerts(metrics: list, state: dict) -> list:
                 icon = "🚨" if level >= 95 else "⚠️"
                 messages.append(f"{icon} <b>{esc(m.label)}</b> 已用 <u><b>{m.pct:.1f}%</b></u>"
                                 f"（<code>{esc(m.detail)}</code>）· 超过 {level:g}% 阈值")
-        state[m.key] = {"period": m.period, "level": level}
+        state[m.key] = {"period": m.period, "level": level, "seen": today}
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=STATE_KEEP_DAYS)).strftime("%Y-%m-%d")
+    for k in [k for k, v in state.items() if (v or {}).get("seen", "") < cutoff]:
+        del state[k]
     return messages
 
 
@@ -1797,7 +1862,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _single(update: Update, label: str, fn):
     msg = await update.message.reply_text(f"⏳ 正在查询 {label}...")
-    section = await asyncio.to_thread(fn)
+    section, _ = await run_provider(fn, label)
     await reply_long(update, msg, section.text)
 
 

@@ -111,7 +111,7 @@ ALERT_CHECK_MINUTES="10"
 
 # 以下为可选项，取消注释即可覆盖默认值
 #REPORT_TZ="America/Los_Angeles"
-# 阿里云 CDT：装了 cdt-guard（scripts-de-moi/script/CDT-Management）就会自动显示，bot 不需要阿里云 AK
+# 阿里云 CDT：装了 cdt-guard（scripts-de-moi/CDT-Management）就会自动显示，bot 不需要阿里云 AK
 #CDT_STATE_PATH="/var/lib/cdt-guard/state.json"
 
 # Sonde 面板（可选）：填了就每次告警检查后上报一份用量（已脱敏）
@@ -123,6 +123,8 @@ ALERT_CHECK_MINUTES="10"
 #BWH_NAME="Megabox"          # Sonde 面板上 BandwagonHost 卡片的名称（默认用 API 返回的套餐名）
 #CLOUDFRONT_LIMIT_GB="1024"
 #CLOUDFRONT_LIMIT_REQUESTS="10000000"
+#PROVIDER_TIMEOUT_SEC="90"   # 单个来源最多查多久（秒），超时的本轮显示「查询超时」
+#SLOW_CACHE_MIN="60"         # Cloudflare 账期用量、Oracle 实例清单缓存多久（分钟）
 EOF
   )
   chown root:root "$ENV_FILE"
@@ -310,7 +312,7 @@ systemctl daemon-reload
 systemctl enable "$APP_NAME" >/dev/null 2>&1
 echo "systemd 服务已安装并设为开机自启"
 
-# ---------------------------------------------------------------- 5. 处理旧的 nohup 进程
+# ---------------------------------------------------------------- 5. 处理手动启动的 bot 进程
 # 同一个 token 同时只能有一个实例在轮询，否则 Telegram 会报 409 Conflict
 OLD_PIDS=""
 for p in $(pgrep -f 'python[0-9.]* .*bot\.py' || true); do
@@ -320,7 +322,7 @@ for p in $(pgrep -f 'python[0-9.]* .*bot\.py' || true); do
 done
 if [[ -n $OLD_PIDS ]]; then
   echo
-  echo "发现疑似旧的 nohup 进程："
+  echo "发现不归 systemd 管的 bot.py 进程（手动或 nohup 启动的）："
   for p in $OLD_PIDS; do echo "  PID $p: $(tr '\0' ' ' < /proc/$p/cmdline | cut -c1-100)"; done
   if [[ -t 0 ]]; then
     read -r -p "是否终止这些进程？[y/N] " yn || true
@@ -347,7 +349,7 @@ if [[ $READY == 1 ]]; then
     if [[ -f /var/lib/cdt-guard/state.json ]]; then
       echo "   已检测到 cdt-guard，/aliyun 可查看阿里云 CDT"
     else
-      echo "   想显示阿里云 CDT：在这台机器上安装 scripts-de-moi/script/CDT-Management（bash init.sh），无需改 bot 配置"
+      echo "   想显示阿里云 CDT：在这台机器上安装 scripts-de-moi/CDT-Management（bash init.sh），无需改 bot 配置"
     fi
   else
     echo
