@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 GIB = 1024 ** 3
+QUERY_BUDGET = 60  # 秒：流量 + 实例查询超过这么久就跳过本轮账单查询（systemd 超时 300 秒）
 CN_TZ = timezone(timedelta(hours=8))  # 阿里云账期 / CDT 按北京时间
 RULE_TAG = "cdt-guard"
 
@@ -95,7 +96,8 @@ def _pe(s):
     return urllib.parse.quote(str(s), safe="~")
 
 
-def rpc(cfg, host, version, action, **params):
+def rpc(cfg, host, version, action, attempts=3, **params):
+    """attempts：查询类默认重试 3 次；开关机、改安全组这类会改状态的操作传 1，免得超时后重复执行"""
     p = {
         "Format": "JSON", "Version": version, "AccessKeyId": cfg.ak,
         "SignatureMethod": "HMAC-SHA1", "SignatureVersion": "1.0",
@@ -110,7 +112,7 @@ def rpc(cfg, host, version, action, **params):
     body = urllib.parse.urlencode(p).encode()
 
     last = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -131,12 +133,18 @@ def rpc(cfg, host, version, action, **params):
             if code and code not in ("200", "OK", "Success", "success"):
                 raise AliError(code, data.get("Message", ""))
             return data
-        time.sleep(1.5 * (attempt + 1))
+        if attempt + 1 < attempts:
+            time.sleep(1.5 * (attempt + 1))
     raise last
 
 
 def ecs(cfg, action, **p):
     return rpc(cfg, f"ecs.{cfg.region}.aliyuncs.com", "2014-05-26", action, RegionId=cfg.region, **p)
+
+
+def ecs_once(cfg, action, **p):
+    """会改状态的 ECS 操作：只发一次。超时时可能已经生效，下一轮 check 会按实际状态处理"""
+    return rpc(cfg, f"ecs.{cfg.region}.aliyuncs.com", "2014-05-26", action, attempts=1, RegionId=cfg.region, **p)
 
 
 # ───────────────────────── 查询 ─────────────────────────
@@ -177,11 +185,11 @@ def stop_instance(cfg, inst):
     p = {"InstanceId": cfg.instance, "ForceStop": "false"}
     if inst["charge"] == "PostPaid":  # 包年包月不支持 StoppedMode
         p["StoppedMode"] = cfg.stop_mode
-    ecs(cfg, "StopInstance", **p)
+    ecs_once(cfg, "StopInstance", **p)
 
 
 def start_instance(cfg):
-    ecs(cfg, "StartInstance", InstanceId=cfg.instance)
+    ecs_once(cfg, "StartInstance", InstanceId=cfg.instance)
 
 
 def _sg(cfg, inst):
@@ -203,7 +211,7 @@ def sg_lock(cfg, inst):
     sg = _sg(cfg, inst)
     if find_lock_rule(cfg, sg):
         return False
-    ecs(cfg, "AuthorizeSecurityGroup", SecurityGroupId=sg, **{
+    ecs_once(cfg, "AuthorizeSecurityGroup", SecurityGroupId=sg, **{
         "Permissions.1.IpProtocol": "ALL", "Permissions.1.PortRange": "-1/-1",
         "Permissions.1.SourceCidrIp": "0.0.0.0/0", "Permissions.1.Policy": "drop",
         "Permissions.1.Priority": "1", "Permissions.1.Description": RULE_TAG,
@@ -216,7 +224,7 @@ def sg_unlock(cfg, inst):
     rid = find_lock_rule(cfg, sg)
     if not rid:
         return False
-    ecs(cfg, "RevokeSecurityGroup", SecurityGroupId=sg, **{"SecurityGroupRuleId.1": rid})
+    ecs_once(cfg, "RevokeSecurityGroup", SecurityGroupId=sg, **{"SecurityGroupRuleId.1": rid})
     return True
 
 
@@ -245,6 +253,7 @@ def save_state(cfg, st):
 # TG 消息脱敏：不出现 IP、网址、域名（错误信息里常带 aliyuncs.com 的接口地址）
 _SCRUB = [re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"）)]*"),
           re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b"),
+          re.compile(r"\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7}(?:/\d{1,3})?\b"),
           re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|xyz|io|dev|app|cn|me|top|cc|co|info|cloud|site|tech|link"
                      r"|one|uk|jp|kr|hk|tw|us|de|fr)\b")]
 
@@ -268,6 +277,22 @@ def notify(cfg, text):
             print(f"[tg] 发送到 {chat} 失败: {type(e).__name__}", file=sys.stderr)  # 不打印 e，URL 里有 token
 
 
+SONDE_HEARTBEAT = 900  # 状态没变化时多久上报一次（秒）；Sonde 按这个间隔判断数据是否过期
+
+
+def sonde_due(cfg, st, now):
+    """这一轮要不要上报 Sonde：熔断 / 运行状态 / 出错情况有变化就报，否则每 SONDE_HEARTBEAT 秒报一次。
+    流量、速率这些数字每轮都在变，不算「变化」，跟着心跳更新。决定上报时顺便把时间和指纹记进 st"""
+    if not (cfg.sonde_url and cfg.sonde_token):
+        return False
+    fp = "|".join(str(x) for x in (st.get("status"), st.get("locked"), st.get("cost_locked"), st.get("hold"),
+                                    bool(st.get("fail")), bool(st.get("cost_error")), bool(st.get("start_fail"))))
+    if fp == st.get("sonde_fp") and now - st.get("sonde_ts", 0) < SONDE_HEARTBEAT - 30:
+        return False
+    st["sonde_fp"], st["sonde_ts"] = fp, now
+    return True
+
+
 def sonde_report(cfg, st):
     """把当前状态上报到 Sonde 面板（可选，失败只打日志）。只报展示需要的字段，不含 IP、实例 ID"""
     if not (cfg.sonde_url and cfg.sonde_token):
@@ -281,7 +306,7 @@ def sonde_report(cfg, st):
     data["cost_error"] = scrub(st["cost_error"]) if st.get("cost_error") else ""
     data["last_error"] = scrub(st["last_error"]) if st.get("last_error") else ""
     series = {k: float(data[k]) for k in ("used_gb", "rate_gbh", "cost") if isinstance(data.get(k), (int, float))}
-    body = json.dumps({"source": "cdt-guard", "ts": int(time.time()), "interval": 300,
+    body = json.dumps({"source": "cdt-guard", "ts": int(time.time()), "interval": SONDE_HEARTBEAT,
                        "data": data, "series": series}).encode()
     req = urllib.request.Request(cfg.sonde_url + "/ingest", data=body, method="POST", headers={
         "Authorization": f"Bearer {cfg.sonde_token}", "Content-Type": "application/json",
@@ -335,8 +360,10 @@ def check(cfg):
         st["last_error"] = str(e)
         if st["fail"] == 3:
             notify(cfg, f"⚠️ {tag} 连续 3 次查询阿里云失败，守护暂停动作\n{e}")
+        report = sonde_due(cfg, st, now)
         save_state(cfg, st)
-        sonde_report(cfg, st)
+        if report:
+            sonde_report(cfg, st)
         print(f"query failed: {e}", file=sys.stderr)
         return 1
     if st.get("fail", 0) >= 3:
@@ -348,7 +375,11 @@ def check(cfg):
     cycle = bill_cycle(now)
 
     # ── 费用：每 COST_CHECK_MIN 分钟查一次账单（账单本身是小时级的，查太勤没意义）
-    if cfg.cost_limit > 0 and (now - st.get("cost_ts", 0) >= cfg.cost_every * 60 or st.get("cost_cycle") != cycle):
+    # 前面的查询已经很慢（接口卡顿）时，这一轮先不查账单，把时间留给熔断动作，免得整轮超过 systemd 的超时被杀掉
+    slow = time.time() - now > QUERY_BUDGET
+    if slow and cfg.cost_limit > 0:
+        print(f"前面的查询用了 {time.time() - now:.0f}s，本轮跳过账单查询", file=sys.stderr)
+    if cfg.cost_limit > 0 and not slow and (now - st.get("cost_ts", 0) >= cfg.cost_every * 60 or st.get("cost_cycle") != cycle):
         try:
             cost, cur = get_month_cost(cfg, cycle)
             st.update({"cost": round(cost, 4), "currency": cur, "cost_cycle": cycle, "cost_ts": now})
@@ -396,13 +427,20 @@ def check(cfg):
 
         # ── 流量熔断
         if locked:
-            if used < cfg.release:  # 月初重置；stop 模式的开机交给下面的保活段
+            # 只在换了账单月（北京时间）之后才解除：同一个月里读数突然变低（接口返回空列表、数据补算）
+            # 不是真的重置，按异常处理，保持熔断。月中想放行：调高 CDT_LIMIT_GB 后运行 cdt_guard.py unlock
+            lock_cycle = st.setdefault("lock_cycle", cycle)
+            if used < cfg.release and lock_cycle != cycle:  # stop 模式的开机交给下面的保活段
                 if cfg.mode == "sg":
                     sg_unlock(cfg, inst)
                 locked = False
                 just_unlocked = True
-                events.append(f"🔓 {tag} 流量已重置（{used:.2f} GB），解除流量熔断")
+                st.pop("lock_cycle", None)
+                events.append(f"🔓 {tag} 新的月份流量已重置（{used:.2f} GB），解除流量熔断")
             else:  # 维持熔断：有人手动开机/删规则就再执行一次
+                if used < cfg.release:
+                    print(f"读数 {used:.2f} GB 低于解除线 {cfg.release:g} GB，但熔断发生在本月（{lock_cycle}），"
+                          f"按数据异常处理，保持熔断", file=sys.stderr)
                 if cfg.mode == "stop" and status == "Running" and not cost_locked:
                     stop_instance(cfg, inst)
                     events.append(f"🛑 {tag} 流量熔断期间实例被启动，已再次关机（{used:.2f} GB）")
@@ -418,6 +456,7 @@ def check(cfg):
                 sg_lock(cfg, inst)
                 events.append(f"🛑 {tag} 流量熔断：{why} ≥ {cfg.limit:g} GB，已在安全组 {_sg(cfg, inst)} 加 drop-all 入站规则")
             locked = True
+            st["lock_cycle"] = cycle
 
         # ── 保活 / 解除熔断后开机（sg 模式流量熔断期间也照样保活，反正规则挡着）
         may_run = not cost_locked and (not locked or cfg.mode == "sg")
@@ -446,8 +485,10 @@ def check(cfg):
         "status": status, "ip": inst["ip"], "name": inst["name"], "bw_out": inst.get("bw_out", 0),
         "cost_limit": cfg.cost_limit, "cost_locked": cost_locked,
     })
+    report = sonde_due(cfg, st, now)
     save_state(cfg, st)
-    sonde_report(cfg, st)
+    if report:
+        sonde_report(cfg, st)
     for ev in events:
         notify(cfg, ev)
     print(f"{datetime.now():%F %T} used={used:.3f}GB rate={rate:.2f}GB/h proj={projected:.2f} status={status} "
@@ -456,7 +497,7 @@ def check(cfg):
 
 
 def format_report(st, now=None):
-    """traffic-bot 可以直接复制这个函数：只读 state.json，不需要 AK。"""
+    """report 命令的纯文本报告（traffic-bot 有自己的展示，读同一份 state.json）"""
     if not st or "used_gb" not in st:
         return "☁️ Aliyun CDT：暂无数据（cdt-guard 还没跑过）"
     now = now or time.time()
@@ -519,6 +560,7 @@ def main(argv):
         if cfg.mode == "sg" and cfg.instance:
             print("已删除安全组 drop 规则" if sg_unlock(cfg, get_instance(cfg)) else "安全组里没有 cdt-guard 规则")
         st["locked"] = False
+        st.pop("lock_cycle", None)
         st.pop("cost_lock", None)  # 费用熔断也一并解除；本月再超线会再次熔断——想放行就把 COST_LIMIT 调高
         st["cost_ts"] = 0
         save_state(cfg, st)

@@ -9,4 +9,5 @@ Environment=CDT_GUARD_ENV=/etc/cdt-guard.env
 ExecStart=/usr/bin/python3 /opt/cdt-guard/cdt_guard.py check
 StateDirectory=cdt-guard
 StateDirectoryMode=0755
-TimeoutStartSec=120
+# 最坏情况：两次查询各约 65 秒 + 关机 / 安全组操作，留足余量，免得在写状态之前被杀掉
+TimeoutStartSec=300
