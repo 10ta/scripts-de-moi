@@ -23,7 +23,7 @@ case "$MODE" in auto|check|pool|full|stats) ;; *) echo "失败: 用法 cfst-ddns
 
 # ---------- 多目标：TARGETS 里每个目标各自测速、各自更新一条记录 ----------
 # 目标的配置 = <前缀>_XXX（如 CLOUDFRONT_RECORD_NAME）> 内置预设 > 全局的 XXX > 默认值
-# cloudflare 直接用不带前缀的全局配置（兼容旧版）
+# cloudflare 直接用不带前缀的全局配置
 TARGET_KEYS="LABEL RECORD_NAME ZONE_ID TTL IPFILE IPLIST_URL IPLIST_JQ IP_EXCLUDE IP_SAMPLE CFST_ARGS RANK_BY
   MIN_SPEED SPEED_TOLERANCE LATENCY_SPLIT PICK_PER_GROUP UPLOAD_URL UP_SECONDS FULL_AT PEAK_HOURS PEAK_EVERY
   OFFPEAK_EVERY HEALTH_RATIO SWITCH_MARGIN FULL_MIN_GAP TG_NOTIFY TG_NOTIFY_CHECK
@@ -105,8 +105,6 @@ if [[ -z "${CFST_TARGET:-}" ]]; then
   mkdir -p "$STATE_DIRECTORY"; cd "$STATE_DIRECTORY"
   exec 9>.lock
   flock -n 9 || { echo "另一轮测速正在进行，跳过"; exit 0; }
-  # 旧版本的状态文件在根目录，挪进 cloudflare/ 子目录
-  if [[ -f state && ! -e cloudflare ]]; then mkdir cloudflare; mv state pool.csv cloudflare/ 2>/dev/null || true; fi
   rc=0
   for tgt in $TARGETS; do
     ( load_target "$tgt"; exec bash "$SELF" "$MODE" ) || rc=1
@@ -164,8 +162,8 @@ export TZ="$TIMEZONE"
 CURL_BASE=(-sS --retry 2 --retry-delay 3 --connect-timeout 10 -m 30)
 [[ -n "$API_PROXY" ]] && CURL_BASE+=(-x "$API_PROXY")
 
-# 下载模式下 CFST_ARGS 里带了 -dd，等同于 latency 模式（兼容旧配置）
-[[ "$RANK_BY" == download && " $CFST_ARGS " == *" -dd "* ]] && RANK_BY=latency
+# -dd（关掉下载测速）由脚本自己按 RANK_BY 决定，不要写进 CFST_ARGS
+[[ " $CFST_ARGS " == *" -dd "* ]] && { echo "失败: [$TARGET_LABEL] CFST_ARGS 里不要写 -dd：只看延迟请设 RANK_BY=latency" >&2; exit 1; }
 case "$RANK_BY" in
   download) METRIC="下载" ;;
   upload)   METRIC="上传" ;;
@@ -201,6 +199,7 @@ h() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }   # HTM
 scrub() {
   sed -E -e 's#[a-zA-Z][a-zA-Z0-9+.-]*://[^ <>"）)]*#***#g' \
          -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?\b/***/g' \
+         -e 's/\b[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{0,4}){2,7}(\/[0-9]{1,3})?\b/***/g' \
          -e 's/\b([a-zA-Z0-9-]+\.)+(com|net|org|xyz|io|dev|app|cn|me|top|cc|co|info|cloud|site|tech|link|one|uk|jp|kr|hk|tw|us|de|fr)\b/***/g' <<<"$1"
 }
 src_name() { sed -E -e 's/^种子:.*\(段外\)$/种子（段外）/' -e 's/^种子:.*/种子/' <<<"$1"; }
@@ -1062,6 +1061,9 @@ if grep -q ':' "$CFST_IPFILE" 2>/dev/null; then TYPE=AAAA; else TYPE=A; fi
 cf GET "${API}?type=${TYPE}&name=${CF_RECORD_NAME}"
 REC_ID=$(jq -r '.result[0].id // empty' <<<"$RESP")
 OLD_IP=$(jq -r '.result[0].content // empty' <<<"$RESP")
+if (( $(jq '.result | length' <<<"$RESP") > 1 )); then
+  echo "警告: $CF_RECORD_NAME 有 $(jq '.result | length' <<<"$RESP") 条 $TYPE 记录，只会更新第一条；其余的请到 Cloudflare 控制台删掉" >&2
+fi
 echo "当前解析: $CF_RECORD_NAME ($TYPE) = ${OLD_IP:-<无>}${API_PROXY:+（API 经代理 $API_PROXY）}"
 
 rm -f result.csv latency.csv latency.all.csv candidates.csv candidates.txt

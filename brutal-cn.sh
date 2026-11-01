@@ -82,8 +82,6 @@ LOCK=/run/brutal-cn.lock
 SVC=/etc/systemd/system/brutal-cn-update.service
 TMR=/etc/systemd/system/brutal-cn-update.timer
 PROC_RULES=/proc/net/tcp_brutal/rules
-LEGACY_BIN=/usr/local/sbin/brutal-cn
-LEGACY_CONF=/etc/brutal-cn
 
 log()  { printf '[brutal-cn] %s\n' "$*"; }
 warn() { printf '[brutal-cn] WARN %s\n' "$*" >&2; }
@@ -613,25 +611,6 @@ cmd_status() {
 }
 
 # ─── install ─────────────────────────────────────────────────────────
-# 清理旧版本留下的文件（旧版会复制脚本到 /usr/local/sbin，并用 /etc/brutal-cn 放列表）
-cleanup_legacy() {
-    if [[ -e $LEGACY_BIN && $(readlink -f "$LEGACY_BIN") != "$SELF" ]]; then
-        rm -f "$LEGACY_BIN"
-        log "已删除旧版副本 $LEGACY_BIN"
-    fi
-    if [[ -d $LEGACY_CONF ]]; then
-        local leftover
-        leftover=$(grep -hv '^[[:space:]]*\(#\|$\)' "$LEGACY_CONF"/extra.txt "$LEGACY_CONF"/exclude.txt 2>/dev/null || true)
-        if [[ -n $leftover ]]; then
-            warn "$LEGACY_CONF 里还有你写的前缀，请搬到脚本的 EXTRA_PREFIXES / EXCLUDE_PREFIXES 后手动删除该目录:"
-            printf '%s\n' "$leftover" | sed 's/^/          /' >&2
-        else
-            rm -rf "$LEGACY_CONF"
-            log "已删除旧版配置目录 $LEGACY_CONF"
-        fi
-    fi
-}
-
 write_units() {
     cat > "$SVC" <<EOF
 [Unit]
@@ -693,7 +672,6 @@ cmd_install() {
     ensure_module
 
     mkdir -p "$STATE_DIR"
-    cleanup_legacy
     write_units
     systemctl daemon-reload
 
@@ -733,7 +711,6 @@ cmd_uninstall() {
     systemctl daemon-reload
     rm -rf "$STATE_DIR"
     rm -f "$LOCK"
-    if [[ -e $LEGACY_BIN && $(readlink -f "$LEGACY_BIN") != "$SELF" ]]; then rm -f "$LEGACY_BIN"; fi
     log "✅ 已卸载，删除规则 $n 条。本脚本文件、brutalctl 和内核模块保留，其他规则未动。"
 }
 

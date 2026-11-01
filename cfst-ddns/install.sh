@@ -39,7 +39,7 @@ else
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
   curl -fL "${GH_PROXY}https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_${ARCH}.tar.gz" \
     | tar -xz -C "$TMP"
-  # 新版压缩包里多了一层 cfst_linux_<arch>/ 目录，旧版没有，两种都兼容
+  # 压缩包里可能多一层 cfst_linux_<arch>/ 目录，按文件名找
   BIN=$(find "$TMP" -type f -name cfst | head -n1)
   [[ -n "$BIN" ]] || { echo "压缩包里没找到 cfst"; exit 1; }
   SRC=$(dirname "$BIN")
@@ -49,14 +49,8 @@ fi
 
 install -m 755 cfst-ddns.sh "$DIR/cfst-ddns.sh"
 
-# 旧版本是单个 cfst-ddns.service，新版本改成 cfst-ddns@.service（按模式运行），这里清理掉旧的
 TIMER_WAS_ON=""
 systemctl is-enabled --quiet cfst-ddns.timer 2>/dev/null && TIMER_WAS_ON=1
-if [[ -f /etc/systemd/system/cfst-ddns.service ]]; then
-  echo "移除旧版 cfst-ddns.service ..."
-  systemctl stop cfst-ddns.timer cfst-ddns.service 2>/dev/null || true
-  rm -f /etc/systemd/system/cfst-ddns.service
-fi
 install -m 644 'cfst-ddns@.service' cfst-ddns.timer /etc/systemd/system/
 ENV_KEPT=""
 if [[ -f /etc/cfst-ddns.env ]]; then ENV_KEPT=1
