@@ -1,206 +1,193 @@
 # warp-keeper
 
-给 sing-box 自动维护一个 Cloudflare WARP 出口：注册账户、生成 wireguard endpoint、每小时检查，不通就自愈。不需要 wireproxy、wg-quick，也不需要 wireguard-tools。
+**English** · [简体中文](README.zh-CN.md)
 
-- **不占额外资源**：WARP 隧道就是 sing-box 自己的 wireguard endpoint（用户态），没有另外的常驻进程。检查由 systemd timer 每小时跑一次，跑完就退出
-- **主配置不用改**：在 sing-box 的配置目录里放一个独立的片段文件，sing-box 启动时自动合并
-- **兼容原来的 socks5 地址**：片段里带一个只监听 `127.0.0.1:18650` 的 mixed 入站，原来指向 wireproxy `socks5://127.0.0.1:18650` 的东西照常能用
-- **逐级自愈**：探测不通 → 先排除 sing-box 没运行、本机断网 → 重载 sing-box → 换新账户。每一步改配置前都先 `sing-box check`，新配置不通就退回原来的
-- **WARP+**：可以从公开频道自动取许可证，套不上就用免费账户
-- **可观测**：Telegram 告警、恢复通知、每日日报；[Sonde](https://github.com/10ta/Sonde) 面板上每台机器一张卡片
-- 依赖只有 `curl`、`jq`（加上 Debian 自带的 `iproute2`、`flock`）
+Keeps a Cloudflare WARP exit alive inside sing-box: registers, writes a WireGuard endpoint, checks hourly, self-heals. No wireproxy.
 
-## 工作原理
+```text
+$ warp-keeper --help
+warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不需要 wireproxy / wg-quick
 
+  warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证
+  warp-keeper.sh check       健康检查，不通就按「重载 → 换号」逐级自愈（timer 每小时调用）
+  warp-keeper.sh status      看当前状态：出口、延迟、账户、可用率（会实测一次，不改任何东西）
+  warp-keeper.sh renew       立即换一个新账户（想换出口 IP 时用）
+  warp-keeper.sh plus [KEY]  给当前账户套 WARP+ 许可证；不带 KEY 就从 env 里 WARP_PLUS 指定的来源取
+  warp-keeper.sh sync        按当前版本和 env 重新生成片段，有变化才重载（update.sh 用）
+  warp-keeper.sh remove      删掉配置片段、重载 sing-box、注销账户（主配置还在引用 tag 时会拒绝）
 ```
-                       ┌──────────── sing-box（一个进程）─────────────────────────────┐
-你的路由规则 ──────────▶│                                                               │
-（outbound: 🧩 <WARP>） │   endpoint「🧩 <WARP>」(wireguard) ═══════▶ Cloudflare WARP   │
-                       │        ▲                                                      │
-127.0.0.1:18650 ──────▶│   mixed 入站 warp-keeper-in ── 规则：这个入站全部走 WARP      │
-（socks5 / http）       └──────────────────────────────────────────────────────────────┘
-        ▲
-        │ 每小时经它访问 Cloudflare trace，看 warp=on / plus
-warp-keeper.timer ──▶ warp-keeper check ──(不通)──▶ 重载 sing-box ──(还不通)──▶ 注册新账户 → 换片段 → 重载
-```
+*Command help (abridged). Output is in Chinese.*
 
-### sing-box 怎么把片段合进来
+## Contents
 
-官方 `.deb` 装的 sing-box 服务就是这样启动的：
+- [Why warp-keeper?](#-why-warp-keeper)
+- [Highlights](#-highlights)
+- [Quick Start](#-quick-start)
+- [Installation](#-installation)
+- [Usage](#-usage)
+- [Configuration](#-configuration)
+- [Update & Maintenance](#-update--maintenance)
+- [How It Works](#-how-it-works)
+- [Security](#-security)
+- [Documentation](#-documentation)
+- [License](#-license)
 
-```
-/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run
-```
+## 💡 Why warp-keeper?
 
-`-C` 表示读取这个目录里**所有** `.json` 文件，按文件名排序后合并：
+The usual setup — a WARP account from a one-off script, copied by hand into a sing-box endpoint, or wireproxy running next to sing-box — breaks silently when Cloudflare drops the account. warp-keeper puts the endpoint into its own sing-box config fragment, probes it every hour through a local inbound, and repairs it step by step.
 
-- **数组拼接**：`inbounds`、`endpoints`、`route.rules` 等，排在前面的文件的元素在前
-- **对象递归合并**；同一个字段两边都有值时，**排在前面的文件**的值生效
+- ✅ Good fit: a VPS running sing-box ≥ 1.11 under systemd with a config directory (`-C`), routing some traffic out via WARP.
+- ❌ Not a fit: sing-box started from a single `-c` file you don't want to change, or a machine without sing-box.
 
-片段默认叫 `00-warp-keeper.json`，排在 `config.json` 前面，所以「探测入站 → WARP」这条规则在所有规则的最前面，不会被你的规则截走。它只匹配自己的入站，对其他流量没有影响。片段里没有 `log`、`dns`、`route.final` 这类单值字段，不会覆盖你的设置。
+## ✨ Highlights
 
-想看合并后的完整配置：
+- **No extra process** — the tunnel is sing-box's own userspace WireGuard endpoint; the check is a timer that exits.
+- **Main config untouched** — a separate `00-warp-keeper.json` fragment is merged by sing-box at load.
+- **Drop-in for wireproxy** — a `127.0.0.1:18650` mixed inbound replaces the old `socks5://127.0.0.1:18650`.
+- **Step-by-step self-healing** — rule out sing-box down / network down → reload sing-box → register a new account; every change is `sing-box check`ed and rolled back if the new one fails.
+- **WARP+** — optionally pulls public licences; falls back to free.
+- **Observable** — Telegram alerts, recovery notices and a daily summary; one Sonde card for all machines.
 
-```bash
-sing-box merge /tmp/merged.json -C /etc/sing-box && less /tmp/merged.json
-```
+## 🚀 Quick Start
 
-> 如果你的 sing-box 是用 `-c config.json` 单文件启动的，`warp-keeper init` 会停下来，并打印改成 `-c ... -C /etc/sing-box` 的方法。这一步会影响整个 sing-box 服务（要重启一次，所有入站断开几秒），所以由你自己决定。
-
-### 生成的片段
-
-```jsonc
-{
-  "inbounds":  [{ "type": "mixed", "tag": "warp-keeper-in", "listen": "127.0.0.1", "listen_port": 18650 }],
-  "endpoints": [{ "type": "wireguard", "tag": "🧩 <WARP>", "mtu": 1280,
-                  "address": ["172.16.0.2/32", "2606:4700:110:…/128"], "private_key": "…",
-                  "peers": [{ "address": "162.159.192.x", "port": 2408, "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                              "allowed_ips": ["0.0.0.0/0", "::/0"], "persistent_keepalive_interval": 30,
-                              "reserved": [151, 54, 152] }] }],
-  "route": { "rules": [{ "inbound": ["warp-keeper-in"], "action": "route", "outbound": "🧩 <WARP>" }] }
-}
-```
-
-- `reserved` 来自注册时分配的 `client_id`。部分地区不带它连不上 WARP，所以总是带上
-- peer 地址直接用注册时分配的 IP，不依赖 sing-box 的 DNS 去解析 `engage.cloudflareclient.com`
-- 不设 `listen_port`，WireGuard 本地 UDP 端口由系统随机分配，不会和别的端口冲突
-
-## 文件
-
-| 文件 | 安装位置 | 作用 |
-|---|---|---|
-| `install.sh` | — | 安装 / 升级程序和 systemd 单元，不碰配置、账户和 sing-box |
-| `update.sh` | — | 一键更新（和仓库里其他工具同一套约定） |
-| `warp-keeper.sh` | `/opt/warp-keeper/`，并链接为 `/usr/local/bin/warp-keeper` | 主脚本 |
-| `warp-keeper.service` / `.timer` | `/etc/systemd/system/` | 开机 3 分钟后一次，之后每小时一次（随机延后 0~5 分钟） |
-| `warp-keeper.env.example` | `/etc/warp-keeper.env` | 配置模板（首次安装时复制，之后不会覆盖） |
-
-运行时数据在 `/var/lib/warp-keeper/`（权限 700）：`account.json`（设备 ID、令牌、私钥）、`state`（上次结果、换号次数等）、`checks.log`（近 8 天每次检查的结果和延迟，用来算可用率）、`fragment.prev`（上一版片段，回滚用）、`bad-keys`（试过不能用的 WARP+ 许可证）。
-
-## 安装
-
-需要：sing-box **1.11 以上**（wireguard endpoint 是 1.11 引入的），由 systemd 管理，启动参数里有 `-C 配置目录`。
+Requires sing-box ≥ 1.11 managed by systemd with `-C <config dir>`, run as root.
 
 ```bash
 git clone https://github.com/10ta/scripts-de-moi.git /opt/scripts-de-moi
 cd /opt/scripts-de-moi/warp-keeper
-sudo ./install.sh
-sudo nano /etc/warp-keeper.env          # tag、端口、WARP+、Telegram、Sonde
+./install.sh
+warp-keeper init
+systemctl enable --now warp-keeper.timer
 ```
 
-如果是从 wireproxy 迁移过来，先看下一节，再继续：
+`init` ends with a Telegram "已部署" message (if configured) and `warp-keeper status` shows `IPv4 ✅ WARP · 出口 …` for each stack. Migrating from wireproxy? Read [the migration steps](docs/MANUAL.zh-CN.md#从-fscarmen-脚本的-wireproxy-迁移) first.
 
-```bash
-sudo warp-keeper init                    # 注册 → 写片段 → sing-box check → 重载 → 验证
-sudo warp-keeper status
-sudo systemctl enable --now warp-keeper.timer
-```
+## 📦 Installation
 
-> ⚠️ **影响范围**：`init`、自动换号和片段有变化的更新都会**重载 sing-box**。sing-box 的重载是整体重建：**所有入站的现有连接都会断开一下**（客户端会自动重连），不只是 WARP。每小时的检查本身只读不写，只有确认不通时才会重载。
+### Requirements
 
-### 从 fscarmen 脚本的 wireproxy 迁移
-
-原来的做法是：fscarmen 的 `menu.sh` 装了 wireproxy（监听 `127.0.0.1:18650` 的 socks5），sing-box 里再手动填一个 wireguard endpoint，或者用 socks 出站指向 18650。
-
-1. **停掉 wireproxy**，把 18650 让出来：
-
-   ```bash
-   systemctl disable --now wireproxy
-   ```
-
-   以后不用 fscarmen 的脚本了，可以再运行 `warp u` 把它装的东西都清掉。注意：这会注销它注册的 WARP 账户、删除 `/usr/bin/warp`，还会重启 systemd-resolved。
-
-2. **处理主配置里旧的 WARP**（改文件，**先别重启 sing-box**）。按你现在的写法选一种：
-
-   - **主配置里有一个 tag 是「🧩 <WARP>」的 wireguard endpoint**：删掉这个 endpoint。规则不用改，warp-keeper 的片段会提供同名的 endpoint。
-   - **规则指向一个 socks 出站（`127.0.0.1:18650`）**：
-     - 最省事：**什么都不改**。片段里的 mixed 入站就在 18650 上，那个 socks 出站会连到它，再进 WARP。缺点是流量在 sing-box 里多绕一圈（同一个进程内，开销很小）。
-     - 更干净：删掉那个 socks 出站，把规则里的出站名改成 `WARP_TAG`（或者把 `WARP_TAG` 设成原来 socks 出站的 tag，规则就不用改了）。
-
-3. `warp-keeper init`。它会先 `sing-box check` 合并后的整套配置，不通过就恢复原样并打印错误（最常见的是 tag 重名：主配置里旧的那个还没删）。
-
-## 自愈逻辑
-
-每小时一次 `warp-keeper check`：
-
-| 情况 | 怎么判断 | 处理 |
+| Component | Version | Notes |
 |---|---|---|
-| 正常 | 经 `127.0.0.1:18650` 访问 `1.1.1.1` / `[2606:4700:4700::1111]` 的 `/cdn-cgi/trace`，每个栈都是 `warp=on` 或 `plus`（不通的话 5 秒后再试一次） | 无。免费账户且开了 WARP+ 时，每天试一次套许可证（不用重载） |
-| sing-box 没运行 | `systemctl is-active` | 不处理，只告警（重启 sing-box 不是 warp-keeper 该做的事） |
-| 片段被删了 | 18650 没在监听，片段文件不在 | 用现有账户重新生成，check 通过后重载 |
-| 本机断网 | 直连 `1.1.1.1` 也不通 | 不处理，只告警 |
-| 流量没走 WARP | trace 显示 `warp=off` | 不处理：说明路由没把探测入站送进 WARP，换号没用，提示你看合并后的规则 |
-| WARP 不通 | 以上都不是 | ① 账户还在：重载 sing-box，再探测 ② 还不通（或账户已被 Cloudflare 删除）：注册新账户 → 写片段 → check → 重载 → 探测；新账户也不通就**退回原来的片段**，注销新账户 |
+| sing-box | ≥ 1.11 | WireGuard endpoints arrived in 1.11; install with [upsing](../docs/upsing.md) |
+| systemd unit with `-C <dir>` | — | The official `.deb` already starts with `-C /etc/sing-box` |
+| `curl`, `jq`, `ss`, `flock` | — | Installed by `install.sh` if missing |
 
-- 两次自动换号至少隔 `RENEW_MIN_GAP`（默认 6 小时），避免网络抖动时反复注册；原账户已被删除时不受这个限制。急的话手动 `warp-keeper renew`
-- 换号成功后注销旧设备，Cloudflare 那边不会越积越多
-- 同一时间只跑一个（`flock`），手动命令和 timer 撞上时手动的会等
+### What `install.sh` changes
 
-探测的目标直接写 IP，不依赖 DNS；延迟取「TLS 握手完成 → 收到第一个字节」，约等于经 WARP 的一个往返。
+- Installs `/opt/warp-keeper/warp-keeper.sh` and links it as `/usr/local/bin/warp-keeper`.
+- Installs `warp-keeper.service` / `.timer` (3 min after boot, then hourly with up to 5 min jitter).
+- Copies `/etc/warp-keeper.env` on first install only. It never touches sing-box or the account.
 
-## WARP+
+> [!WARNING]
+> `init`, an automatic account renewal and a fragment change all **reload sing-box**, which briefly drops every inbound connection, not just WARP. The hourly check only reloads when WARP is actually down.
 
-`WARP_PLUS` 三种写法：
+## 🧭 Usage
 
-| 值 | 行为 |
-|---|---|
-| `auto`（模板默认） | 从 `WARP_PLUS_CHANNEL`（默认 [t.me/s/warpplus](https://t.me/s/warpplus) 的网页版）抓最新的许可证，从新到旧逐个试，最多 10 个，套上为止。试过不行的记下来，下次跳过 |
-| 许可证本身 | 只用你给的（多个用空格隔开） |
-| `off` | 只用免费账户 |
-
-- 注册新账户时、`init` 时会试；免费账户每天再试一次。套许可证不换密钥，不用重载 sing-box，下一次握手后生效
-- 公开频道的许可证是很多人共用的，随时可能设备数满或失效。套不上不影响正常工作，继续用免费账户
-- 手动套一个：`warp-keeper plus xxxxxxxx-xxxxxxxx-xxxxxxxx`
-
-## 通知
-
-**Telegram**（`TG_BOT_TOKEN` + `TG_CHAT_ID`，可以和 traffic-bot、cfst-ddns 用同一个 bot）。每个栈一行：状态、出口机房和国家、延迟、**WARP 出口 IP**（等宽显示，点一下就能复制）。出口 IP 是 Cloudflare 分配的地址，不是本机的；除此之外和仓库里其他工具一样，消息里不会出现本机 IP、域名、网址。
-
-| `TG_NOTIFY` | 什么时候发 |
-|---|---|
-| `change`（默认） | 出问题、做了自愈动作（重载 / 换号 / 重新生成片段 / 升级 WARP+）、恢复；故障一直没好时每 `TG_REPEAT_HOURS` 小时提醒一次 |
-| `all` | 每次检查都发 |
-| `off` | 不发 |
-
-另外每天 `TG_SUMMARY_HOUR` 点后的第一次检查发一条**日报**：每个栈的出口和延迟、24 小时 / 7 天可用率、24 小时平均延迟、账户类型和使用天数、换号和重载次数。留空不发。
-
-**Sonde**：填上 `SONDE_URL`、`SONDE_TOKEN`，每次检查后上报。来源名是 `warp-keeper:<WARP_NAME>`（小写）；面板把所有机器汇总在**同一张** WARP 卡片里，每台一行。上报周期 1 小时，两小时没动静那一行就标离线。Sonde 页面是公开的，所以上报里**不带出口 IP**，只有机房代码和国家。
-
-## 命令
+### See the current state
 
 ```bash
-warp-keeper init        # 注册（已有账户就沿用）→ 写片段 → check → 重载 → 验证；改了 env 后也用它（片段没变就不重载）
-warp-keeper check       # 健康检查 + 自愈（timer 调用的就是它）
-warp-keeper status      # 当前状态，会实测一次，不改任何东西
-warp-keeper renew       # 立即换新账户（想换个出口 IP 时）
-warp-keeper plus [KEY]  # 套 WARP+ 许可证
-warp-keeper sync        # 按当前版本和 env 重新生成片段，有变化才重载（update.sh 调用）
-warp-keeper remove      # 删片段 → check → 重载 → 注销账户；主配置还在引用 tag 时会拒绝
+warp-keeper status
 ```
 
-日志：`journalctl -u warp-keeper --output cat`
+Probes once and prints exits, latency, account type, renewals and 24 h / 7 d availability; changes nothing.
 
-## 更新
+### Get a new exit IP
+
+```bash
+warp-keeper renew
+```
+
+Registers a new account, swaps the fragment, reloads, probes; on failure it rolls back to the old one.
+
+### Apply a WARP+ licence
+
+```bash
+warp-keeper plus xxxxxxxx-xxxxxxxx-xxxxxxxx
+```
+
+No reload needed; it takes effect on the next handshake.
+
+## 🔧 Configuration
+
+Settings live in `/etc/warp-keeper.env`; run `warp-keeper init` after editing (keeps the account, reloads only if the fragment changed). Template: [`warp-keeper.env.example`](warp-keeper.env.example).
+
+| Name | Required | Default | Description |
+|---|---|---|---|
+| `WARP_NAME` | ❌ | hostname | Name in Telegram and Sonde |
+| `WARP_TAG` | ❌ | `🧩 <WARP>` | Endpoint tag your route rules point to; must be unique |
+| `LOCAL_PORT` | ❌ | `18650` | Local mixed inbound used for probing |
+| `STACK` | ❌ | `dual` | `dual`, `v4` or `v6` |
+| `MTU` | ❌ | `1280` | WireGuard MTU |
+| `PEER` / `PEER_PORT` | ❌ | `auto` / `2408` | Peer address and port |
+| `SB_SERVICE` / `SB_CONFIG_DIR` | ❌ | `sing-box` / from unit | sing-box service and config directory |
+| `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | Fragment file name (sort order matters) |
+| `RENEW_MIN_GAP` | ❌ | `360` | Minutes between automatic renewals |
+| `WARP_PLUS` | ❌ | `off` (template: `auto`) | `auto`, `off`, or licence keys |
+| `TIMEZONE` | ❌ | `Asia/Taipei` | Time zone for messages and the daily summary |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | ❌ | — | Telegram |
+| `TG_NOTIFY` / `TG_REPEAT_HOURS` / `TG_SUMMARY_HOUR` | ❌ | `change` / `6` / `9` | When to message; daily summary hour |
+| `SONDE_URL` / `SONDE_TOKEN` | ❌ | — | Sonde panel reporting |
+
+## 🔄 Update & Maintenance
+
+### Update
 
 ```bash
 cd /opt/scripts-de-moi
-git am -3 *.patch && rm *.patch && git push && ./update.sh
+./warp-keeper/update.sh
 ```
 
-根目录的 `update.sh` 会更新本机装了的所有工具；只更新这一个：`sudo ./warp-keeper/update.sh`。它会重新安装程序和单元，然后运行 `warp-keeper sync`：新版本生成的片段和现在的一样就什么都不做；不一样时 check → 重载 → 探测，不通就退回原来的片段。`--status` 只看版本和上次检查的结果。
+Reinstalls the program, then runs `warp-keeper sync`: if the regenerated fragment is identical nothing happens; otherwise check → reload → probe, with rollback on failure.
 
-## 卸载
+### Data & backup
+
+`/var/lib/warp-keeper/` (700): `account.json` (device ID, token, private key), `state`, `checks.log` (8 days of results), `fragment.prev`, `bad-keys`.
+
+### Logs
 
 ```bash
-# 先把主配置里引用「🧩 <WARP>」的规则改掉（否则 remove 会拒绝），然后：
-sudo ./warp-keeper/uninstall.sh    # 或者根目录的 sudo ./uninstall.sh，在菜单里选
+journalctl -u warp-keeper --output cat
 ```
 
-先执行 `warp-keeper remove`（删片段 → 检查 → 重载 sing-box → 注销 WARP 账户），成功了才删 timer、服务、`/opt/warp-keeper` 和 `/usr/local/bin/warp-keeper`；remove 被拒绝时什么都不删。配置 `/etc/warp-keeper.env` 和状态 `/var/lib/warp-keeper` 保留，卸载完会打印彻底删除的命令。
+### Uninstall
 
-## 注意事项
+Remove route rules that use `WARP_TAG` from the main config first, then:
 
-- **注册接口有频率限制。** 同一个 IP 短时间内注册太多次会被拒绝（HTTP 429）。所以自动换号有最小间隔；注册失败时保持原配置，下一小时再试，并在 Telegram 里写明原因。
-- **Cloudflare 的注册接口没有公开文档。** 请求格式参照 [wgcf](https://github.com/ViRb3/wgcf) 和 fscarmen 的脚本；`WARP_API`、`WARP_UA`、`WARP_CLIENT_VER` 可以在 env 里覆盖，接口变动时不用等脚本更新。
-- **账户文件里有私钥和令牌**，在 `/var/lib/warp-keeper/account.json`（权限 600）。片段文件里也有私钥，权限同样是 600。
-- **出口 IP 是 Cloudflare 分配的**，换号后通常会变；`warp-keeper renew` 可以手动换。
+```bash
+./warp-keeper/uninstall.sh
+```
+
+It runs `warp-keeper remove` (delete fragment → check → reload → deregister) and only then deletes the units and program. Config and state are kept.
+
+## 🧠 How It Works
+
+```mermaid
+flowchart LR
+  R[Your route rules] -->|outbound 🧩 WARP| E[WireGuard endpoint<br/>in sing-box]
+  L[127.0.0.1:18650<br/>mixed inbound] --> E
+  E --> W[Cloudflare WARP]
+  T[warp-keeper.timer<br/>hourly] --> K[warp-keeper check]
+  K -->|probe /cdn-cgi/trace via 18650| L
+  K -->|down| RL[reload sing-box] -->|still down| RN[new account + fragment]
+```
+
+- **Fragment, not edits** → sing-box merges every `.json` in the `-C` directory; `00-` sorts first so the probe rule precedes yours.
+- **Probe through the real path** → it fetches `1.1.1.1/cdn-cgi/trace` via the inbound and requires `warp=on` or `plus`.
+- **Renewals are rate-limited** → at least `RENEW_MIN_GAP` apart (the registration API returns 429 if you hammer it), unless the account is gone.
+- **Every change is reversible** → `sing-box check` before reload, `fragment.prev` for rollback, and a new account is deregistered if it doesn't work.
+
+## 🔒 Security
+
+- `account.json` and the fragment hold the WireGuard private key; both are mode 600.
+- The registration API is undocumented; request format follows [wgcf](https://github.com/ViRb3/wgcf). Override `WARP_API`, `WARP_UA`, `WARP_CLIENT_VER` in the env if it changes.
+- Telegram messages show the WARP exit IP (a Cloudflare address) but no host IPs or domains; Sonde reports carry no IP at all.
+
+## 📚 Documentation
+
+- [docs/MANUAL.zh-CN.md](docs/MANUAL.zh-CN.md): Full Chinese manual — fragment merging, wireproxy migration, self-healing table, WARP+, notifications.
+- [warp-keeper.env.example](warp-keeper.env.example): Every config key with comments.
+- [../AGENTS.md](../AGENTS.md): Conventions and checks for AI coding agents working on this repo.
+
+## 📄 License
+
+No license file yet; all rights reserved by default. See the [repository README](../README.md#-license).

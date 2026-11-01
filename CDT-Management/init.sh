@@ -85,7 +85,7 @@ install_files() {
 configure() {
     echo
     echo "${c_b}── 阿里云 RAM 用户 AccessKey ──${c_0}"
-    echo "（RAM 控制台 → 用户 → 创建 AccessKey；权限见 README 的 ram-policy.json）"
+    echo "（RAM 控制台 → 用户 → 创建 AccessKey；权限见 CDT-Management/ram-policy.json，步骤见 CDT-Management/docs/MANUAL.zh-CN.md）"
     local ak sk region inst limit mode stopmode sg tg_token tg_chat
     while :; do
         ask        ak     "AccessKey ID"     "$(get_val ALI_AK "$ENV_FILE")"
