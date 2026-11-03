@@ -101,6 +101,7 @@ git am -3 *.patch && rm *.patch && git push && ./update.sh
 python3 -m unittest discover CDT-Management/tests
 /opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests
 bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh
+bash cfst-ddns/tests/run.sh
 ```
 
 约定、不变量和提交前检查清单见 [AGENTS.md](AGENTS.md)。
@@ -121,12 +122,12 @@ bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh
 | AWS CloudWatch 免费 API 次数 | 100 万次 / 月 | 来自代码注释，未核实；traffic-bot 每月约 1.6 万次 |
 | OCI SDK 默认重试 | 8 次 / 600 秒 | 已用 `oci` 2.189.0 核实；traffic-bot 现在限制为 3 次 / 60 秒 |
 | 性能基线 | 还没有记录 | traffic-bot 现在每轮记录各来源耗时；收集一天的数据 |
-| cfst-ddns 两个目标的全量扫描 | 必须在 `RuntimeMaxSec=30min` 内跑完 | 未测量；`FULL_AT` 时看 journal 里的 `完成，用时` |
+| cfst-ddns 两个目标的全量扫描 | 必须在 `RuntimeMaxSec=30min` 内跑完 | 仓库主人实测，2026-10-20：Cloudflare 159–189 秒、CloudFront 120 秒、复测榜单约 50 秒，两个目标合计约 5 分钟 |
 
 ### 已知局限
 
-- shell 工具（cfst-ddns、warp-keeper、brutal-cn、debian-init）没有自动化测试，改动靠在服务器上手动验证。
-- shell 工具传给 `curl` 的密钥，本机其他用户能在进程列表里看到。
+- warp-keeper、brutal-cn、debian-init 没有自动化测试，改动靠在服务器上手动验证。cfst-ddns 有离线测试（`cfst-ddns/tests/run.sh`）。
+- warp-keeper 把 Telegram 和 Sonde 的 token 写在 `curl` 命令行里，本机其他用户能在进程列表里看到。cfst-ddns 改为经标准输入传递。
 
 ## 📚 文档地图
 

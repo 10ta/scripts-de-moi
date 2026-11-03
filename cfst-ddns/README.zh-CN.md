@@ -135,10 +135,13 @@ systemctl start cfst-ddns@full:cloudfront
 | `RANK_BY` | ❌ | `download` | `download`、`upload` 或 `latency` |
 | `LATENCY_SPLIT` / `PICK_PER_GROUP` | ❌ | `0` / `5` | 延迟分段界限（ms）和每段榜单大小 |
 | `MIN_SPEED` / `SWITCH_MARGIN` / `HEALTH_RATIO` | ❌ | `0` / `20` / `70` | 速度底线（MB/s）、切换门槛（%）、健康比例（%） |
+| `SPEED_TOLERANCE` | ❌ | `0` | 速度在最快的这个百分比以内时，先比丢包、再比延迟 |
+| `FULL_MIN_GAP` | ❌ | `120` | 全量扫描失败、榜单全不达标后，至少隔这么多分钟才再全量扫描 |
 | `CFST_ARGS` | ❌ | `-tl 250` | 额外的 cfst 参数；不要写 `-f -o -p -dn -dd` |
 | `SEEDS_DNS` / `SEEDS_URL` | ❌ | — | 种子来源 |
 | `API_PROXY` | ❌ | 直连 | API 和 Telegram 请求用的代理 |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_NOTIFY` | ❌ | — / — / `all` | Telegram 简报（`all`、`change`、`off`） |
+| `TG_NOTIFY_CHECK` | ❌ | `off` | 巡检发现当前 IP 健康时也发一条 |
 | `SONDE_URL` / `SONDE_TOKEN` | ❌ | — | 上报 Sonde 面板 |
 | `<目标>_XXX` | ❌ | — | 按目标覆盖，如 `CLOUDFRONT_RECORD_NAME` |
 
@@ -187,16 +190,18 @@ flowchart LR
 - **路由几天才变，拥堵按小时变** → 全量延迟扫描一天一次；频繁运行的只是巡检当前 IP。
 - **延迟限制由脚本筛，不交给 cfst** → 日志能说清楚一个 IP 是连不上还是超出限制。
 - **两轮不会重叠** → `flock` 让新的一轮在上一轮没结束时直接跳过；每次运行最长 30 分钟。
+- **全量扫描失败后不马上重试** → 每 `FULL_MIN_GAP` 最多全量扫描一次，直连坏了也不会每 5 分钟探测几千个 IP。同样的失败 2 小时内只发一次 Telegram。
+- **复测不会让榜单变少** → 某一轮暂时连不上的 IP 留在榜单里，到下次全量扫描再重建。
 - **种子必须落在该 CDN 的官方网段内** → 被劫持的公共域名混不进别的 IP（除非 `SEED_ALLOW_OUTSIDE=1`）。
 - **消息里写机房代码，不写 IP** → Telegram 和 Sonde 里不会出现 IP 和域名。
 
 ## 🔨 开发
 
 ```bash
-bash -n cfst-ddns/cfst-ddns.sh
+bash cfst-ddns/tests/run.sh
 ```
 
-没有自动化测试。改动后用一条临时记录手动跑一次，看 journal 验证。
+用假的 cfst 和假的 Cloudflare / Telegram API 离线跑完整流程，不需要 root；最后输出 `通过 25 项，失败 0 项`。正式使用改动之前，再用一条临时记录真实跑一次，看 journal 确认。
 
 ## 📚 文档地图
 

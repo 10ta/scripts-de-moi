@@ -135,10 +135,13 @@ Settings live in `/etc/cfst-ddns.env`. The full commented list is [`cfst-ddns.en
 | `RANK_BY` | ❌ | `download` | `download`, `upload` or `latency` |
 | `LATENCY_SPLIT` / `PICK_PER_GROUP` | ❌ | `0` / `5` | Latency split (ms) and shortlist size per group |
 | `MIN_SPEED` / `SWITCH_MARGIN` / `HEALTH_RATIO` | ❌ | `0` / `20` / `70` | Floor (MB/s), switch margin (%), health ratio (%) |
+| `SPEED_TOLERANCE` | ❌ | `0` | Within this % of the fastest, prefer lower loss, then lower latency |
+| `FULL_MIN_GAP` | ❌ | `120` | Minutes between full scans after a failed one or a failed shortlist |
 | `CFST_ARGS` | ❌ | `-tl 250` | Extra cfst flags; never `-f -o -p -dn -dd` |
 | `SEEDS_DNS` / `SEEDS_URL` | ❌ | — | Seed sources |
 | `API_PROXY` | ❌ | direct | Proxy for API and Telegram requests |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_NOTIFY` | ❌ | — / — / `all` | Telegram summaries (`all`, `change`, `off`) |
+| `TG_NOTIFY_CHECK` | ❌ | `off` | Also send a message when a check finds the current IP healthy |
 | `SONDE_URL` / `SONDE_TOKEN` | ❌ | — | Sonde panel reporting |
 | `<TARGET>_XXX` | ❌ | — | Per-target override, e.g. `CLOUDFRONT_RECORD_NAME` |
 
@@ -187,16 +190,18 @@ flowchart LR
 - **Routes change over days, congestion over hours** → full latency scans once a day; frequent runs only re-check the current IP.
 - **Latency limits are applied by the script, not cfst** → logs say whether an IP was unreachable or just over the limit.
 - **Runs never overlap** → a `flock` makes a new round skip while one is running; each run is capped at 30 minutes.
+- **A failed full scan waits before retrying** → at most one full scan per `FULL_MIN_GAP`, so a broken direct route does not turn into thousands of probes every 5 minutes. The same failure goes to Telegram once per 2 hours.
+- **Re-testing never shrinks the shortlist** → IPs that are unreachable for one round stay until the next full scan.
 - **Seeds must fall inside the CDN's official ranges** → a hijacked public domain cannot inject foreign IPs (unless `SEED_ALLOW_OUTSIDE=1`).
 - **Messages show the edge's colo code, not the IP** → Telegram and Sonde never carry IPs or domains.
 
 ## 🔨 Development
 
 ```bash
-bash -n cfst-ddns/cfst-ddns.sh
+bash cfst-ddns/tests/run.sh
 ```
 
-There is no automated test suite. Test changes with a manual run against a throw-away record and watch the journal.
+Runs the whole flow offline with a fake cfst and a fake Cloudflare / Telegram API, no root needed; it ends with `通过 25 项，失败 0 项`. Before relying on a change, also run it once against a throw-away record and watch the journal.
 
 ## 📚 Documentation
 

@@ -101,6 +101,7 @@ Each tool directory has `README.md`, `README.zh-CN.md`, a Chinese `docs/MANUAL.z
 python3 -m unittest discover CDT-Management/tests
 /opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests
 bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh
+bash cfst-ddns/tests/run.sh
 ```
 
 Conventions, invariants and the pre-commit checklist are in [AGENTS.md](AGENTS.md).
@@ -121,12 +122,12 @@ Facts the code depends on but cannot show. Update this table when one is confirm
 | AWS CloudWatch free API calls | 1M / month | From code comments, unverified; traffic-bot uses ≈ 16k / month |
 | OCI SDK default retry | 8 attempts / 600 s | Verified with `oci` 2.189.0; traffic-bot now caps it at 3 / 60 s |
 | Performance baseline | None recorded yet | traffic-bot now logs per-provider time each round; collect a day of it |
-| cfst-ddns full scan with two targets | Must finish within `RuntimeMaxSec=30min` | Unmeasured; check `完成，用时` in the journal at `FULL_AT` |
+| cfst-ddns full scan with two targets | Must finish within `RuntimeMaxSec=30min` | Measured by owner, 2026-10-20: Cloudflare 159–189 s, CloudFront 120 s, shortlist re-test ≈ 50 s — about 5 min for both |
 
 ### Known limitations
 
-- No automated tests for the shell tools (cfst-ddns, warp-keeper, brutal-cn, debian-init); changes are verified by hand on a server.
-- Secrets passed to `curl` in the shell tools are visible in the process list to other local users.
+- No automated tests for warp-keeper, brutal-cn and debian-init; changes are verified by hand on a server. cfst-ddns has an offline suite (`cfst-ddns/tests/run.sh`).
+- warp-keeper passes its Telegram and Sonde tokens on the `curl` command line, where other local users can see them in the process list. cfst-ddns passes them on stdin.
 
 ## 📚 Documentation
 

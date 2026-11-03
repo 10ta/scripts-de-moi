@@ -132,9 +132,10 @@ sync_repo
 
 step "部署（install.sh）"
 bash -n cfst-ddns.sh || die "cfst-ddns.sh 有语法错误，没有部署"
-bash install.sh </dev/null >/tmp/cfst-ddns-install.log 2>&1 || { cat /tmp/cfst-ddns-install.log; die "install.sh 失败"; }
-grep -E "已重启|跳过下载|下载 cfst|移除旧版|注意" /tmp/cfst-ddns-install.log | sed 's/^/  /' || true
-rm -f /tmp/cfst-ddns-install.log
+LOG=$(mktemp)   # 不用固定的 /tmp 文件名：root 写可预测的路径可能被软链接劫持
+bash install.sh </dev/null >"$LOG" 2>&1 || { cat "$LOG"; rm -f "$LOG"; die "install.sh 失败"; }
+grep -E "已重启|跳过下载|下载 cfst|移除旧版|注意" "$LOG" | sed 's/^/  /' || true
+rm -f "$LOG"
 same_file cfst-ddns.sh "$APP/cfst-ddns.sh"
 if systemctl is-enabled --quiet cfst-ddns.timer 2>/dev/null; then
   ok "cfst-ddns.timer 已启用，下一轮（5 分钟内）就用 v$(ver "$APP/cfst-ddns.sh")"

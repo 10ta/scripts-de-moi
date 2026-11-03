@@ -58,7 +58,7 @@ IPv4 写 A 记录，IPv6 写 AAAA 记录。记录会被设为 **DNS only（灰�
 ```bash
 git clone https://github.com/10ta/scripts-de-moi.git
 cd scripts-de-moi/cfst-ddns
-sudo ./install.sh
+./install.sh
 ```
 
 可选环境变量：
@@ -66,8 +66,8 @@ sudo ./install.sh
 - `GH_PROXY=https://你的反代前缀/`：GitHub 下载慢时使用
 - `CFST_UID=951`：默认 UID 950 被占用时指定其他值
 
-升级时 `git pull` 后重新执行 `sudo ./install.sh` 即可，几秒完成：
-- cfst 已经装过就不会重新下载；想顺便升级 cfst 用 `sudo UPDATE_CFST=1 ./install.sh`
+升级时 `git pull` 后重新执行 `./install.sh` 即可，几秒完成：
+- cfst 已经装过就不会重新下载；想顺便升级 cfst 用 `env UPDATE_CFST=1 ./install.sh`
 - 已有的 `/etc/cfst-ddns.env` 不会被覆盖
 - 新增的配置项都有默认值，不补也能跑。查看 env 里还缺哪些（bash 和 fish 都能用）：
 
@@ -110,7 +110,7 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 | `OFFPEAK_EVERY` | `120` | 其余时间巡检间隔（分钟） |
 | `HEALTH_RATIO` | `70` | 健康标准 %：当前 IP 速度 ≥ 基准 × 这个比例 |
 | `SWITCH_MARGIN` | `20` | 切换门槛 %：新 IP 至少快这么多才换 |
-| `FULL_MIN_GAP` | `120` | 距上次全量不到这么多分钟，就不因榜单不达标而补扫 |
+| `FULL_MIN_GAP` | `120` | 全量扫描之间至少隔这么多分钟：榜单全不达标时的补扫、全量失败后的重试都受它限制 |
 
 **测速**（见下方「选 IP 的规则」）
 
@@ -149,12 +149,14 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 |---|---|---|---|
 | ① 巡检 | 只测当前解析的 IP：延迟 + 一次测速 | 几个包 + 一次测速的流量 | 晚高峰每 `PEAK_EVERY` 分钟，其余时间每 `OFFPEAK_EVERY` 分钟 |
 | ② 复测榜单 | 榜单里的 IP（加上当前 IP）重测延迟和速度，选最好的 | 榜单大小 × 一次测速 | 巡检发现当前 IP 变差时 |
-| ③ 全量扫描 | 测约 6000 个 IP 的延迟，重建榜单，再测速选最好的 | 约 2.4 万次 TCP 握手 + 一轮测速 | 每天 `FULL_AT`；还没有榜单时；榜单全不达标时（受 `FULL_MIN_GAP` 限制） |
+| ③ 全量扫描 | 测约 6000 个 IP 的延迟，重建榜单，再测速选最好的 | 约 2.4 万次 TCP 握手 + 一轮测速 | 每天 `FULL_AT`；还没有榜单时；榜单全不达标时（后两种受 `FULL_MIN_GAP` 限制） |
 
 - **健康**：当前 IP 速度 ≥ 基准 × `HEALTH_RATIO`%，且不低于 `MIN_SPEED`。基准 = 它上次被选中或被确认留用时测到的速度。晚高峰整体变慢时，复测后如果还是留用它，基准会更新为当时的速度，所以不会每次巡检都触发复测
 - **切换门槛**：复测/全量后，只有新的第一名比当前 IP 快 `SWITCH_MARGIN`% 以上，或当前 IP 已经不达标，才更新 DNS。设了 `SPEED_TOLERANCE` 时，速度相当且延迟低 `SWITCH_MARGIN`% 以上也会切换
 - **为什么这样分级**：哪些 IP 能连、延迟多少取决于路由，几天才变；拥堵则随时段变化。所以全量延迟扫描一天一次就够，频繁要看的只是「当前 IP 还行不行」。全量放在晚高峰前，进入高峰时榜单是新的；闲时上行/下行往往被自家宽带跑满，任何 IP 都差不多，也就没必要频繁重选
 - 两轮之间不会重叠：上一轮还没跑完时，新触发的一轮会直接跳过
+- **全量扫描失败不会马上重试**：比如 `exclude_uid` 没配好、一个 IP 都连不上，下一次全量至少隔 `FULL_MIN_GAP` 分钟，不会每 5 分钟扫一遍几千个 IP（还没有榜单时也一样）
+- **复测不会让榜单变少**：某一轮暂时连不上、超出延迟限制的榜单成员留在榜单里，下次复测再给机会；通过了延迟筛选但没挤进前几名的照常淘汰。榜单只在全量扫描时重建
 
 ### 选 IP 的规则
 
@@ -207,8 +209,8 @@ CLOUDFRONT_SEEDS_URL="https://www.wetest.vip/page/cloudfront/address_v4.html htt
 跑几天后看汇总（分晚高峰 / 非高峰）：
 
 ```bash
-sudo /opt/cfst-ddns/cfst-ddns.sh stats        # 最近 7 天
-sudo /opt/cfst-ddns/cfst-ddns.sh stats:30     # 最近 30 天
+/opt/cfst-ddns/cfst-ddns.sh stats        # 最近 7 天
+/opt/cfst-ddns/cfst-ddns.sh stats:30     # 最近 30 天
 ```
 
 ```
@@ -252,7 +254,7 @@ export default {
 **和浏览器里的 speed.cloudflare.com 对不上？** 浏览器测的是另一条路：域名按正常 DNS 解析（不是你的优选 IP），流量经过路由器和旁路由，可能还按规则走了代理。可以在那台设备上打开 `https://speed.cloudflare.com/cdn-cgi/trace`，看 `ip=` 是不是你家的出口 IP、`colo=` 是哪个机房。要验证脚本的数字，在 Debian 上用同一个用户把 64 MB 完整传完、由服务器确认：
 
 ```bash
-sudo -u cfst-ddns bash -c 'truncate -s 64M /tmp/up.bin; curl -sS --noproxy "*" -o /dev/null -H "Expect:" -w "HTTP %{http_code}  传完 %{size_upload} 字节用了 %{time_total}s\n" --resolve speed.cloudflare.com:443:你的优选IP -X POST -T /tmp/up.bin https://speed.cloudflare.com/__up; rm /tmp/up.bin'
+runuser -u cfst-ddns -- bash -c 'truncate -s 64M /tmp/up.bin; curl -sS --noproxy "*" -o /dev/null -H "Expect:" -w "HTTP %{http_code}  传完 %{size_upload} 字节用了 %{time_total}s\n" --resolve speed.cloudflare.com:443:你的优选IP -X POST -T /tmp/up.bin https://speed.cloudflare.com/__up; rm /tmp/up.bin'
 ```
 
 ### 3. 配合 sing-box TUN
@@ -293,11 +295,15 @@ API_PROXY=socks5h://127.0.0.1:2080
 
 两项都填才会发送。拿到 chat id 的方法：先给 bot 发一条消息，然后打开 `https://api.telegram.org/bot<TOKEN>/getUpdates`，找到其中的 `chat.id`。
 
-简报使用 Telegram HTML 格式，内容包括结果（已更新 / 无变化 / 巡检正常 / 失败及原因）、流程（如「巡检 → 复测榜单」）、域名、新旧 IP、为什么换或不换、延迟 / 丢包 / 速度、前 5 名、主机名和时间。
+简报使用 Telegram HTML 格式，内容包括结果（已更新 / 无变化 / 巡检正常 / 失败及原因）、流程（如「巡检 → 复测榜单」）、新旧节点的机房代码（如 `LAX ➜ HKG`）、延迟 / 丢包 / 速度、为什么换或不换、官方最佳 vs 种子最佳、前 5 名（排名 + 机房）、可展开的延迟筛选和参数、主机名和用时。
+
+简报**不含 IP、域名和网址**：IP 用机房代码代替，种子来源只写「种子」，发送前还会再过一遍脱敏，把漏网的 IP、网址、域名替换成 `***`。完整的 IP 和来源在 journal 里。
 
 - 巡检结果正常时默认不发（`TG_NOTIFY_CHECK=off`），否则晚高峰每 30 分钟就有一条；巡检发现变差、换 IP、失败时照常发
 - `TG_NOTIFY=change` 时只在 IP 变化或失败时发，优先于 `TG_NOTIFY_CHECK`
+- 同一个失败原因 2 小时内只发一次（原因里的数字不算，比如「扫描的 3 个 IP」和「扫描的 5 个 IP」算同一个）；中间成功过一次，再失败就重新通知
 - Telegram 发送失败只会在日志里记一条警告，不影响 DNS 更新的结果
+- bot token 和 Cloudflare token 经标准输入交给 curl，不出现在进程列表里
 
 ### 5. CloudFront 和其他 CDN
 
@@ -350,9 +356,9 @@ GCORE_CFST_ARGS="-tl 300 -dt 5 -url https://你在该CDN上的测速文件"
 `systemctl start` 会立即返回，测速在后台进行，进度通过日志查看：
 
 ```bash
-sudo systemctl start cfst-ddns@full               # 先手动全量跑一次，建立榜单
-journalctl -fu 'cfst-ddns@*' --output cat         # 跟踪日志，Ctrl+C 退出
-sudo systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
+systemctl start cfst-ddns@full               # 先手动全量跑一次，建立榜单
+journalctl -fu 'cfst-ddns@*' --output cat    # 跟踪日志，Ctrl+C 退出
+systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
 ```
 
 全量扫描输出示例：
@@ -361,13 +367,13 @@ sudo systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
 10-20 18:30 非高峰，每 120 分钟巡检
 当前解析: cf.example.com (A) = 104.18.x.x（API 经代理 socks5h://127.0.0.1:2080）
 ===== 全量扫描 =====
-延迟测速（全部 IP）: cfst -tl 250 -dt 5 -dd
+延迟测速（全量）: cfst -tl 250 -dt 5 -dd
   [15s] 延迟测速：已测 881/5955 个 IP，可连通 292 个（限制条件最后统一筛）
   ...
   测了 6044 个 IP：可连通 1893 个（最低延迟 52ms），满足限制条件（延迟 ≤250ms）1696 个
   其中种子 78 个：可连通 70 个（最低延迟 61ms），满足限制条件 66 个
   参与挑选 1696 个（其中种子 66 个）：<150ms 段 420 个，≥150ms 段 1276 个
-  新榜单 10 个 IP
+  候选 11 个：官方 10 个，种子 0 个，含当前 IP
 下载测速: 11 个 IP
 结果（IP / 延迟ms / 丢包 / 下载MB/s）：
   104.18.x.x         183.87   0.00     9.78  ≥150ms  ← 当前
@@ -413,14 +419,14 @@ SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
 
 ## 日常运维
 
-模式后面加 `:目标` 只跑这一个目标，例如 `sudo systemctl start cfst-ddns@full:cloudfront`；不加就按 `TARGETS` 依次跑所有目标。
+模式后面加 `:目标` 只跑这一个目标，例如 `systemctl start cfst-ddns@full:cloudfront`；不加就按 `TARGETS` 依次跑所有目标。
 
 ```bash
 systemctl list-timers cfst-ddns.timer       # timer 是否在跑（每 5 分钟）
 journalctl -fu 'cfst-ddns@*' --output cat   # 实时日志
-sudo systemctl start cfst-ddns@check        # 立即巡检一次
-sudo systemctl start cfst-ddns@pool         # 立即复测榜单
-sudo systemctl start cfst-ddns@full         # 立即全量扫描
+systemctl start cfst-ddns@check             # 立即巡检一次
+systemctl start cfst-ddns@pool              # 立即复测榜单
+systemctl start cfst-ddns@full              # 立即全量扫描
 cat /var/lib/cfst-ddns/cloudflare/state     # 上次全量/巡检时间（Unix 时间戳）、当前 IP 的基准
 ```
 
@@ -434,12 +440,14 @@ timer 每 5 分钟会启动一次 `cfst-ddns@auto`，没到时间时几毫秒就
 |---|---|
 | `curl: (28) Connection timed out` | API 请求被排除在 TUN 外但连不上，见上文配置 `API_PROXY` |
 | `curl: (6) Could not resolve host` | 排除后的 DNS 不可用，检查 `/etc/resolv.conf`，或配置 `API_PROXY` 使用 `socks5h://` |
-| 测速很慢、延迟合格数一直接近 0 | 测速流量仍然经过了代理，检查 `exclude_uid` 和 UID 是否一致，并确认已重启 sing-box |
+| 测速很慢、日志里「可连通」一直接近 0 | 测速流量仍然经过了代理，检查 `exclude_uid` 和 UID 是否一致，并确认已重启 sing-box |
 | 下载速度全部为 0 | 默认测速地址不可用，用 `-url` 换成自己挂在 CF 后面的文件 |
 | 上传测速大面积 `HTTP 4xx` / `服务器中途断开` | 默认上传地址不可用，换成自建 Worker，见「上传测速」 |
 | 上传测速 `连接失败（curl 退出码 7）` | 连不上这些 IP，多半是上传流量没被 `exclude_uid` 放行 |
 | `榜单里没有达标的 IP，且 … 刚做过全量扫描` | 高峰期整体都很差，低于 `MIN_SPEED`；保留现有解析，等下一轮。可适当调低 `MIN_SPEED` |
 | `Telegram 发送失败` | 通常是直连不通，配置 `API_PROXY` |
+| `同样的失败 2 小时内已经通知过，这次不发 Telegram` | 正常的去重；原因还在 journal 里，Sonde 照常上报 |
+| 全量扫描失败后，timer 很久没再扫 | 正常：至少隔 `FULL_MIN_GAP` 分钟才重试；急的话手动 `systemctl start cfst-ddns@full` |
 | 时间表和预期差几个小时 | 检查 `TIMEZONE` |
 | `种子 xxx：0 个` | 域名解析不到（DoH 连不上或域名已失效），或网页里没有 IP（比如页面是 JS 渲染的） |
 | `… 个不在官方网段，已丢弃` | 种子源返回了不属于该 CDN 的 IP，正常的保护行为；如果某个来源长期大量被丢弃，换掉它 |
@@ -460,7 +468,7 @@ timer 每 5 分钟会启动一次 `cfst-ddns@auto`，没到时间时几毫秒就
 ## 卸载
 
 ```bash
-sudo ./cfst-ddns/uninstall.sh      # 或者根目录的 sudo ./uninstall.sh，在菜单里选
+./cfst-ddns/uninstall.sh      # 或者根目录的 ./uninstall.sh，在菜单里选
 ```
 
 删掉 timer、服务和 `/opt/cfst-ddns`。配置 `/etc/cfst-ddns.env`、测速历史 `/var/lib/cfst-ddns` 和系统用户 `cfst-ddns` 保留，重新安装时直接沿用；卸载完会打印彻底删除它们的命令（`rm -rf …`、`userdel cfst-ddns`）。删了用户的话，别忘了把 sing-box 配置里的 `exclude_uid` 一并删掉。DNS 记录停在最后一次写入的 IP。

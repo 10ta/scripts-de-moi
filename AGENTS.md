@@ -13,6 +13,7 @@
 |---|---|
 | cdt-guard tests (no deps, no network) | `python3 -m unittest discover CDT-Management/tests` |
 | traffic-bot tests (needs bot deps) | `/opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests` |
+| cfst-ddns tests (offline: fake cfst, fake Cloudflare / Telegram API; no root) | `bash cfst-ddns/tests/run.sh` |
 | Syntax-check shell | `bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh debian-init.sh */install.sh */update.sh` |
 | Syntax-check Python | `python3 -m py_compile traffic-bot/bot.py CDT-Management/cdt_guard.py` |
 | Deploy on a server | `cd /opt/scripts-de-moi && git am -3 *.patch && rm *.patch && git push && ./update.sh` |
@@ -48,6 +49,8 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 - **Sonde runs on Cloudflare D1** (owner-confirmed). Budget writes: cdt-guard reports on change + 15 min heartbeat; traffic-bot once per alert round. Don't add per-minute reporters.
 - warp-keeper must `sing-box check` before every reload and keep `fragment.prev` for rollback. Temp files in the sing-box config dir must not end in `.json`.
 - cfst-ddns: speed tests must go direct (service user UID 950 is excluded from sing-box TUN); API calls may use `API_PROXY`.
+- cfst-ddns: at most one full scan per `FULL_MIN_GAP`, including when there is no shortlist yet (`full_due`); a broken route must never turn into a full scan every timer tick. Shortlist re-tests keep members that failed latency (`keep_pool_members`); only `do_full` rebuilds `pool.csv`.
+- cfst-ddns: tokens reach `curl` through `-K -` on stdin (`cf`, `tg_send`, `sonde_report`), never on the command line; the test suite fails if a token shows up in argv. The same failure reason is sent to Telegram at most once per `FAIL_QUIET` (2 h).
 
 ## Do not
 
@@ -70,7 +73,7 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 
 ## Before you finish
 
-- [ ] Both test suites pass; `bash -n` and `py_compile` are clean.
+- [ ] All three test suites pass (cdt-guard, traffic-bot, cfst-ddns); `bash -n` and `py_compile` are clean.
 - [ ] Docs synced: changed a command, config key, default or behavior → update the tool's `README.md` **and** `README.zh-CN.md`, its `docs/MANUAL.zh-CN.md`, the env template, and this file if an invariant moved.
 - [ ] New env key → add it to the env template (`*.env.example` or `install.sh`) and the README config table.
 - [ ] Output still scrubbed (no IP / domain / URL in Telegram or Sonde).

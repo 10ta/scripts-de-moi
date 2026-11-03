@@ -14,7 +14,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.10.22.3"
+VERSION="2026.11.03"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -175,7 +175,7 @@ mode_name() { case "$1" in check) echo 巡检 ;; pool) echo 复测榜单 ;; full
 
 # 运行状态，结束时用来写日志和 Telegram 简报
 KIND=""; REASON=""; WHY=""; PATH_DESC=""; IP=""; OLD_IP=""; LAT=""; LOSS=""; SPEED=""; GROUP=""; SRC=""; COMPARE=""
-PID=""; t=0; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""
+PID=""; t=0; QUICK=""; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""
 
 # ---------- 状态文件：上次全量/巡检时间、当前 IP 的基准速度 ----------
 STATE="$WORK/state"
@@ -230,9 +230,37 @@ top_table() {   # 前 5 名，等宽表格；用排名 + 机房代码代替 IP�
       else         printf "%-2d %-4s %5.0f %5s%s  %s%s\n", FNR - 1, cc, $5, $4, g, l, mk }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null
 }
 
+# 发一条 Telegram 消息。bot token 经标准输入交给 curl（-K -），不出现在命令行里（/proc/*/cmdline 谁都能读）
+# 被终止时（QUICK）只试一次、最多 10 秒，赶在 systemd 的停止期限之前
+tg_send() {   # tg_send 正文 [额外 curl 参数...]
+  local text=$1; shift
+  local cb=("${CURL_BASE[@]}"); [[ -n "$QUICK" ]] && cb+=(--retry 0 -m 10)
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_BOT_TOKEN" \
+    | curl "${cb[@]}" -K - --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${text}" \
+        -d disable_web_page_preview=true "$@" 2>&1
+}
+
+# 同一个失败原因 FAIL_QUIET 秒内只通知一次（原因里的数字不算，比如「扫描的 3 个 IP」和「扫描的 5 个 IP」算同一个）。
+# 成功一次就清掉，下次失败照常通知
+FAIL_QUIET=7200
+fail_repeated() {
+  local key last_key last_at now
+  [[ -d "$WORK" ]] || return 1
+  key=$(tr -d '0-9.' <<<"$REASON" | cksum | cut -d' ' -f1)
+  now=$(date +%s); last_key=$(state_get FAIL_KEY); last_at=$(state_get FAIL_AT); last_at=${last_at:-0}
+  if [[ "$key" == "$last_key" ]] && (( now - last_at < FAIL_QUIET )); then return 0; fi
+  state_set "FAIL_KEY=$key" "FAIL_AT=$now"
+  return 1
+}
+
 notify() {
   [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" && "$TG_NOTIFY" != off ]] || return 0
   [[ "$KIND" == skip || -z "$KIND" ]] && return 0
+  if [[ "$KIND" == failed ]]; then
+    if fail_repeated; then echo "同样的失败 $((FAIL_QUIET / 3600)) 小时内已经通知过，这次不发 Telegram"; return 0; fi
+  elif [[ -f "$STATE" ]] && [[ -n "$(state_get FAIL_KEY)" ]]; then
+    state_set "FAIL_KEY=" "FAIL_AT=0"
+  fi
   [[ "$KIND" == healthy && "$TG_NOTIFY_CHECK" != on ]] && return 0
   [[ "$TG_NOTIFY" == change && ( "$KIND" == unchanged || "$KIND" == healthy ) ]] && return 0
 
@@ -282,9 +310,7 @@ notify() {
   msg+=$'\n'"<i>🖥 $(h "$(cat /proc/sys/kernel/hostname)") · ⏱ ${t}s · $(date '+%m-%d %H:%M') · v${VERSION}</i>"
   msg=$(scrub "$msg")
 
-  resp=$(curl "${CURL_BASE[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
-    -d parse_mode=HTML -d disable_web_page_preview=true 2>&1) || true
+  resp=$(tg_send "$msg" -d parse_mode=HTML) || true
   if jq -e '.ok' >/dev/null 2>&1 <<<"$resp"; then
     echo "已发送 Telegram 简报"
     return
@@ -294,9 +320,7 @@ notify() {
   # 格式出错（比如某段文字没转义干净）时，去掉标签再发一次纯文本，至少别丢了这条简报
   if [[ "$why" == *"parse entities"* ]]; then
     msg=$(sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g' <<<"$msg")
-    curl "${CURL_BASE[@]}" "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
-      -d disable_web_page_preview=true >/dev/null 2>&1 && echo "已改用纯文本重发简报"
+    tg_send "$msg" >/dev/null 2>&1 && echo "已改用纯文本重发简报"
   fi
 }
 
@@ -363,8 +387,9 @@ sonde_report() {
              group: $group, src: $src, why: $why, reason: $reason, compare: $compare, top: $top,
              version: $ver, host: $host, elapsed: $t, peak: ($peak == "1"),
              scan: $scan, params: $params, top_ts: $top_ts, mode: $mode}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
-  if curl "${CURL_BASE[@]}" --retry 0 -m 8 -o /dev/null -w '%{http_code}' -X POST "$SONDE_URL/ingest" \
-       -H "Authorization: Bearer $SONDE_TOKEN" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
+  if printf 'header = "Authorization: Bearer %s"\n' "$SONDE_TOKEN" \
+       | curl "${CURL_BASE[@]}" --retry 0 -m 8 -K - -o /dev/null -w '%{http_code}' -X POST "$SONDE_URL/ingest" \
+           -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
     echo "已上报 Sonde"
   else
     echo "警告: Sonde 上报失败" >&2
@@ -385,14 +410,15 @@ finish() {
   sonde_report || true
 }
 trap finish EXIT
-trap 'REASON="被终止（超时或手动停止）"; exit 143' TERM INT
+trap 'REASON="被终止（超时或手动停止）"; QUICK=1; exit 143' TERM INT
 
 # cf 方法 URL [JSON] —— 调 Cloudflare API，结果放在全局变量 RESP；success 不为 true 就失败
 cf() {
-  local args=("${CURL_BASE[@]}" -X "$1" "$2"
-    -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json")
+  local args=("${CURL_BASE[@]}" -K - -X "$1" "$2" -H "Content-Type: application/json")
   [[ $# -ge 3 ]] && args+=(--data "$3")
-  RESP=$(curl "${args[@]}" 2>&1) || die "连不上 Cloudflare API：${RESP:0:200}"
+  # token 经标准输入交给 curl，不出现在命令行里
+  RESP=$(printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN" | curl "${args[@]}" 2>&1) \
+    || die "连不上 Cloudflare API：${RESP:0:200}"
   jq -e '.success' >/dev/null 2>&1 <<<"$RESP" \
     || die "Cloudflare API 返回错误：$(jq -c '.errors' <<<"$RESP" 2>/dev/null || echo "${RESP:0:200}")"
 }
@@ -406,8 +432,9 @@ is_peak() {
 }
 full_due() {
   local now last tt at
-  [[ -s "$WORK/pool.csv" ]] || return 0                 # 还没有榜单 → 先做一次全量
   now=$(date +%s); last=$(state_get LAST_FULL); last=${last:-0}
+  # 还没有榜单 → 先做全量；但上次全量失败了（比如直连不通）就隔 FULL_MIN_GAP 再试，免得每 5 分钟扫一遍几千个 IP
+  if [[ ! -s "$WORK/pool.csv" ]]; then (( now - last >= FULL_MIN_GAP * 60 )); return; fi
   for tt in $FULL_AT; do
     at=$(date -d "today $tt" +%s 2>/dev/null) || continue
     if (( at <= now && last < at )); then return 0; fi
@@ -452,7 +479,7 @@ cfst_tail() { tail -c 1500 cfst.log | tr '\r' '\n' | sed 's/\x1b\[[0-9;]*m//g' |
 # run_cfst 输出文件 cfst参数...  —— 后台跑 cfst，定时打进度，出错就退出
 run_cfst() {
   local out=$1; shift
-  rm -f "$out"
+  rm -f "$out"; t=0
   "$CFST_DIR/cfst" "$@" -o "$out" -p 0 >cfst.log 2>&1 &
   PID=$!
   while kill -0 "$PID" 2>/dev/null; do
@@ -855,7 +882,8 @@ select_and_update() {
     if (cs+0 >= ks * (1 + m/100)) { printf "switch 速度 %s → %s MB/s，快了 %.0f%%\n", ks, cs, (cs/ks - 1) * 100; exit }
     if (tol+0 > 0 && ks+0 >= best * (1 - tol/100) && cl+0 <= kl * (1 - m/100)) {
       printf "switch 速度相当（%s vs %s MB/s），延迟 %s → %s ms\n", ks, cs, kl, cl; exit }
-    printf "keep 第一名 %s MB/s，比当前 %s MB/s 只快 %.0f%%，未达切换门槛 %s%%\n", cs, ks, (cs/ks - 1) * 100, m
+    if (cs+0 < ks+0) printf "keep 第一名 %s MB/s 比当前 %s MB/s 慢，延迟 %s → %s ms 只低 %.0f%%，未达切换门槛 %s%%\n", cs, ks, kl, cl, (kl > 0 ? (1 - cl/kl) * 100 : 0), m
+    else printf "keep 第一名 %s MB/s，比当前 %s MB/s 只快 %.0f%%，未达切换门槛 %s%%\n", cs, ks, (cs/ks - 1) * 100, m
   }')
 
   if [[ "$action" == keep ]]; then load_row "${k:-$c}"; else load_row "$c"; fi
@@ -933,6 +961,21 @@ do_check() {
   NEXT=pool
 }
 
+# 复测时这轮暂时连不上、超出限制的旧榜单成员留在榜单里（下次复测再给机会），只有全量扫描才重建榜单。
+# 否则晚高峰丢包一阵，榜单就会越复测越少。通过了延迟筛选但没挤进前几名的照常淘汰，榜单不会无限变大
+keep_pool_members() {
+  local n
+  awk -F, 'FILENAME == ARGV[1] { s[$1] = 1; next } FILENAME == ARGV[2] { p[$1] = 1; next }
+    FNR > 1 && !($1 in s) && !($1 in p) { print }' latency.csv pool.csv pool.old > pool.keep
+  n=$(wc -l < pool.keep); cat pool.keep >> pool.csv
+  awk -F, 'FILENAME == ARGV[1] { s[$1] = 1; next } !($1 in s)' origin.map origin.old > origin.keep
+  cat origin.keep >> origin.map
+  rm -f pool.old origin.old pool.keep origin.keep
+  rm -f pool.old origin.old
+  (( n )) && echo "  榜单里 $n 个 IP 这轮没通过延迟筛选，暂时保留（全量扫描时重建榜单）"
+  return 0
+}
+
 # 复测榜单：重测上次留下的榜单（加上当前 IP 和本轮的新种子），选最好的
 do_pool() {
   [[ -s pool.csv ]] || { echo "还没有榜单"; NEXT=full; return; }
@@ -940,13 +983,15 @@ do_pool() {
   { tail -n +2 pool.csv | cut -d, -f1; cut -d, -f1 seeds.txt; if [[ -n "$OLD_IP" ]]; then echo "$OLD_IP"; fi; } \
     | awk 'NF && !seen[$0]++' > pool.txt
   echo "复测榜单: $(wc -l < pool.txt) 个 IP（榜单 + 种子 + 当前 IP）"
+  cp pool.csv pool.old; cp origin.map origin.old
   ping_list pool.txt
   if [[ $(rows latency.csv) -lt 1 ]]; then
-    echo "榜单里没有满足限制条件的 IP"; NEXT=full; return
+    rm -f pool.old origin.old; echo "榜单里没有满足限制条件的 IP"; NEXT=full; return
   fi
   pick_candidates "$PICK_PER_GROUP"
   add_current
   finish_candidates
+  keep_pool_members
   speed_test
   select_and_update
   if [[ -n "$NOGOOD" ]]; then echo "榜单里没有达标的 IP"; NEXT=full; fi
@@ -1045,7 +1090,7 @@ if [[ "$CFST_TARGET" != cloudflare ]]; then
 fi
 
 if [[ "$MODE" == auto ]]; then
-  if full_due; then MODE=full
+  if full_due; then MODE=full; state_set "LAST_FULL=$(date +%s)"   # 先记下，后面查 API 失败也算尝试过
   elif check_due; then MODE=check
   else KIND=skip; exit 0                                 # 还没到时间，安静退出
   fi
