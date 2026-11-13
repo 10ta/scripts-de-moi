@@ -42,11 +42,31 @@ It prints the latest and installed versions. If they differ it downloads, instal
 
 ## 🧭 Usage
 
+### Install or update sing-box-ut
+
+[sing-box-ut](https://github.com/10ta/sing-box-ut) is sing-box with split upload/download for VLESS + XHTTP. Add `ut` and upsing reads that repository instead; everything else works the same.
+
+```bash
+bash /tmp/upsing.sh ut
+```
+
+Its versions end in `-ut`, so switching between official and ut is just running the other command: the versions differ, so it installs.
+
+### Shortcut command
+
+```bash
+bash /tmp/upsing.sh link
+```
+
+This copies the script to `/usr/local/bin/upsing`. After that, `upsing` updates the official build and `upsing ut` updates sing-box-ut. After editing or updating `upsing.sh`, run `link` again to refresh the copy.
+
 ### Reinstall the same version
 
 ```bash
 FORCE=1 bash /tmp/upsing.sh
 ```
+
+Works with `ut` too: `FORCE=1 bash /tmp/upsing.sh ut`.
 
 ### Read the last run's log
 
@@ -57,6 +77,7 @@ cat /var/log/upsing.log
 ## 🚧 Limitations & Roadmap
 
 - The first release in the list may be an **alpha or beta** pre-release.
+- sing-box-ut publishes `.deb` files for `amd64` and `arm64` only; on `armv7`, `ut` fails at the download step.
 - Only the program is installed. Your config stays in `/etc/sing-box/config.json`; enabling the service is up to you.
 - Unauthenticated GitHub API calls are limited to 60 per hour per IP.
 - There is no checksum check beyond HTTPS from GitHub.

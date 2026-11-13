@@ -42,11 +42,31 @@ bash /tmp/upsing.sh
 
 ## 🧭 使用
 
+### 安装或更新 sing-box-ut
+
+[sing-box-ut](https://github.com/10ta/sing-box-ut) 是支持 VLESS + XHTTP 拆分上下行的 sing-box。加上 `ut`，upsing 就改读那个仓库，其余行为完全一样。
+
+```bash
+bash /tmp/upsing.sh ut
+```
+
+它的版本号以 `-ut` 结尾，所以官方版和 ut 版互相切换只要运行另一个命令：版本不同，就会安装。
+
+### 快捷命令
+
+```bash
+bash /tmp/upsing.sh link
+```
+
+把脚本复制到 `/usr/local/bin/upsing`。之后 `upsing` 更新官方版，`upsing ut` 更新 sing-box-ut。`upsing.sh` 有改动或更新后，重新运行一次 `link` 刷新这份副本。
+
 ### 重装同一个版本
 
 ```bash
 FORCE=1 bash /tmp/upsing.sh
 ```
+
+`ut` 也适用：`FORCE=1 bash /tmp/upsing.sh ut`。
 
 ### 看上一次运行的日志
 
@@ -57,6 +77,7 @@ cat /var/log/upsing.log
 ## 🚧 局限与路线
 
 - 列表里的第一个版本可能是 **alpha 或 beta** 预发布版。
+- sing-box-ut 只发布 `amd64` 和 `arm64` 的 `.deb`；在 `armv7` 上 `ut` 会在下载步骤失败。
 - 只安装程序。配置仍在 `/etc/sing-box/config.json`，服务由你自己启用。
 - 未登录的 GitHub API 每个 IP 每小时限 60 次。
 - 除了从 GitHub 走 HTTPS 下载，没有额外的校验和检查。

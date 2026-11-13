@@ -2,12 +2,13 @@
 # upsing —— 从 GitHub Release 安装 / 更新 sing-box 的官方 .deb 包
 #
 #   bash upsing.sh           安装 Release 列表里的第一个版本（可能是 alpha / beta 预发布版）；已是这个版本就什么都不做
-#   FORCE=1 bash upsing.sh   版本相同也重新安装
+#   bash upsing.sh ut        同上，但装 10ta/sing-box-ut（带 XHTTP 拆分上下行的版本，仅 amd64 / arm64）
+#   bash upsing.sh link      把本脚本装成快捷命令 upsing：以后直接 upsing / upsing ut
+#   FORCE=1 bash upsing.sh   版本相同也重新安装（可与 ut 一起用）
 #
 # 只装程序、不改配置。装了新版本才会重启 sing-box（所有连接会断开一下）。日志：/var/log/upsing.log
 set -uo pipefail
 
-REPO="SagerNet/sing-box"
 LOG="/var/log/upsing.log"
 FORCE="${FORCE:-0}"
 
@@ -15,6 +16,16 @@ log() { echo "$*" | tee -a "$LOG"; }
 fail() { log "[错误] $*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || { echo "[错误] 请用 root 运行"; exit 1; }
+
+# 官方版和 ut 版只差仓库；ut 的 tag、.deb、sing-box version 都带 -ut 后缀，下面的版本比较照常工作
+case "${1:-}" in
+    "")   REPO="SagerNet/sing-box" ;;
+    ut)   REPO="10ta/sing-box-ut" ;;
+    link) install -m 755 "${BASH_SOURCE[0]:-}" /usr/local/bin/upsing 2>/dev/null \
+              || { echo "[错误] 要先把脚本下载成文件再 link（不能是管道运行）"; exit 1; }
+          echo "已安装快捷命令 upsing：官方版 upsing，ut 版 upsing ut（脚本有更新时重新 link 一次）"; exit 0 ;;
+    *)    echo "用法: upsing.sh [ut|link]"; exit 1 ;;
+esac
 
 # 自动探测架构，映射到 sing-box release 文件命名规则
 case "$(uname -m)" in
@@ -29,7 +40,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 : > "$LOG"
 log "===== $(date '+%Y-%m-%d %H:%M:%S') 开始执行 ====="
-log "架构: $(uname -m) -> ${ARCH}"
+log "架构: $(uname -m) -> ${ARCH}，来源: ${REPO}"
 
 log "[1/4] 请求 GitHub releases 列表..."
 HTTP_CODE=$(curl -sSL -m 30 -o "$WORK/releases.json" -w "%{http_code}" "https://api.github.com/repos/${REPO}/releases?per_page=5") || HTTP_CODE=000
