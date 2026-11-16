@@ -24,7 +24,7 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 ## Repository map
 
 - `traffic-bot/bot.py` — the whole bot. One `get_<provider>_data()` per source returns a `Section`; `PROVIDERS` lists them; `collect_sections()` runs them in threads with `PROVIDER_TIMEOUT_SEC`; `evaluate_alerts()` dedups alerts; `sonde_report()` builds the panel payload. The env template lives inside `traffic-bot/install.sh` (`write_env`, `ensure_line`).
-- `CDT-Management/cdt_guard.py` — `check()` is the fuse logic; `rpc()` signs Aliyun RPC calls; `sonde_due()` throttles Sonde. `init.sh` installs and configures.
+- `CDT-Management/cdt_guard.py` — `check()` is the fuse logic; `rpc()` signs Aliyun RPC calls; `get_komari()` / `komari_track()` read and accumulate Komari's monthly upload; `apply_request()` takes traffic-bot's `/cdt hold|release`; `sonde_due()` throttles Sonde. `init.sh` installs and configures (`init.sh komari` for Komari only).
 - `cfst-ddns/cfst-ddns.sh` — `do_check` / `do_pool` / `do_full` are the three levels; `select_and_update` decides and writes DNS; `notify` / `sonde_report` format output.
 - `warp-keeper/warp-keeper.sh` — `cmd_check` is the self-healing ladder; `build_fragment` writes the sing-box JSON.
 - `brutal-cn.sh` — config constants at the top; embedded Python (`PY_HELPER`) builds the add/delete plan.
@@ -43,6 +43,8 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 
 - **No IPs, domains or URLs in Telegram or Sonde output.** Each tool has its own scrub (`scrub()` in bot.py and the shell tools, `_redact()` in cdt_guard.py); keep the IPv4, IPv6, URL and domain patterns in sync. Only exception: warp-keeper shows the WARP exit IP in Telegram (not in Sonde).
 - **cdt-guard is fail-safe.** A failed query means no action; a reading is never treated as 0 on error; the traffic fuse lifts only when `bill_cycle()` differs from `lock_cycle` **and** usage < release; stop/start/security-group calls use `ecs_once()` (no retry).
+- **cdt-guard usage = max(CDT, Komari).** CDT's API lags by hours, so Komari may only raise the reading: a Komari failure falls back to CDT and must never release a fuse or start the instance. Komari is accumulated from deltas (`komari_track`), never trusted as an absolute monthly value after the first reading.
+- **Keep-alive waits `KEEPALIVE_GRACE_MIN` after a stop it did not cause** (warns once), except right after a fuse lifts. traffic-bot may only write the hold/release request file; it never gets an Aliyun key or stop/start power.
 - **cdt-guard must finish within `TimeoutStartSec=300`**: two queries ≈ 65 s each worst case, bill query skipped past `QUERY_BUDGET`.
 - **traffic-bot never calls paid AWS APIs**: CloudWatch `GetMetricStatistics` / `ListMetrics` only — never `GetMetricData` or Cost Explorer.
 - **CPU P90 metrics use `notify=False`**: they fluctuate around the limit; only 24 h breaches and killed calls alert.

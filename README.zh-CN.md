@@ -114,6 +114,8 @@ bash cfst-ddns/tests/run.sh
 
 | 事项 | 值 | 状态 |
 |---|---|---|
+| Komari `totalUp` | agent 报的本月上行计数；Komari 自己的流量告警就拿它和节点限额比 | 读 Komari 1.5.0 源码确认（`utils/notifier/traffic.go`、`/api/recent/:uuid`）。节点要开月度统计；cdt-guard 按增量累计，不受轮换时间影响 |
+| CDT 接口滞后 | 落后 Komari 约 70 GB，当时约 16 GB/h（≥ 4 小时） | 仓库主人实测，2026-11-16 |
 | Sonde 存储后端 | Cloudflare D1 | 仓库主人确认，2026-11-01。Sonde 的代码在 [10ta/Sonde](https://github.com/10ta/Sonde)，不在这里 |
 | Sonde 上报量 | 约 320 次/天：traffic-bot ≈ 156、cdt-guard ≈ 96、cfst-ddns ≈ 40、warp-keeper 每台 24 | 按调度估算；D1 免费额度是每天写 10 万行，余量取决于每次上报写几行——未核实 |
 | Sonde 离线判断 | 每次上报都带 `interval`（cdt-guard 现在是 900 秒） | 假定 Sonde 用它判断来源是否过期——到 Sonde 仓库确认 |

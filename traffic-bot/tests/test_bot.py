@@ -93,6 +93,42 @@ class CacheTest(unittest.TestCase):
         fn.assert_called_once()
 
 
+class AliyunCdtTest(unittest.TestCase):
+    def setUp(self):
+        import json, tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "state.json")
+        self.req = os.path.join(self.tmp.name, "cdt-request.json")
+        self.json = json
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_shows_realtime_vs_cdt(self):
+        st = {"used_gb": 211.0, "cdt_gb": 140.5, "komari_gb": 211.0, "quota_gb": 200, "limit_gb": 199,
+              "cls": "international", "mode": "stop", "locked": True, "status": "Stopped", "name": "hk",
+              "updated": time.time()}
+        with open(self.state, "w") as f:
+            self.json.dump(st, f)
+        with mock.patch.object(bot, "CDT_STATE_PATH", self.state):
+            text = bot.get_aliyun_data().text
+        self.assertIn("Komari", text)
+        self.assertIn("滞后", text)
+        self.assertIn("流量熔断", text)
+
+    def test_hold_command_writes_request(self):
+        upd = mock.MagicMock()
+        upd.effective_chat.id = 1
+        upd.message.reply_text = mock.AsyncMock()
+        ctx = mock.MagicMock(args=["hold"])
+        with mock.patch.object(bot, "CDT_REQUEST_PATH", self.req), mock.patch.object(bot, "ALLOWED_CHAT_IDS", {1}):
+            asyncio.run(bot.aliyun_command(upd, ctx))
+        with open(self.req) as f:
+            req = self.json.load(f)
+        self.assertTrue(req["hold"])
+        self.assertGreater(req["ts"], 0)
+
+
 class SondeTest(unittest.TestCase):
     def test_payload_is_scrubbed_and_has_no_html(self):
         sec = bot.Section("<b>X</b> 1.2.3.4", [bot.Metric("k", "K", 50, "p", "5 / 10", limit=10, unit="GB")],

@@ -114,6 +114,8 @@ Facts the code depends on but cannot show. Update this table when one is confirm
 
 | Item | Value | Status |
 |---|---|---|
+| Komari `totalUp` | The agent's monthly upload counter; Komari's own traffic alerts compare it with the node limit | Read from Komari 1.5.0 source (`utils/notifier/traffic.go`, `/api/recent/:uuid`). Needs monthly accounting on the node; cdt-guard accumulates deltas so rotation time does not matter |
+| CDT API lag | ≈ 70 GB behind Komari at ≈ 16 GB/h (≥ 4 h) | Observed by owner, 2026-11-16 |
 | Sonde storage backend | Cloudflare D1 | Confirmed by owner, 2026-11-01. Sonde code lives in [10ta/Sonde](https://github.com/10ta/Sonde), not here |
 | Sonde ingest volume | ≈ 320 reports/day: traffic-bot ≈ 156, cdt-guard ≈ 96, cfst-ddns ≈ 40, warp-keeper 24 per host | Estimated from schedules; D1 free tier is 100k rows written/day, so writes per report decide the headroom — unverified |
 | Sonde offline detection | Each report sends `interval` (cdt-guard now 900 s) | Assumed Sonde uses it to mark a source stale — check in the Sonde repo |

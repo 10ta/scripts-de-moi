@@ -41,9 +41,10 @@ hk-cdt · Running · 203.0.113.10
 ## ✨ 亮点
 
 - **流量熔断**：默认 199 GB 时关机（或加一条 drop-all 安全组规则）。
-- **提前熔断**：按近 90 分钟的速率往后推 30 分钟，弥补 CDT 数据的延迟。
+- **实时流量（Komari）**：CDT 接口的数据会滞后好几个小时（曾经落后约 70 GB）；配上 Komari 后，按 CDT 和实例 agent 报的本月上行两者的大值熔断。
+- **提前熔断**：按当前速率往后推 30 分钟（有 Komari 用近 1 小时，只有 CDT 用近 90 分钟）。
 - **费用熔断**：本月账单到 `COST_LIMIT`（默认 5 USD）就关机，不管熔断方式是什么。
-- **保活**：抢占回收、误关之后自动开机；新的一个月自动解除熔断。
+- **保活**：抢占回收、误关之后自动开机，开机前留 10 分钟宽限，让你能在 Telegram 发 `/cdt hold`；新的一个月自动解除熔断。
 - **出错不乱动**：查询阿里云失败时什么都不做；月中读数突然变低也不会解除熔断。
 - **通知**：每个动作都推 Telegram；可选 [Sonde](https://github.com/10ta/Sonde) 面板；[traffic-bot](../traffic-bot/) 不用阿里云 AK 也能显示。
 - **零依赖**：只用 Python 标准库加一个 systemd timer。
@@ -57,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Manage
 bash /tmp/cdt-init.sh
 ```
 
-脚本会问 AccessKey 和地域并当场验证，列出实例让你选，再问熔断线、熔断方式和 Telegram 设置。最后打印一份和上面一样的用量报告，此时定时器已经在每 5 分钟运行一次。
+脚本会问 AccessKey 和地域并当场验证，列出实例让你选，再问熔断线、熔断方式、Telegram 设置和 Komari 面板（可选，推荐）。最后打印一份和上面一样的用量报告，此时定时器已经在每 5 分钟运行一次。
 
 ## 📦 安装
 
@@ -104,7 +105,15 @@ python3 /opt/cdt-guard/cdt_guard.py hold
 python3 /opt/cdt-guard/cdt_guard.py release
 ```
 
-不先 `hold` 的话，手动关掉的实例最多 10 分钟后会被开回来。
+也可以给 traffic-bot 发 `/cdt hold` / `/cdt release`，守护程序下一轮检查（≤ 5 分钟）生效。关机前先发 `hold`。没发的话，不是守护程序造成的停机会先推一条 Telegram 提醒，过 `KEEPALIVE_GRACE_MIN`（10）分钟再开机。
+
+### 用 Komari 的实时流量
+
+```bash
+bash init.sh komari
+```
+
+问面板地址（带子路径）和 API 密钥（节点隐藏时才要），列出节点让你选，再把 Komari 和 CDT 的读数并排打印出来。这个节点要开着月度流量统计（面板上显示「RESET 1ST」）。
 
 ### 月中放行
 
@@ -135,6 +144,11 @@ python3 /opt/cdt-guard/cdt_guard.py unlock
 | `STOP_MODE` | ❌ | `KeepCharging` | 仅按量付费；`StopCharging` 会释放公网 IP |
 | `SG_ID` | ❌ | 第一个安全组 | `sg` 模式用的安全组 |
 | `GUARD_KEEPALIVE` | ❌ | `1` | 发现停机就开机 |
+| `KEEPALIVE_GRACE_MIN` | ❌ | `10` | 不明原因的停机等这么多分钟再开机；`0` = 立刻 |
+| `GUARD_REQUEST_FILE` | ❌ | `/var/lib/traffic-bot/cdt-request.json` | traffic-bot 写 `/cdt hold` / `/cdt release` 的位置 |
+| `KOMARI_URL` | ❌ | — | Komari 面板地址，带子路径；留空 = 只用 CDT |
+| `KOMARI_UUID` | ❌ | — | 这台实例在 Komari 里的节点（`bash init.sh komari` 帮你选） |
+| `KOMARI_API_KEY` | ❌ | — | 节点设为隐藏时才需要 |
 | `COST_LIMIT` | ❌ | `5` | 费用熔断线，国际站 USD / 中国站 CNY；`0` = 关闭 |
 | `COST_WARN_PCT` | ❌ | `50` | 到 `COST_LIMIT` 的这个百分比时提醒一次 |
 | `COST_CHECK_MIN` | ❌ | `30` | 多少分钟查一次账单 |
@@ -181,6 +195,7 @@ bash init.sh uninstall
 flowchart LR
   T[cdt-guard.timer<br/>every 5 min] --> C[cdt_guard.py check]
   C -->|CDT + ECS + bill| A[(Aliyun API)]
+  C -->|monthly upload| K[(Komari)]
   C -->|over the line| S[Stop instance /<br/>drop-all rule]
   C -->|stopped, not fused| R[Start instance]
   C --> F[state.json]
@@ -190,6 +205,7 @@ flowchart LR
 
 - **装在另一台机器上** → 实例关机后没法自己开机。
 - **API 出错就不动作** → 查询失败绝不当成 0 GB；连续失败 3 次推一次告警。
+- **用量 = max(CDT, Komari)** → Komari 只会把读数往上抬：Komari 挂了就退回 CDT，绝不会因此解除熔断或开机。Komari 的计数按增量累计，所以 agent 在几点轮换月度计数都不影响。
 - **只在新的月份解除熔断** → 月中读数突然为空或变低（接口故障、数据补算）时保持熔断。
 - **会改状态的操作只发一次** → 关机或开机超时不重发，下一轮按实际状态处理。
 - **时间预算** → 流量和实例查询超过 60 秒时，这一轮跳过账单查询，保证在 systemd 的 300 秒超时前跑完。
@@ -208,7 +224,7 @@ flowchart LR
 python3 -m unittest discover CDT-Management/tests
 ```
 
-测试通过 `ALI_ENDPOINT_OVERRIDE` 起一个假的阿里云 API，不需要账号。覆盖熔断、换月、单次动作、失败计数和 Sonde 心跳。
+测试通过 `ALI_ENDPOINT_OVERRIDE` 起一个假的阿里云 API，不需要账号。覆盖熔断、换月、单次动作、失败计数、Sonde 心跳、Komari 读数（同一个假服务器响应 GET 请求充当 Komari）、保活宽限和 Telegram 暂停请求。
 
 ## 📚 文档地图
 

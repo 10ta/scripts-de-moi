@@ -76,7 +76,7 @@ Each provider needs a read-only credential. Step-by-step setup for every console
 
 ### Aliyun CDT
 
-No bot config and no Aliyun key: install [CDT-Management](../CDT-Management/) on the same machine and the bot reads `/var/lib/cdt-guard/state.json`.
+No bot config and no Aliyun key: install [CDT-Management](../CDT-Management/) on the same machine and the bot reads `/var/lib/cdt-guard/state.json`. `/cdt hold` and `/cdt release` write `cdt-request.json` in the bot's state directory, which cdt-guard reads. The bot can only ask to pause or resume auto-start, never stop or start the instance.
 
 ## 🧭 Usage
 
@@ -90,7 +90,8 @@ Only chats in `ALLOWED_CHAT_IDS` can use the bot; others are ignored and logged.
 | `/cloudflare` | Cloudflare only |
 | `/bill`, `/awsbill` | AWS bill only (skips the bill cache) |
 | `/oracle`, `/oci` | Oracle Cloud only |
-| `/aliyun`, `/cdt` | Aliyun CDT only |
+| `/aliyun`, `/cdt` | Aliyun CDT only (real-time Komari reading next to CDT's when cdt-guard has Komari) |
+| `/cdt hold`, `/cdt release` | Pause / resume cdt-guard's auto-start; send `hold` before stopping the instance by hand. Applied on the guard's next check (≤ 5 min) |
 | `/help` | Command list |
 
 Alerts: every `ALERT_CHECK_MINUTES` the bot checks all quotas; the first time one crosses a step in `ALERT_THRESHOLDS`, it pushes "🚨 用量告警". The record resets when the period (day or month) changes.

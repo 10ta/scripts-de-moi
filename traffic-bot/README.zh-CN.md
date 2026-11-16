@@ -76,7 +76,7 @@ bash install.sh
 
 ### 阿里云 CDT
 
-bot 不需要任何配置，也不需要阿里云 AK：在同一台机器上装 [CDT-Management](../CDT-Management/)，bot 会读 `/var/lib/cdt-guard/state.json`。
+bot 不需要任何配置，也不需要阿里云 AK：在同一台机器上装 [CDT-Management](../CDT-Management/)，bot 会读 `/var/lib/cdt-guard/state.json`。`/cdt hold`、`/cdt release` 往 bot 的状态目录写 `cdt-request.json`，由 cdt-guard 读取。bot 只能请求暂停 / 恢复自动开机，不能开关机。
 
 ## 🧭 使用
 
@@ -90,7 +90,8 @@ bot 不需要任何配置，也不需要阿里云 AK：在同一台机器上装 
 | `/cloudflare` | 只查 Cloudflare |
 | `/bill`、`/awsbill` | 只查 AWS 账单（跳过账单缓存） |
 | `/oracle`、`/oci` | 只查 Oracle Cloud |
-| `/aliyun`、`/cdt` | 只查阿里云 CDT |
+| `/aliyun`、`/cdt` | 只查阿里云 CDT（cdt-guard 配了 Komari 时，实时读数和 CDT 并排显示） |
+| `/cdt hold`、`/cdt release` | 暂停 / 恢复 cdt-guard 自动开机；手动关机前先发 `hold`。守护程序下一轮检查（≤ 5 分钟）生效 |
 | `/help` | 命令列表 |
 
 告警：每 `ALERT_CHECK_MINUTES` 分钟检查一次全部额度；某项第一次越过 `ALERT_THRESHOLDS` 里的一档时，推送「🚨 用量告警」。周期（天 / 月）切换后记录自动清零。

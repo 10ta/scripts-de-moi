@@ -5,10 +5,11 @@ cdt-guard — 阿里云 CDT 流量熔断 + ECS 保活。零依赖（只用 Pytho
 
   cdt_guard.py check     # systemd timer 每 5 分钟跑一次：查流量 → 熔断/恢复/保活 → 写快照
   cdt_guard.py report    # 立即查一次 API，打印报告（--json 输出 JSON）
-  cdt_guard.py hold      # 暂停自动开机（手动关机维护时用）
-  cdt_guard.py release   # 取消暂停
+  cdt_guard.py hold      # 暂停自动开机（手动关机维护时用；Telegram 里发 /cdt hold 也行）
+  cdt_guard.py release   # 取消暂停（/cdt release）
   cdt_guard.py list      # 列出 ALI_REGION 下的实例（验证 AK、找实例 ID）
   cdt_guard.py unlock    # 手动解除熔断（sg 模式会删掉 drop 规则）
+  cdt_guard.py komari    # 测试 Komari：没配 KOMARI_UUID 时列出节点，配了就打印本月上行
 
 配置：/etc/cdt-guard.env（或 CDT_GUARD_ENV 指定），见 cdt-guard.env.example
 状态：$STATE_DIR/state.json —— traffic-bot 只读这个文件，不需要 AK。
@@ -45,7 +46,7 @@ def load_env(path):
                 k, v = line.split("=", 1)
                 v = v.split(" #", 1)[0]  # 允许行尾注释
                 env[k.strip()] = v.strip().strip('"').strip("'")
-    env.update({k: v for k, v in os.environ.items() if k in env or k.startswith(("ALI_", "CDT_", "TG_", "GUARD_", "STOP_", "SG_", "STATE_", "COST_"))})
+    env.update({k: v for k, v in os.environ.items() if k in env or k.startswith(("ALI_", "CDT_", "TG_", "GUARD_", "STOP_", "SG_", "STATE_", "COST_", "KOMARI_", "KEEPALIVE_"))})
     return env
 
 
@@ -69,6 +70,14 @@ class Config:
         self.stop_mode = env.get("STOP_MODE", "KeepCharging")  # KeepCharging | StopCharging
         self.sg_id = env.get("SG_ID", "")
         self.keepalive = env.get("GUARD_KEEPALIVE", "1") == "1"
+        # 发现不明原因的停机，等这么多分钟再开机，给手动关机的人留时间发 /cdt hold（0 = 立刻开机）
+        self.grace = float(env.get("KEEPALIVE_GRACE_MIN", 10))
+        # traffic-bot 收到 /cdt hold|release 后写这个文件（bot 没有 AK，只能请求暂停/恢复自动开机）
+        self.request_file = env.get("GUARD_REQUEST_FILE", "/var/lib/traffic-bot/cdt-request.json")
+        # Komari：实例上 agent 报的本月上行，实时；CDT 接口的数据会滞后好几个小时
+        self.komari_url = env.get("KOMARI_URL", "").rstrip("/")
+        self.komari_uuid = env.get("KOMARI_UUID", "")
+        self.komari_key = env.get("KOMARI_API_KEY", "")  # 节点设为隐藏时需要（Komari 后台 → 设置 → API 密钥）
         self.tg_token = env.get("TG_BOT_TOKEN", "")
         self.tg_chat = env.get("TG_CHAT_ID", "")
         self.state_dir = env.get("STATE_DIR", "/var/lib/cdt-guard")
@@ -180,6 +189,76 @@ def get_instance(cfg):
     }
 
 
+# ───────────────────────── Komari（实时流量）─────────────────────────
+KOMARI_FRESH = 900  # 秒：Komari 最新上报在这个时间内才算「实时」
+
+
+def _parse_ts(s):
+    """RFC3339（Komari 的 updated_at，可能带纳秒和时区）→ 时间戳；解析不了返回 None"""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)?$", str(s or ""))
+    if not m:
+        return None
+    tz = m.group(2) or "Z"
+    off = 0 if tz == "Z" else (1 if tz[0] == "+" else -1) * (int(tz[1:3]) * 60 + int(tz[4:6]))
+    return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone(timedelta(minutes=off))).timestamp()
+
+
+def komari_get(cfg, path):
+    headers = {"User-Agent": "cdt-guard"}
+    if cfg.komari_key:
+        headers["Authorization"] = f"Bearer {cfg.komari_key}"
+    req = urllib.request.Request(cfg.komari_url + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read())
+    if data.get("status") != "success":
+        raise ValueError(f"Komari 返回 {data.get('status')}: {data.get('message', '')}")
+    return data.get("data")
+
+
+def get_komari(cfg):
+    """返回 (agent 报的 totalUp GiB, 上报时间)；节点最近没有上报（离线 / 关机）返回 None。出错直接抛出"""
+    best = None
+    for r in komari_get(cfg, "/api/recent/" + urllib.parse.quote(cfg.komari_uuid)) or []:
+        up = (r.get("network") or {}).get("totalUp")
+        if isinstance(up, (int, float)) and not isinstance(up, bool):
+            best = (float(up) / GIB, _parse_ts(r.get("updated_at")) or time.time())
+    return best
+
+
+def komari_track(st, raw, cycle, bound=None):
+    """把 agent 的计数换算成「本账单月上行」，存在 st["komari"]。只累计增量，所以不依赖 agent 在几点轮换月度计数：
+    - 计数变小（agent 重启 / 月度轮换）：之后的读数从 0 起算，已经累计的不丢
+    - 新的账单月：从 0 开始；如果 agent 已经轮换过（读数比上次小），读数本身就是本月的
+    - 第一次接入：直接用读数（agent 的 totalUp 是本月上行），但不超过从月初到现在带宽能跑出的上限 bound"""
+    k = st.get("komari") or {}
+    if k.get("cycle") != cycle:
+        if not k:
+            gb = min(raw, bound) if bound is not None else raw
+        else:
+            gb = raw if raw < k.get("raw", 0) else 0.0
+        k = {"cycle": cycle, "gb": gb}
+    else:
+        d = raw - k.get("raw", 0)
+        k["gb"] += d if d >= 0 else raw
+    k["raw"] = raw
+    st["komari"] = k
+    return k["gb"]
+
+
+def apply_request(cfg, st):
+    """traffic-bot 写的 /cdt hold|release 请求：比上一次 hold/release 新才生效。返回要推送的消息，没有新请求返回 None"""
+    try:
+        with open(cfg.request_file, encoding="utf-8") as f:
+            req = json.load(f)
+        hold, ts = bool(req["hold"]), float(req["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if ts <= st.get("hold_ts", 0):
+        return None
+    st["hold"], st["hold_ts"] = hold, ts
+    return "⏸ 已按 Telegram 请求暂停自动开机" if hold else "▶️ 已按 Telegram 请求恢复自动开机"
+
+
 # ───────────────────────── 动作 ─────────────────────────
 def stop_instance(cfg, inst):
     p = {"InstanceId": cfg.instance, "ForceStop": "false"}
@@ -286,7 +365,8 @@ def sonde_due(cfg, st, now):
     if not (cfg.sonde_url and cfg.sonde_token):
         return False
     fp = "|".join(str(x) for x in (st.get("status"), st.get("locked"), st.get("cost_locked"), st.get("hold"),
-                                    bool(st.get("fail")), bool(st.get("cost_error")), bool(st.get("start_fail"))))
+                                    bool(st.get("fail")), bool(st.get("cost_error")), bool(st.get("start_fail")),
+                                    st.get("komari_fail", 0) >= 3))
     if fp == st.get("sonde_fp") and now - st.get("sonde_ts", 0) < SONDE_HEARTBEAT - 30:
         return False
     st["sonde_fp"], st["sonde_ts"] = fp, now
@@ -300,11 +380,13 @@ def sonde_report(cfg, st):
     scrub = lambda t: _redact(str(t))[:160]
     cycle_ok = st.get("cost_cycle") == bill_cycle(time.time())
     data = {k: st.get(k) for k in ("name", "status", "cls", "mode", "region", "used_gb", "quota_gb", "limit_gb",
-                                   "rate_gbh", "locked", "cost_locked", "hold", "cost_limit", "currency", "fail")}
+                                   "rate_gbh", "locked", "cost_locked", "hold", "cost_limit", "currency", "fail",
+                                   "cdt_gb", "komari_gb", "komari_fresh")}
     data["by_region"] = st.get("by_region") or {}
     data["cost"] = st.get("cost", 0.0) if cycle_ok else 0.0
     data["cost_error"] = scrub(st["cost_error"]) if st.get("cost_error") else ""
     data["last_error"] = scrub(st["last_error"]) if st.get("last_error") else ""
+    data["komari_error"] = scrub(st["komari_error"]) if st.get("komari_fail", 0) >= 3 else ""
     series = {k: float(data[k]) for k in ("used_gb", "rate_gbh", "cost") if isinstance(data.get(k), (int, float))}
     body = json.dumps({"source": "cdt-guard", "ts": int(time.time()), "interval": SONDE_HEARTBEAT,
                        "data": data, "series": series}).encode()
@@ -317,17 +399,17 @@ def sonde_report(cfg, st):
         print(f"[sonde] 上报失败: {type(e).__name__}: {getattr(e, 'code', '')}", file=sys.stderr)
 
 
-def rate_per_hour(samples, now, bw_mbps=0):
-    """近 90 分钟窗口的平均速率（GiB/h）。
-    窗口不足 40 分钟不算（CDT 数据是成批补上来的，短窗口会把一次补数算成超高速率误熔断）；
-    并且不超过实例出网带宽的物理上限。"""
-    window = [s for s in samples if now - s[0] <= 5400]
-    if len(window) < 2 or window[-1][0] - window[0][0] < 2400:
+def rate_per_hour(samples, now, bw_mbps=0, span=5400, min_span=2400):
+    """近 span 秒窗口的平均速率（GiB/h），不超过实例出网带宽的物理上限。
+    CDT 默认窗口 90 分钟、不足 40 分钟不算（CDT 数据是成批补上来的，短窗口会把一次补数算成超高速率误熔断）；
+    Komari 是实时数据，用 60 / 10 分钟。"""
+    window = [s for s in samples if now - s[0] <= span]
+    if len(window) < 2 or window[-1][0] - window[0][0] < min_span:
         return 0.0
     (t0, g0), (t1, g1) = window[0], window[-1]
     rate = max(0.0, (g1 - g0) / ((t1 - t0) / 3600))
     if bw_mbps:
-        rate = min(rate, bw_mbps * 3600 / 8 / 1024)
+        rate = min(rate, bw_mbps * 1e6 / 8 * 3600 / GIB)
     return rate
 
 
@@ -350,6 +432,9 @@ def check(cfg):
     st = load_state(cfg)
     now = time.time()
     tag = f"[CDT {st.get('name') or 'ECS'}]"  # 用实例名称区分，不用实例 ID
+    msg = apply_request(cfg, st)  # 查询失败也照样生效：hold 只会减少动作
+    if msg:
+        notify(cfg, f"{msg} {tag}")
 
     try:
         used, by_region = get_traffic(cfg)
@@ -373,6 +458,29 @@ def check(cfg):
 
     events = []
     cycle = bill_cycle(now)
+    bw = float(inst.get("bw_out") or 0)
+
+    # ── Komari 实时流量：和 CDT 取大值。读不到时只剩 CDT（滞后），不会因此放行或开机
+    cdt_used, k_gb, k_fresh = used, None, False
+    if cfg.komari_url and cfg.komari_uuid:
+        try:
+            got = get_komari(cfg)
+            if st.pop("komari_fail", 0) >= 3:
+                events.append(f"✅ {tag} Komari 恢复，实时流量重新生效")
+            st.pop("komari_error", None)
+            if got:
+                start = datetime.strptime(cycle, "%Y-%m").replace(tzinfo=CN_TZ).timestamp()
+                komari_track(st, got[0], cycle, bw * 1e6 / 8 * (now - start) / GIB if bw else None)
+                st["komari"]["ts"] = got[1]
+        except Exception as e:
+            st["komari_fail"] = st.get("komari_fail", 0) + 1
+            st["komari_error"] = str(e)[:200]
+            if st["komari_fail"] == 3:
+                events.append(f"⚠️ {tag} 连续 3 次读不到 Komari，实时流量失效，熔断只能靠滞后的 CDT 数据：{e}")
+        k = st.get("komari") or {}
+        if k.get("cycle") == cycle:
+            k_gb, k_fresh = k["gb"], now - k.get("ts", 0) <= KOMARI_FRESH
+    used = max(cdt_used, k_gb or 0.0)
 
     # ── 费用：每 COST_CHECK_MIN 分钟查一次账单（账单本身是小时级的，查太勤没意义）
     # 前面的查询已经很慢（接口卡顿）时，这一轮先不查账单，把时间留给熔断动作，免得整轮超过 systemd 的超时被杀掉
@@ -394,10 +502,17 @@ def check(cfg):
     cur = st.get("currency", "USD")
 
     # 速率 & 预测（CDT 数据本身有延迟，用速率往前看 LOOKAHEAD 分钟）
-    samples = [s for s in st.get("samples", []) if now - s[0] <= 7200 and s[1] <= used + 0.001]
-    samples.append([now, round(used, 4)])
-    rate = rate_per_hour(samples, now, float(inst.get("bw_out") or 0))
+    samples = [s for s in st.get("samples", []) if now - s[0] <= 7200 and s[1] <= cdt_used + 0.001]
+    samples.append([now, round(cdt_used, 4)])
+    rate = rate_per_hour(samples, now, bw)
+    if k_fresh:  # 有实时数据就用实时速率
+        ks = [s for s in st.get("ksamples", []) if now - s[0] <= 3600 and s[1] <= k_gb + 0.001]
+        ks.append([now, round(k_gb, 4)])
+        st["ksamples"] = ks[-15:]
+        rate = rate_per_hour(ks, now, bw, span=3600, min_span=600)
     projected = used + rate * cfg.lookahead / 60
+    src = f"Komari 实时 {used:.2f} GB（CDT 还显示 {cdt_used:.2f} GB）" if k_gb is not None and k_gb > cdt_used \
+        else f"{used:.2f} GB"
     locked = st.get("locked", False)
     cost_locked = st.get("cost_lock") == cycle  # 费用熔断只在本账单月有效，换月自动失效
     status = inst["status"]
@@ -447,7 +562,7 @@ def check(cfg):
                 elif cfg.mode == "sg" and sg_lock(cfg, inst):
                     events.append(f"🛑 {tag} 熔断规则丢失，已重新加上")
         elif used >= cfg.limit or projected >= cfg.limit:
-            why = f"{used:.2f} GB" + (f"，按 {rate:.1f} GB/h 预计 {cfg.lookahead:.0f} 分钟内到 {projected:.1f}" if used < cfg.limit else "")
+            why = src + (f"，按 {rate:.1f} GB/h 预计 {cfg.lookahead:.0f} 分钟内到 {projected:.1f}" if used < cfg.limit else "")
             if cfg.mode == "stop":
                 if status == "Running" and not cost_locked:
                     stop_instance(cfg, inst)
@@ -459,9 +574,19 @@ def check(cfg):
             st["lock_cycle"] = cycle
 
         # ── 保活 / 解除熔断后开机（sg 模式流量熔断期间也照样保活，反正规则挡着）
+        # 不明原因的停机先等 KEEPALIVE_GRACE_MIN 分钟：手动关机的人有时间发 /cdt hold；解除熔断后的开机不等
         may_run = not cost_locked and (not locked or cfg.mode == "sg")
+        if status != "Stopped":
+            st.pop("stopped_seen", None)
+            st.pop("grace_told", None)
         if (cfg.keepalive or just_unlocked) and status == "Stopped" and not st.get("hold") and may_run:
-            if just_unlocked or now - st.get("last_start", 0) > 600:  # 10 分钟冷却，防止库存不足时狂刷
+            seen = st.setdefault("stopped_seen", now)
+            if not just_unlocked and now - seen < cfg.grace * 60:
+                if not st.get("grace_told"):
+                    st["grace_told"] = True
+                    events.append(f"⏳ {tag} 检测到实例停机，{cfg.grace:g} 分钟后自动开机。\n"
+                                  f"如果是你手动关的：在 Telegram 发 /cdt hold（或运行 cdt_guard.py hold）")
+            elif just_unlocked or now - st.get("last_start", 0) > 600:  # 10 分钟冷却，防止库存不足时狂刷
                 st["last_start"] = now
                 try:
                     start_instance(cfg)
@@ -480,6 +605,7 @@ def check(cfg):
     st.update({
         "locked": locked, "samples": samples[-30:], "updated": now,
         "used_gb": round(used, 3), "by_region": {k: round(v, 3) for k, v in by_region.items()},
+        "cdt_gb": round(cdt_used, 3), "komari_gb": None if k_gb is None else round(k_gb, 3), "komari_fresh": k_fresh,
         "rate_gbh": round(rate, 3), "quota_gb": cfg.quota, "limit_gb": cfg.limit, "cls": cfg.cls,
         "mode": cfg.mode, "instance": cfg.instance, "region": cfg.region,
         "status": status, "ip": inst["ip"], "name": inst["name"], "bw_out": inst.get("bw_out", 0),
@@ -518,6 +644,8 @@ def format_report(st, now=None):
         f"{bar} {pct:.1f}%",
         f"已用 {used:.2f} / {quota:g} GB · 熔断线 {limit:g} GB · 余 {max(0, limit - used):.2f} GB",
         f"速率 {st.get('rate_gbh', 0):.2f} GB/h",
+        *([f"实时 {st['komari_gb']:.2f} GB（Komari）· CDT 口径 {st.get('cdt_gb', 0):.2f} GB"]
+          if st.get("komari_gb") is not None else []),
         f"{st.get('name') or st.get('instance')} · {st.get('status')} · {st.get('ip') or '无公网IP'}",
         f"守护 {guard}",
     ]
@@ -542,6 +670,16 @@ def main(argv):
             ips = i.get("PublicIpAddress", {}).get("IpAddress", []) or [i.get("EipAddress", {}).get("IpAddress", "")]
             print("\t".join([i.get("InstanceId", ""), i.get("Status", ""), i.get("InstanceName", ""),
                              ips[0] or "-", i.get("InstanceChargeType", "")]))
+        return 0
+    if cmd == "komari":
+        if not cfg.komari_url:
+            raise SystemExit("未配置 KOMARI_URL")
+        if not cfg.komari_uuid:
+            for n in komari_get(cfg, "/api/nodes") or []:
+                print(f"{n.get('uuid', '')}\t{n.get('name', '')}")
+            return 0
+        got = get_komari(cfg)
+        print("节点最近没有上报（离线或关机）" if got is None else f"{got[0]:.2f}")
         return 0
     if cmd in ("check", "report") and not cfg.instance:
         raise SystemExit("未配置 ALI_INSTANCE_ID")
@@ -568,7 +706,7 @@ def main(argv):
         return 0
     if cmd in ("hold", "release"):
         st = load_state(cfg)
-        st["hold"] = cmd == "hold"
+        st["hold"], st["hold_ts"] = cmd == "hold", time.time()  # 比之前的 Telegram 请求新，覆盖它
         save_state(cfg, st)
         print("已暂停自动开机" if st["hold"] else "已恢复自动开机")
         return 0

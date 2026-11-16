@@ -41,9 +41,10 @@ Aliyun CDT gives 200 GB of free Hong Kong/overseas traffic a month (20 GB for ma
 ## ✨ Highlights
 
 - **Traffic fuse** — stops the instance (or adds a drop-all security-group rule) at 199 GB by default.
-- **Early fuse** — projects the last 90 minutes' rate 30 minutes ahead to cover CDT's reporting delay.
+- **Real-time traffic (Komari)** — CDT's API lags by hours (it once trailed by ~70 GB); with Komari configured the fuse uses the larger of CDT and the instance agent's monthly upload.
+- **Early fuse** — projects the current rate 30 minutes ahead (Komari: last hour; CDT only: last 90 minutes).
 - **Cost fuse** — stops the instance when this month's bill reaches `COST_LIMIT` (default 5 USD), whatever the mode.
-- **Keep-alive** — restarts the instance after a spot reclaim or an accidental stop; releases the fuse in the new month.
+- **Keep-alive** — restarts the instance after a spot reclaim or an accidental stop, after a 10-minute grace period that lets you send `/cdt hold` from Telegram; releases the fuse in the new month.
 - **Fail-safe** — if the Aliyun API fails, it does nothing; a sudden low reading mid-month never releases the fuse.
 - **Notifications** — Telegram for every action; optional [Sonde](https://github.com/10ta/Sonde) panel; [traffic-bot](../traffic-bot/) shows it without an Aliyun key.
 - **No dependencies** — Python standard library plus a systemd timer.
@@ -57,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/10ta/scripts-de-moi/main/CDT-Manage
 bash /tmp/cdt-init.sh
 ```
 
-The script asks for the AccessKey and region, verifies them on the spot, lists your instances to pick from, then asks for the fuse line, mode and Telegram settings. It ends with a usage report like the one above; the timer is then running every 5 minutes.
+The script asks for the AccessKey and region, verifies them on the spot, lists your instances to pick from, then asks for the fuse line, mode, Telegram settings and (optional, recommended) your Komari panel. It ends with a usage report like the one above; the timer is then running every 5 minutes.
 
 ## 📦 Installation
 
@@ -104,7 +105,15 @@ python3 /opt/cdt-guard/cdt_guard.py hold
 python3 /opt/cdt-guard/cdt_guard.py release
 ```
 
-Without `hold`, an instance you stop by hand is started again within 10 minutes.
+Or send `/cdt hold` / `/cdt release` to traffic-bot; the guard applies it on its next check (≤ 5 min). Send `hold` before stopping the instance. Without it, a stop the guard did not cause triggers a Telegram warning, and the instance is started again after `KEEPALIVE_GRACE_MIN` (10) minutes.
+
+### Real-time traffic from Komari
+
+```bash
+bash init.sh komari
+```
+
+Asks for the panel address (with its subpath) and, for a hidden node, an API key; lists the nodes to pick from and prints the Komari and CDT readings side by side. The node must have monthly traffic accounting on (the panel shows "RESET 1ST").
 
 ### Let traffic through mid-month
 
@@ -135,6 +144,11 @@ All settings live in `/etc/cdt-guard.env` and take effect on the next check; no 
 | `STOP_MODE` | ❌ | `KeepCharging` | Pay-as-you-go only; `StopCharging` frees the IP |
 | `SG_ID` | ❌ | first group | Security group for `sg` mode |
 | `GUARD_KEEPALIVE` | ❌ | `1` | Start the instance when found stopped |
+| `KEEPALIVE_GRACE_MIN` | ❌ | `10` | Wait this long after an unexplained stop before starting; `0` = at once |
+| `GUARD_REQUEST_FILE` | ❌ | `/var/lib/traffic-bot/cdt-request.json` | Where traffic-bot writes `/cdt hold` / `/cdt release` |
+| `KOMARI_URL` | ❌ | — | Komari panel address, including any subpath; empty = CDT only |
+| `KOMARI_UUID` | ❌ | — | The instance's node in Komari (`bash init.sh komari` picks it) |
+| `KOMARI_API_KEY` | ❌ | — | Needed only if the node is hidden |
 | `COST_LIMIT` | ❌ | `5` | Cost fuse in USD (intl) / CNY (cn); `0` = off |
 | `COST_WARN_PCT` | ❌ | `50` | Warn once at this % of `COST_LIMIT` |
 | `COST_CHECK_MIN` | ❌ | `30` | Minutes between bill queries |
@@ -181,6 +195,7 @@ Removes the timer, service and `/opt/cdt-guard`; in `sg` mode it first deletes i
 flowchart LR
   T[cdt-guard.timer<br/>every 5 min] --> C[cdt_guard.py check]
   C -->|CDT + ECS + bill| A[(Aliyun API)]
+  C -->|monthly upload| K[(Komari)]
   C -->|over the line| S[Stop instance /<br/>drop-all rule]
   C -->|stopped, not fused| R[Start instance]
   C --> F[state.json]
@@ -190,6 +205,7 @@ flowchart LR
 
 - **Runs on another machine** → a stopped instance cannot start itself.
 - **API failure means no action** → a failed query is never read as 0 GB; 3 failures in a row send one alert.
+- **Usage = max(CDT, Komari)** → Komari only ever raises the reading, so a Komari outage falls back to CDT and can never release a fuse or start the instance. The Komari counter is tracked as deltas, so when the agent rotates its monthly counter does not matter.
 - **The fuse lifts only in a new month** → an empty or low reading mid-month (API glitch, back-filled data) keeps the fuse on.
 - **State-changing calls are sent once** → a timed-out stop or start is not repeated; the next check sees the real state.
 - **Time budget** → if the traffic and instance queries take over 60 s, the bill query is skipped that round so the run finishes before systemd's 300 s timeout.
@@ -208,7 +224,7 @@ flowchart LR
 python3 -m unittest discover CDT-Management/tests
 ```
 
-Tests start a fake Aliyun API through `ALI_ENDPOINT_OVERRIDE`, so no account is needed. They cover the fuse, month change, single-attempt actions, failure counting and the Sonde heartbeat.
+Tests start a fake Aliyun API through `ALI_ENDPOINT_OVERRIDE`, so no account is needed. They cover the fuse, month change, single-attempt actions, failure counting, the Sonde heartbeat, the Komari reading (a fake Komari answers GET requests on the same server), the keep-alive grace period and Telegram hold requests.
 
 ## 📚 Documentation
 

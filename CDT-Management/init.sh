@@ -3,6 +3,7 @@
 #
 #   bash init.sh                # 安装（已安装则只更新程序文件，保留配置）
 #   bash init.sh reconfigure    # 重新填写配置
+#   bash init.sh komari         # 只配置 Komari 实时流量（推荐）
 #   bash init.sh status         # 查看运行状态和当前用量
 #   bash init.sh uninstall      # 卸载
 #
@@ -45,6 +46,13 @@ ask_secret() {  # ask_secret VAR "提示" "已有值"
 }
 
 guard() { CDT_GUARD_ENV="$1" python3 "$APP_DIR/cdt_guard.py" "${@:2}"; }
+
+set_val() {  # set_val KEY VALUE FILE：有就替换，没有就追加（保留文件权限）
+    local t="$TMP/set_val"
+    grep -vE "^$1=" "$3" > "$t" || true
+    printf '%s=%s\n' "$1" "$2" >> "$t"
+    cat "$t" > "$3"
+}
 
 # ---------------------------------------------------------------- 检查环境
 preflight() {
@@ -186,6 +194,51 @@ EOF
     )
     chmod 600 "$ENV_FILE"
     info "配置已写入 $ENV_FILE（权限 600）"
+    configure_komari
+}
+
+# ---------------------------------------------------------------- Komari 实时流量
+configure_komari() {
+    echo
+    echo "${c_b}── Komari 实时流量（推荐，留空跳过）──${c_0}"
+    echo "  CDT 接口的流量数据会滞后好几个小时（实测落后约 70GB），光靠它熔断来不及。"
+    echo "  配上 Komari 后，按实例上 agent 报的本月上行熔断，和 CDT 取大值。"
+    echo "  要求：实例装了 Komari agent，面板上这个节点开了月度流量统计（显示「RESET 1ST」那种）"
+    local url key uuid pick n
+    ask url "Komari 面板地址（含子路径）" "$(get_val KOMARI_URL "$ENV_FILE")"
+    if [[ -z "$url" ]]; then
+        set_val KOMARI_URL "" "$ENV_FILE"
+        warn "跳过 Komari：熔断只靠 CDT 数据。以后要配：bash init.sh komari"
+        return 0
+    fi
+    ask_secret key "Komari API 密钥（节点设为隐藏时才需要：后台 → 设置 → API 密钥；不需要就回车）" "$(get_val KOMARI_API_KEY "$ENV_FILE")"
+
+    cp "$ENV_FILE" "$TMP/k.env"
+    set_val KOMARI_URL "$url" "$TMP/k.env"; set_val KOMARI_API_KEY "$key" "$TMP/k.env"; set_val KOMARI_UUID "" "$TMP/k.env"
+    set_val STATE_DIR "$TMP/state" "$TMP/k.env"
+    if ! guard "$TMP/k.env" komari > "$TMP/nodes" 2> "$TMP/err"; then
+        warn "读不到 Komari 节点列表：$(tail -n1 "$TMP/err")"
+        warn "检查地址（要带子路径）和 API 密钥，然后重新运行：bash init.sh komari"
+        return 0
+    fi
+    n=$(grep -c . "$TMP/nodes" || true)
+    if [[ "$n" -eq 0 ]]; then
+        warn "列表是空的：节点可能设成了隐藏，需要填 API 密钥。重新运行：bash init.sh komari"
+        return 0
+    fi
+    awk -F'\t' '{printf "  %d) %s  %s\n", NR, $2, $1}' "$TMP/nodes"
+    ask pick "选择这台 CDT 实例对应的节点编号" "1"
+    uuid=$(awk -F'\t' -v n="$pick" 'NR==n{print $1}' "$TMP/nodes")
+    [[ -n "$uuid" ]] || { warn "编号无效，重新运行：bash init.sh komari"; return 0; }
+
+    set_val KOMARI_UUID "$uuid" "$TMP/k.env"
+    local kgb cdt
+    kgb=$(guard "$TMP/k.env" komari 2>/dev/null || echo "?")
+    cdt=$(guard "$ENV_FILE" report --json 2>/dev/null | python3 -c 'import json,sys; print(round(json.load(sys.stdin)["used_gb"], 2))' 2>/dev/null || echo "?")
+    echo "  Komari 本月上行：${kgb} GB · CDT 当前：${cdt} GB（CDT 滞后，Komari 通常更大）"
+    set_val KOMARI_URL "$url" "$ENV_FILE"; set_val KOMARI_API_KEY "$key" "$ENV_FILE"; set_val KOMARI_UUID "$uuid" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    info "Komari 已写入 $ENV_FILE"
 }
 
 start_timer() {
@@ -209,6 +262,10 @@ cmd_install() {
     install_files
     if [[ -f "$ENV_FILE" ]]; then
         info "已存在 $ENV_FILE，保留原配置（要重填请运行：bash init.sh reconfigure）"
+        if ! grep -qE '^KOMARI_URL=' "$ENV_FILE"; then  # 新版本加的选项：交互运行时问一次，update.sh 里只提示
+            if [[ -t 0 ]]; then configure_komari
+            else warn "还没配置 Komari 实时流量（CDT 数据滞后，熔断可能来不及）：bash init.sh komari"; fi
+        fi
     else
         configure
     fi
@@ -219,6 +276,14 @@ cmd_reconfigure() {
     preflight
     [[ -f "$APP_DIR/cdt_guard.py" ]] || install_files
     configure
+    start_timer
+}
+
+cmd_komari() {
+    preflight
+    [[ -f "$ENV_FILE" ]] || die "还没安装，先运行：bash init.sh"
+    [[ -f "$APP_DIR/cdt_guard.py" ]] || install_files
+    configure_komari
     start_timer
 }
 
@@ -254,7 +319,8 @@ cmd_uninstall() {
 case "${1:-install}" in
     install)     cmd_install ;;
     reconfigure) cmd_reconfigure ;;
+    komari)      cmd_komari ;;
     status)      cmd_status ;;
     uninstall)   cmd_uninstall ;;
-    *) echo "用法：bash init.sh [install|reconfigure|status|uninstall]"; exit 2 ;;
+    *) echo "用法：bash init.sh [install|reconfigure|komari|status|uninstall]"; exit 2 ;;
 esac

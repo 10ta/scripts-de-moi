@@ -89,6 +89,8 @@ OCI_IDLE_WARN = float(os.getenv("OCI_IDLE_WARN", "25"))   # CPU p95 低于它就
 CDT_STATE_PATH = os.getenv("CDT_STATE_PATH", "/var/lib/cdt-guard/state.json")
 CDT_STALE_MIN = float(os.getenv("CDT_STALE_MIN", "15"))  # 快照超过这么多分钟没更新就提醒（cdt-guard 可能停了）
 CDT_TZ = ZoneInfo("Asia/Shanghai")
+# /cdt hold|release 写的请求文件，cdt-guard（root）下一轮读取。bot 没有阿里云 AK，只能请求暂停/恢复自动开机
+CDT_REQUEST_PATH = os.path.join(os.getenv("STATE_DIRECTORY", "."), "cdt-request.json")
 
 # Sonde 面板（可选）：填了就在每次告警检查后上报一份用量（和 TG 消息一样脱敏），失败不影响 bot
 SONDE_URL = os.getenv("SONDE_URL", "").rstrip("/")
@@ -1505,6 +1507,14 @@ def get_aliyun_data() -> Section:
     lines.append(f"🖥 <b>{esc(host)}</b> · {esc(st.get('status', '?'))} · "
                  f"{'有公网IP' if st.get('ip') else '无公网IP'} · 速率 {float(st.get('rate_gbh') or 0):.2f}GB/h")
     notes = [guard_line, lines[-1]]
+    if st.get("komari_gb") is not None:  # cdt-guard 配了 Komari：实时读数 vs 滞后的 CDT 口径
+        k_gb, c_gb = float(st["komari_gb"]), float(st.get("cdt_gb") or 0)
+        lines.append(f"📡 实时 <b>{fmt_gb(k_gb)}</b>（Komari）· CDT 口径 {fmt_gb(c_gb)}"
+                     + (f" <i>滞后 {fmt_gb(k_gb - c_gb)}</i>" if k_gb - c_gb >= 1 else ""))
+        notes.append(lines[-1])
+    if st.get("komari_fail", 0) >= 3:
+        lines.append(f"⚠️ <b>读不到 Komari，熔断只能靠滞后的 CDT 数据</b>：{esc(str(st.get('komari_error', ''))[:80])}")
+        notes.append(lines[-1])
     detail = []
     if len(st.get("by_region") or {}) > 1:
         lines.append("🗺 " + " · ".join(f"{esc(r)} {fmt_gb(g)}" for r, g in sorted(st["by_region"].items())))
@@ -1895,6 +1905,26 @@ async def oracle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def aliyun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("hold", "release"):
+        hold = arg == "hold"
+        tmp = CDT_REQUEST_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"hold": hold, "ts": time.time()}, f)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, CDT_REQUEST_PATH)
+        except OSError as e:
+            await update.message.reply_text(f"写请求失败：{type(e).__name__}")
+            return
+        await update.message.reply_text(
+            "⏸ 已请求暂停 cdt-guard 自动开机，下一轮检查（≤5 分钟）生效。\n"
+            "关机前先发这条；恢复自动开机：/cdt release" if hold else
+            "▶️ 已请求恢复自动开机，下一轮检查（≤5 分钟）生效")
+        return
+    if arg:
+        await update.message.reply_text("用法：/cdt 查询 · /cdt hold 暂停自动开机 · /cdt release 恢复")
+        return
     if not cdt_enabled():
         await update.message.reply_text(f"没有找到 {CDT_STATE_PATH}，cdt-guard 还没安装或还没运行过")
         return
@@ -1915,7 +1945,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - 开启定时播报与告警\n/check - 查询全部\n"
         "/cloudfront（或 /cf）- 只查 CloudFront\n/cloudflare - 只查 Cloudflare\n"
         "/bill - 只查 AWS 账单\n/oracle（或 /oci）- 只查 Oracle Cloud\n"
-        "/aliyun（或 /cdt）- 只查阿里云 CDT"
+        "/aliyun（或 /cdt）- 只查阿里云 CDT\n"
+        "/cdt hold · /cdt release - 暂停 / 恢复 cdt-guard 自动开机（手动关机前先发 hold）"
     )
 
 
