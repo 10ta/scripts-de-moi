@@ -205,7 +205,7 @@ configure_komari() {
     echo "  配上 Komari 后，按实例上 agent 报的本月上行熔断，和 CDT 取大值。"
     echo "  要求：实例装了 Komari agent，面板上这个节点开了月度流量统计（显示「RESET 1ST」那种）"
     local url key uuid pick n
-    ask url "Komari 面板地址（含子路径）" "$(get_val KOMARI_URL "$ENV_FILE")"
+    ask url "Komari 面板地址（如 https://komari.example.com，有子路径就带上）" "$(get_val KOMARI_URL "$ENV_FILE")"
     if [[ -z "$url" ]]; then
         set_val KOMARI_URL "" "$ENV_FILE"
         warn "跳过 Komari：熔断只靠 CDT 数据。以后要配：bash init.sh komari"
@@ -217,8 +217,8 @@ configure_komari() {
     set_val KOMARI_URL "$url" "$TMP/k.env"; set_val KOMARI_API_KEY "$key" "$TMP/k.env"; set_val KOMARI_UUID "" "$TMP/k.env"
     set_val STATE_DIR "$TMP/state" "$TMP/k.env"
     if ! guard "$TMP/k.env" komari > "$TMP/nodes" 2> "$TMP/err"; then
-        warn "读不到 Komari 节点列表：$(tail -n1 "$TMP/err")"
-        warn "检查地址（要带子路径）和 API 密钥，然后重新运行：bash init.sh komari"
+        warn "读不到 Komari 节点列表：$(cat "$TMP/err" "$TMP/nodes" | grep -v '^[[:space:]]*$' | tail -n1)"
+        warn "检查面板地址和 API 密钥，然后重新运行：bash init.sh komari"
         return 0
     fi
     n=$(grep -c . "$TMP/nodes" || true)
@@ -274,7 +274,7 @@ cmd_install() {
 
 cmd_reconfigure() {
     preflight
-    [[ -f "$APP_DIR/cdt_guard.py" ]] || install_files
+    install_files
     configure
     start_timer
 }
@@ -282,7 +282,7 @@ cmd_reconfigure() {
 cmd_komari() {
     preflight
     [[ -f "$ENV_FILE" ]] || die "还没安装，先运行：bash init.sh"
-    [[ -f "$APP_DIR/cdt_guard.py" ]] || install_files
+    install_files  # 总是先装上和本脚本同版本的程序：旧版程序不认识 komari 命令
     configure_komari
     start_timer
 }
