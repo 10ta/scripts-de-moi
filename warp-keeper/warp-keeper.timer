@@ -1,11 +1,12 @@
 [Unit]
-Description=每小时检查一次 WARP
+Description=每 2 分钟检查一次 WARP
 
 [Timer]
-OnBootSec=3min
-OnCalendar=hourly
-RandomizedDelaySec=5min
-Persistent=true
+# 检查只是经本机入站访问两次 Cloudflare trace，很轻；查得勤，掉线（比如冷重启后某个源端口握不上手）几分钟内就自愈
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target

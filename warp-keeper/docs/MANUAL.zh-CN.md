@@ -2,12 +2,12 @@
 
 > 详细手册（中文）。概览、快速开始和配置速查见 [README.zh-CN.md](../README.zh-CN.md) · [English README](../README.md)
 
-给 sing-box 自动维护一个 Cloudflare WARP 出口：注册账户、生成 wireguard endpoint、每小时检查，不通就自愈。不需要 wireproxy、wg-quick，也不需要 wireguard-tools。
+给 sing-box 自动维护一个 Cloudflare WARP 出口：注册账户、生成 wireguard endpoint、每 2 分钟检查，不通就自愈。不需要 wireproxy、wg-quick，也不需要 wireguard-tools。
 
-- **不占额外资源**：WARP 隧道就是 sing-box 自己的 wireguard endpoint（用户态），没有另外的常驻进程。检查由 systemd timer 每小时跑一次，跑完就退出
+- **不占额外资源**：WARP 隧道就是 sing-box 自己的 wireguard endpoint（用户态），没有另外的常驻进程。检查由 systemd timer 每 2 分钟跑一次（只是两次 HTTPS 请求），跑完就退出
 - **主配置不用改**：在 sing-box 的配置目录里放一个独立的片段文件，sing-box 启动时自动合并
 - **兼容原来的 socks5 地址**：片段里带一个只监听 `127.0.0.1:18650` 的 mixed 入站，原来指向 wireproxy `socks5://127.0.0.1:18650` 的东西照常能用
-- **逐级自愈**：探测不通 → 先排除 sing-box 没运行、本机断网 → 重载 sing-box → 换新账户。每一步改配置前都先 `sing-box check`，新配置不通就退回原来的
+- **逐级自愈**：探测不通 → 先排除 sing-box 没运行、本机断网 → 重载 sing-box → 冷重启 sing-box → 换新账户。每一步改配置前都先 `sing-box check`，新配置不通就退回原来的
 - **WARP+**：可以从公开频道自动取许可证，套不上就用免费账户
 - **可观测**：Telegram 告警、恢复通知、每日日报；[Sonde](https://github.com/10ta/Sonde) 面板上每台机器一张卡片
 - 依赖只有 `curl`、`jq`（加上 Debian 自带的 `iproute2`、`flock`）
@@ -22,8 +22,8 @@
 127.0.0.1:18650 ──────▶│   mixed 入站 warp-keeper-in ── 规则：这个入站全部走 WARP      │
 （socks5 / http）       └──────────────────────────────────────────────────────────────┘
         ▲
-        │ 每小时经它访问 Cloudflare trace，看 warp=on / plus
-warp-keeper.timer ──▶ warp-keeper check ──(不通)──▶ 重载 sing-box ──(还不通)──▶ 注册新账户 → 换片段 → 重载
+        │ 每 2 分钟经它访问 Cloudflare trace，看 warp=on / plus
+warp-keeper.timer ──▶ warp-keeper check ──(不通)──▶ 重载 ──(还不通)──▶ 冷重启 ──(还不通)──▶ 注册新账户 → 换片段 → 重载
 ```
 
 ### sing-box 怎么把片段合进来
@@ -74,7 +74,7 @@ sing-box merge /tmp/merged.json -C /etc/sing-box && less /tmp/merged.json
 | `install.sh` | — | 安装 / 升级程序和 systemd 单元，不碰配置、账户和 sing-box |
 | `update.sh` | — | 一键更新（和仓库里其他工具同一套约定） |
 | `warp-keeper.sh` | `/opt/warp-keeper/`，并链接为 `/usr/local/bin/warp-keeper` | 主脚本 |
-| `warp-keeper.service` / `.timer` | `/etc/systemd/system/` | 开机 3 分钟后一次，之后每小时一次（随机延后 0~5 分钟） |
+| `warp-keeper.service` / `.timer` | `/etc/systemd/system/` | 开机 2 分钟后一次，之后每 2 分钟一次 |
 | `warp-keeper.env.example` | `/etc/warp-keeper.env` | 配置模板（首次安装时复制，之后不会覆盖） |
 
 运行时数据在 `/var/lib/warp-keeper/`（权限 700）：`account.json`（设备 ID、令牌、私钥）、`state`（上次结果、换号次数等）、`checks.log`（近 8 天每次检查的结果和延迟，用来算可用率）、`fragment.prev`（上一版片段，回滚用）、`bad-keys`（试过不能用的 WARP+ 许可证）。
@@ -98,7 +98,7 @@ sudo warp-keeper status
 sudo systemctl enable --now warp-keeper.timer
 ```
 
-> ⚠️ **影响范围**：`init`、自动换号和片段有变化的更新都会**重载 sing-box**。sing-box 的重载是整体重建：**所有入站的现有连接都会断开一下**（客户端会自动重连），不只是 WARP。每小时的检查本身只读不写，只有确认不通时才会重载。
+> ⚠️ **影响范围**：`init`、自动换号和片段有变化的更新都会**重载 sing-box**。sing-box 的重载是整体重建：**所有入站的现有连接都会断开一下**（客户端会自动重连），不只是 WARP。定时检查本身只读不写，只有确认不通时才会重载 / 冷重启。
 
 ### 从 fscarmen 脚本的 wireproxy 迁移
 
@@ -123,7 +123,7 @@ sudo systemctl enable --now warp-keeper.timer
 
 ## 自愈逻辑
 
-每小时一次 `warp-keeper check`：
+每 2 分钟一次 `warp-keeper check`：
 
 | 情况 | 怎么判断 | 处理 |
 |---|---|---|
@@ -132,8 +132,10 @@ sudo systemctl enable --now warp-keeper.timer
 | 片段被删了 | 18650 没在监听，片段文件不在 | 用现有账户重新生成，check 通过后重载 |
 | 本机断网 | 直连 `1.1.1.1` 也不通 | 不处理，只告警 |
 | 流量没走 WARP | trace 显示 `warp=off` | 不处理：说明路由没把探测入站送进 WARP，换号没用，提示你看合并后的规则 |
-| WARP 不通 | 以上都不是 | ① 账户还在：重载 sing-box，再探测 ② 还不通（或账户已被 Cloudflare 删除）：注册新账户 → 写片段 → check → 重载 → 探测；新账户也不通就**退回原来的片段**，注销新账户 |
+| WARP 不通 | 以上都不是 | ① 账户还在：重载 sing-box，再探测 ② 还不通：冷重启 sing-box，再探测 ③ 还不通（或账户已被 Cloudflare 删除）：注册新账户 → 写片段 → check → 重载 → 探测；新账户也不通就**退回原来的片段**，注销新账户 |
 
+- ①② 的意义：偶尔某个 UDP 源端口的握手 Cloudflare 一直不回（sing-box 日志里 `handshake did not complete after 5 seconds, retrying (try N)` 一直涨，抓包只有出去的 148 字节、没有回包），wireguard-go 会在同一个端口上无限重试。重载 / 冷重启会换个源端口重新握手，通常马上就好；key 本身没问题，不用换号
+- ①② 没救回来时，`HEAL_MIN_GAP`（默认 30 分钟）内的检查只记录、告警，不再动 sing-box，免得 Cloudflare 真出故障时每 2 分钟打断一次所有入站
 - 两次自动换号至少隔 `RENEW_MIN_GAP`（默认 6 小时），避免网络抖动时反复注册；原账户已被删除时不受这个限制。急的话手动 `warp-keeper renew`
 - 换号成功后注销旧设备，Cloudflare 那边不会越积越多
 - 同一时间只跑一个（`flock`），手动命令和 timer 撞上时手动的会等
@@ -166,12 +168,13 @@ sudo systemctl enable --now warp-keeper.timer
 
 另外每天 `TG_SUMMARY_HOUR` 点后的第一次检查发一条**日报**：每个栈的出口和延迟、24 小时 / 7 天可用率、24 小时平均延迟、账户类型和使用天数、换号和重载次数。留空不发。
 
-**Sonde**：填上 `SONDE_URL`、`SONDE_TOKEN`，每次检查后上报。来源名是 `warp-keeper:<WARP_NAME>`（小写）；面板把所有机器汇总在**同一张** WARP 卡片里，每台一行。上报周期 1 小时，两小时没动静那一行就标离线。Sonde 页面是公开的，所以上报里**不带出口 IP**，只有机房代码和国家。
+**Sonde**：填上 `SONDE_URL`、`SONDE_TOKEN`，状态变了马上上报，否则约每小时一次（检查本身每 2 分钟）。来源名是 `warp-keeper:<WARP_NAME>`（小写）；面板把所有机器汇总在**同一张** WARP 卡片里，每台一行。上报周期 1 小时，两小时没动静那一行就标离线。Sonde 页面是公开的，所以上报里**不带出口 IP**，只有机房代码和国家。
 
 ## 命令
 
 ```bash
-warp-keeper init        # 注册（已有账户就沿用）→ 写片段 → check → 重载 → 验证；改了 env 后也用它（片段没变就不重载）
+warp-keeper init        # 注册（已有账户就沿用）→ 写片段 → check → 重载 → 验证；验证不通就冷重启，还不通就换号
+                        # 改了 env 后也用它（片段没变就不重载）；WARP 掉了手动救也用它
 warp-keeper check       # 健康检查 + 自愈（timer 调用的就是它）
 warp-keeper status      # 当前状态，会实测一次，不改任何东西
 warp-keeper renew       # 立即换新账户（想换个出口 IP 时）
@@ -225,7 +228,7 @@ sudo ./warp-keeper/uninstall.sh    # 或者根目录的 sudo ./uninstall.sh，�
 
 ## 注意事项
 
-- **注册接口有频率限制。** 同一个 IP 短时间内注册太多次会被拒绝（HTTP 429）。所以自动换号有最小间隔；注册失败时保持原配置，下一小时再试，并在 Telegram 里写明原因。
+- **注册接口有频率限制。** 同一个 IP 短时间内注册太多次会被拒绝（HTTP 429）。所以自动换号有最小间隔；注册失败时保持原配置，过了间隔再试，并在 Telegram 里写明原因。
 - **Cloudflare 的注册接口没有公开文档。** 请求格式参照 [wgcf](https://github.com/ViRb3/wgcf) 和 fscarmen 的脚本；`WARP_API`、`WARP_UA`、`WARP_CLIENT_VER` 可以在 env 里覆盖，接口变动时不用等脚本更新。
 - **账户文件里有私钥和令牌**，在 `/var/lib/warp-keeper/account.json`（权限 600）。片段文件里也有私钥，权限同样是 600。
 - **出口 IP 是 Cloudflare 分配的**，换号后通常会变；`warp-keeper renew` 可以手动换。

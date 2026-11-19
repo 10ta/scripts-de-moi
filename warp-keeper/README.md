@@ -2,14 +2,15 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Keeps a Cloudflare WARP exit alive inside sing-box: registers, writes a WireGuard endpoint, checks hourly, self-heals. No wireproxy.
+Keeps a Cloudflare WARP exit alive inside sing-box: registers, writes a WireGuard endpoint, checks every 2 minutes, self-heals. No wireproxy.
 
 ```text
 $ warp-keeper --help
 warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不需要 wireproxy / wg-quick
 
-  warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证
-  warp-keeper.sh check       健康检查，不通就按「重载 → 换号」逐级自愈（timer 每小时调用）
+  warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证；
+                             验证不通就冷重启 sing-box，还不通就换新账户（WARP 掉了手动救也用它）
+  warp-keeper.sh check       健康检查，不通就按「重载 → 冷重启 → 换号」逐级自愈（timer 每 2 分钟调用）
   warp-keeper.sh status      看当前状态：出口、延迟、账户、可用率（会实测一次，不改任何东西）
   warp-keeper.sh renew       立即换一个新账户（想换出口 IP 时用）
   warp-keeper.sh plus [KEY]  给当前账户套 WARP+ 许可证；不带 KEY 就从 env 里 WARP_PLUS 指定的来源取
@@ -44,7 +45,7 @@ The usual setup — a WARP account from a one-off script, copied by hand into a 
 - **No extra process** — the tunnel is sing-box's own userspace WireGuard endpoint; the check is a timer that exits.
 - **Main config untouched** — a separate `00-warp-keeper.json` fragment is merged by sing-box at load.
 - **Drop-in for wireproxy** — a `127.0.0.1:18650` mixed inbound replaces the old `socks5://127.0.0.1:18650`.
-- **Step-by-step self-healing** — rule out sing-box down / network down → reload sing-box → register a new account; every change is `sing-box check`ed and rolled back if the new one fails.
+- **Step-by-step self-healing** — rule out sing-box down / network down → reload sing-box → restart sing-box → register a new account; every change is `sing-box check`ed and rolled back if the new one fails.
 - **WARP+** — optionally pulls public licences; falls back to free.
 - **Observable** — Telegram alerts, recovery notices and a daily summary; one Sonde card for all machines.
 
@@ -75,11 +76,11 @@ systemctl enable --now warp-keeper.timer
 ### What `install.sh` changes
 
 - Installs `/opt/warp-keeper/warp-keeper.sh` and links it as `/usr/local/bin/warp-keeper`.
-- Installs `warp-keeper.service` / `.timer` (3 min after boot, then hourly with up to 5 min jitter).
+- Installs `warp-keeper.service` / `.timer` (2 min after boot, then every 2 minutes).
 - Copies `/etc/warp-keeper.env` on first install only. It never touches sing-box or the account.
 
 > [!WARNING]
-> `init`, an automatic account renewal and a fragment change all **reload sing-box**, which briefly drops every inbound connection, not just WARP. The hourly check only reloads when WARP is actually down.
+> `init`, an automatic account renewal and a fragment change all **reload sing-box**, which briefly drops every inbound connection, not just WARP. The scheduled check only reloads / restarts when WARP is actually down, and leaves sing-box alone for `HEAL_MIN_GAP` (default 30 min) if that didn't help.
 
 ## 🧭 Usage
 
@@ -136,6 +137,7 @@ Settings live in `/etc/warp-keeper.env`; run `warp-keeper init` after editing (k
 | `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | Fragment file name (sort order matters); fixed to `00-warp-keeper-<name>.json` for instances |
 | `SYSTEM_IFACE` | ❌ | — | Create the endpoint as this system interface (needs `/dev/net/tun` and an IP peer) |
 | `RENEW_MIN_GAP` | ❌ | `360` | Minutes between automatic renewals |
+| `HEAL_MIN_GAP` | ❌ | `30` | Minutes to leave sing-box alone after a reload / restart didn't help |
 | `WARP_PLUS` | ❌ | `off` (template: `auto`) | `auto`, `off`, or licence keys |
 | `TIMEZONE` | ❌ | `Asia/Taipei` | Time zone for messages and the daily summary |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` | ❌ | — | Telegram |
@@ -181,13 +183,14 @@ flowchart LR
   R[Your route rules] -->|outbound 🧩 WARP| E[WireGuard endpoint<br/>in sing-box]
   L[127.0.0.1:18650<br/>mixed inbound] --> E
   E --> W[Cloudflare WARP]
-  T[warp-keeper.timer<br/>hourly] --> K[warp-keeper check]
+  T[warp-keeper.timer<br/>every 2 min] --> K[warp-keeper check]
   K -->|probe /cdn-cgi/trace via 18650| L
-  K -->|down| RL[reload sing-box] -->|still down| RN[new account + fragment]
+  K -->|down| RL[reload sing-box] -->|still down| RS[restart sing-box] -->|still down| RN[new account + fragment]
 ```
 
 - **Fragment, not edits** → sing-box merges every `.json` in the `-C` directory; `00-` sorts first so the probe rule precedes yours.
 - **Probe through the real path** → it fetches `1.1.1.1/cdn-cgi/trace` via the inbound and requires `warp=on` or `plus`.
+- **New source port before new account** → occasionally Cloudflare never answers handshakes from one UDP source port and wireguard-go retries on that port forever; a reload / restart picks a fresh port and usually fixes it without renewing.
 - **Renewals are rate-limited** → at least `RENEW_MIN_GAP` apart (the registration API returns 429 if you hammer it), unless the account is gone.
 - **Every change is reversible** → `sing-box check` before reload, `fragment.prev` for rollback, and a new account is deregistered if it doesn't work.
 

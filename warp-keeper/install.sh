@@ -40,7 +40,7 @@ if [[ -z "$ENV_KEPT" ]]; then
      主配置里旧的同名 endpoint（或指向 18650 的 socks 出站）按 docs/MANUAL.zh-CN.md「从 fscarmen 脚本的 wireproxy 迁移」处理，先别重启 sing-box
   3. 注册并接入    warp-keeper init     （会重载一次 sing-box，所有入站断开一下）
   4. 看状态        warp-keeper status
-  5. 启用每小时检查 systemctl enable --now warp-keeper.timer
+  5. 启用定时检查（每 2 分钟） systemctl enable --now warp-keeper.timer
   再要一个独立的 WARP（比如给某个入站绑网卡用）：warp-keeper -i 名字 init，见 README「再加一个 WARP」
 EOF
 else

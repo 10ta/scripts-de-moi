@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不需要 wireproxy / wg-quick
 #
-#   warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证
+#   warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证；
+#                              验证不通就冷重启 sing-box，还不通就换新账户（WARP 掉了手动救也用它）
 #                              改了 /etc/warp-keeper.env（端口、tag、MTU…）后也用它重新生成
-#   warp-keeper.sh check       健康检查，不通就按「重载 → 换号」逐级自愈（timer 每小时调用）
+#   warp-keeper.sh check       健康检查，不通就按「重载 → 冷重启 → 换号」逐级自愈（timer 每 2 分钟调用）
 #   warp-keeper.sh status      看当前状态：出口、延迟、账户、可用率（会实测一次，不改任何东西）
 #   warp-keeper.sh renew       立即换一个新账户（想换出口 IP 时用）
 #   warp-keeper.sh plus [KEY]  给当前账户套 WARP+ 许可证；不带 KEY 就从 env 里 WARP_PLUS 指定的来源取
@@ -19,7 +20,7 @@
 #   · 一条规则：这个入站的流量全部走上面的 endpoint
 # sing-box 按文件名合并目录里的所有 .json，主配置一行不用改。
 # 配置在 /etc/warp-keeper.env，状态在 /var/lib/warp-keeper/。
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -uo pipefail
@@ -51,6 +52,7 @@ KEEPALIVE="${KEEPALIVE:-30}"
 WARP_PLUS="${WARP_PLUS:-off}"               # off / auto / tg / 许可证本身
 WARP_PLUS_CHANNEL="${WARP_PLUS_CHANNEL:-https://t.me/s/warpplus}"
 RENEW_MIN_GAP="${RENEW_MIN_GAP:-360}"       # 分钟：两次自动换号的最小间隔
+HEAL_MIN_GAP="${HEAL_MIN_GAP:-30}"          # 分钟：重载 / 冷重启没救回来时，这么久内不再动 sing-box
 SB_SERVICE="${SB_SERVICE:-sing-box}"
 SB_CONFIG_DIR="${SB_CONFIG_DIR:-}"
 FRAGMENT_NAME="${FRAGMENT_NAME:-00-warp-keeper.json}"
@@ -85,23 +87,24 @@ warn() { printf '警告: %s\n' "$*" >&2; }
 fatal() { printf '错误: %s\n' "$*" >&2; exit 1; }
 
 # ---------- 状态文件（key=value，只有本脚本写）----------
-LAST_OK=0 FAIL_SINCE=0 LAST_RENEW=0 RENEW_TOTAL=0 RELOAD_TOTAL=0 LAST_PLUS_TRY=0
-LAST_KIND="" LAST_ALERT=0 LAST_SUMMARY_DAY="" LAST_REASON=""
+LAST_OK=0 FAIL_SINCE=0 LAST_RENEW=0 RENEW_TOTAL=0 RELOAD_TOTAL=0 LAST_PLUS_TRY=0 LAST_HEAL=0 LAST_SONDE=0
+LAST_KIND="" LAST_ALERT=0 LAST_SUMMARY_DAY="" LAST_REASON="" LAST_SONDE_KIND=""
 load_state() {
   local k v
   [[ -f "$STATE" ]] || return 0
   while IFS='=' read -r k v; do
     case "$k" in
-      LAST_OK|FAIL_SINCE|LAST_RENEW|RENEW_TOTAL|RELOAD_TOTAL|LAST_PLUS_TRY|LAST_ALERT)
+      LAST_OK|FAIL_SINCE|LAST_RENEW|RENEW_TOTAL|RELOAD_TOTAL|LAST_PLUS_TRY|LAST_ALERT|LAST_HEAL|LAST_SONDE)
         [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v" ;;
-      LAST_KIND|LAST_SUMMARY_DAY|LAST_REASON) printf -v "$k" '%s' "$v" ;;
+      LAST_KIND|LAST_SUMMARY_DAY|LAST_REASON|LAST_SONDE_KIND) printf -v "$k" '%s' "$v" ;;
     esac
   done < "$STATE"
 }
 save_state() {
   local k
   {
-    for k in LAST_OK FAIL_SINCE LAST_RENEW RENEW_TOTAL RELOAD_TOTAL LAST_PLUS_TRY LAST_KIND LAST_ALERT LAST_SUMMARY_DAY; do
+    for k in LAST_OK FAIL_SINCE LAST_RENEW RENEW_TOTAL RELOAD_TOTAL LAST_PLUS_TRY LAST_KIND LAST_ALERT LAST_SUMMARY_DAY \
+             LAST_HEAL LAST_SONDE LAST_SONDE_KIND; do
       printf '%s=%s\n' "$k" "${!k}"
     done
     printf 'LAST_REASON=%s\n' "${LAST_REASON//$'\n'/ }"
@@ -235,6 +238,10 @@ sb_reload() {
   fi || return 1
   sleep 2; wait_port
 }
+# 冷重启：整个进程重来，所有 endpoint 都换新的 UDP 源端口重新握手。
+# 偶尔某个源端口的握手 Cloudflare 一直不回（日志里 handshake did not complete … try N 一直涨），
+# wireguard-go 会在同一个端口上无限重试；换个端口就好。影响和重载一样：所有入站断开一下
+sb_restart() { systemctl restart "$SB_SERVICE" || return 1; sleep 2; wait_port; }
 
 # ---------- Cloudflare WARP API ----------
 API_CODE="" API_BODY=""
@@ -563,9 +570,11 @@ sonde_report() {
        -H "Authorization: Bearer $SONDE_TOKEN" -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
     log "已上报 Sonde"
   else
-    warn "Sonde 上报失败"
+    warn "Sonde 上报失败"; return 1
   fi
 }
+# 检查每 2 分钟一次，Sonde 不用这么密：状态变了马上报，否则约每小时一次（面板按 1 小时周期判断离线）
+sonde_due() { [[ "$KIND" != "$LAST_SONDE_KIND" ]] || (( NOW - LAST_SONDE >= 3300 )); }
 
 # 一轮结束：记历史、更新状态、发通知、上报
 finish() {
@@ -579,8 +588,8 @@ finish() {
   notify || true
   summary_due && { send_summary || true; }
   LAST_KIND=$KIND
+  if sonde_due && sonde_report; then LAST_SONDE=$NOW; LAST_SONDE_KIND=$KIND; fi
   save_state
-  sonde_report || true
   (( good )) && exit 0
   exit 1
 }
@@ -668,8 +677,20 @@ $CHECK_ERR
   LAST_SUMMARY_DAY=$(date +%F)          # 刚部署完就不再发今天的日报了
   [[ -n "$fresh" ]] && LAST_RENEW=$NOW   # 新账户也算一次「换号」时间：RENEW_MIN_GAP 内不会再自动换
   if ! probe_all; then
-    KIND=failed; REASON="部署后探测不通（$PROBE_FAIL）"
-    NOTE="确认 sing-box 版本带 wireguard，或者把 MTU 调小、换 PEER_PORT（500 / 1701 / 4500）后重新 init"
+    # 片段没变时上面连重载都不做；手动跑 init 多半就是想把掉了的 WARP 救回来，所以往下逐级升级
+    log "探测不通（$PROBE_FAIL）：冷重启 sing-box，让 WARP 换个源端口重新握手（所有入站会断开一下）..."
+    LAST_HEAL=$NOW
+    sb_restart && { RELOAD_TOTAL=$((RELOAD_TOTAL + 1)); sleep 5; }
+    if probe_all; then
+      ACTION="冷重启 sing-box 后恢复"
+    elif [[ -z "$fresh" ]]; then
+      log "还是不通（$PROBE_FAIL）：换一个新账户（出口 IP 会变）..."
+      if renew; then ACTION="原账户握不上手，冷重启也没用，已换新账户"
+      else KIND=failed; REASON="部署后探测不通（$PROBE_FAIL），冷重启无效，换号也失败：$RENEW_ERR"; fi
+    else
+      KIND=failed; REASON="部署后探测不通（$PROBE_FAIL），冷重启也没用"
+    fi
+    [[ "$KIND" == failed ]] && NOTE="确认 sing-box 版本带 wireguard，或者把 MTU 调小、换 PEER_PORT（500 / 1701 / 4500）后重新 init"
   fi
   finish
 }
@@ -715,22 +736,34 @@ cmd_check() {
   local alive; alive=$(account_alive)
   log "账户状态：$alive"
   if [[ "$alive" != dead ]]; then
-    log "第 1 步：重载 sing-box"
+    # 重载 / 冷重启会打断所有入站。真遇上 Cloudflare 大面积故障时，不能每 2 分钟打断一次
+    if (( NOW - LAST_HEAL < HEAL_MIN_GAP * 60 )); then
+      KIND=failed; REASON="$PROBE_FAIL 不通"
+      NOTE="$(ago "$LAST_HEAL")刚重载 / 冷重启过还是不通；$HEAL_MIN_GAP 分钟内不再动 sing-box（HEAL_MIN_GAP），免得反复打断所有入站。急的话手动 $CMD renew"
+      finish
+    fi
+    LAST_HEAL=$NOW
+    log "第 1 步：重载 sing-box（WARP 换个源端口重新握手）"
     if sb_reload; then
       RELOAD_TOTAL=$((RELOAD_TOTAL + 1)); sleep 5
       if probe_all; then KIND=recovered; ACTION="重载 sing-box 后恢复"; finish; fi
+    fi
+    log "第 2 步：冷重启 sing-box"
+    if sb_restart; then
+      RELOAD_TOTAL=$((RELOAD_TOTAL + 1)); sleep 5
+      if probe_all; then KIND=recovered; ACTION="冷重启 sing-box 后恢复（重载没用）"; finish; fi
     fi
   fi
 
   local gap=$(( RENEW_MIN_GAP * 60 ))
   if [[ "$alive" != dead ]] && (( NOW - LAST_RENEW < gap )); then
-    KIND=failed; REASON="$PROBE_FAIL 不通，重载也没用"
+    KIND=failed; REASON="$PROBE_FAIL 不通，重载、冷重启都没用"
     NOTE="距上次换号不到 $((RENEW_MIN_GAP / 60)) 小时，这次先不换（RENEW_MIN_GAP）；急的话手动运行 $CMD renew"
     finish
   fi
-  log "第 2 步：换新账户"
+  log "第 3 步：换新账户"
   if renew; then
-    KIND=recovered; ACTION="换了新账户后恢复（$( [[ $alive == dead ]] && echo "原账户已被 Cloudflare 删除" || echo "重载无效")）"
+    KIND=recovered; ACTION="换了新账户后恢复（$( [[ $alive == dead ]] && echo "原账户已被 Cloudflare 删除" || echo "重载、冷重启都无效")）"
   else
     KIND=failed; ACTION="试过换号，没成功"; REASON="$PROBE_FAIL 不通，换号失败：$RENEW_ERR"
   fi

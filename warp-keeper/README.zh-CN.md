@@ -2,14 +2,15 @@
 
 [English](README.md) · **简体中文**
 
-在 sing-box 里自动维护一个 Cloudflare WARP 出口：注册账户、写 WireGuard endpoint、每小时检查、不通自愈。不需要 wireproxy。
+在 sing-box 里自动维护一个 Cloudflare WARP 出口：注册账户、写 WireGuard endpoint、每 2 分钟检查、不通自愈。不需要 wireproxy。
 
 ```text
 $ warp-keeper --help
 warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不需要 wireproxy / wg-quick
 
-  warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证
-  warp-keeper.sh check       健康检查，不通就按「重载 → 换号」逐级自愈（timer 每小时调用）
+  warp-keeper.sh init        注册账户（已有就沿用）→ 写 sing-box 配置片段 → 检查 → 重载 → 验证；
+                             验证不通就冷重启 sing-box，还不通就换新账户（WARP 掉了手动救也用它）
+  warp-keeper.sh check       健康检查，不通就按「重载 → 冷重启 → 换号」逐级自愈（timer 每 2 分钟调用）
   warp-keeper.sh status      看当前状态：出口、延迟、账户、可用率（会实测一次，不改任何东西）
   warp-keeper.sh renew       立即换一个新账户（想换出口 IP 时用）
   warp-keeper.sh plus [KEY]  给当前账户套 WARP+ 许可证；不带 KEY 就从 env 里 WARP_PLUS 指定的来源取
@@ -34,7 +35,7 @@ warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不�
 
 ## 💡 为什么是 warp-keeper？
 
-常见做法是用一次性脚本注册 WARP 账户，再手动抄进 sing-box 的 endpoint，或者在 sing-box 旁边跑一个 wireproxy；Cloudflare 一旦删掉账户，它就悄悄断了。warp-keeper 把 endpoint 放进 sing-box 的一个独立配置片段，每小时经本机入站探测一次，不通就逐级修复。
+常见做法是用一次性脚本注册 WARP 账户，再手动抄进 sing-box 的 endpoint，或者在 sing-box 旁边跑一个 wireproxy；Cloudflare 一旦删掉账户，它就悄悄断了。warp-keeper 把 endpoint 放进 sing-box 的一个独立配置片段，每 2 分钟经本机入站探测一次，不通就逐级修复。
 
 - ✅ 适用：VPS 上的 sing-box ≥ 1.11，由 systemd 管理并带配置目录（`-C`），有一部分流量要经 WARP 出去。
 - ❌ 不适用：sing-box 用单个 `-c` 文件启动且你不想改；机器上没有 sing-box。
@@ -44,7 +45,7 @@ warp-keeper —— 给 sing-box 自动维护一个 Cloudflare WARP 出口，不�
 - **没有额外进程**：隧道就是 sing-box 自己的用户态 WireGuard endpoint；检查是一个跑完就退出的 timer。
 - **主配置不用改**：独立的 `00-warp-keeper.json` 片段由 sing-box 加载时合并。
 - **直接顶替 wireproxy**：`127.0.0.1:18650` 的 mixed 入站顶替原来的 `socks5://127.0.0.1:18650`。
-- **逐级自愈**：先排除 sing-box 没运行 / 本机断网 → 重载 sing-box → 注册新账户；每次改动都先 `sing-box check`，新的不通就回滚。
+- **逐级自愈**：先排除 sing-box 没运行 / 本机断网 → 重载 sing-box → 冷重启 sing-box → 注册新账户；每次改动都先 `sing-box check`，新的不通就回滚。
 - **WARP+**：可以自动取公开许可证，套不上就用免费账户。
 - **看得见**：Telegram 告警、恢复通知和日报；所有机器共用一张 Sonde 卡片。
 
@@ -75,11 +76,11 @@ systemctl enable --now warp-keeper.timer
 ### `install.sh` 会改动什么
 
 - 安装 `/opt/warp-keeper/warp-keeper.sh`，并链接为 `/usr/local/bin/warp-keeper`。
-- 安装 `warp-keeper.service` / `.timer`（开机 3 分钟后一次，之后每小时一次，随机延后最多 5 分钟）。
+- 安装 `warp-keeper.service` / `.timer`（开机 2 分钟后一次，之后每 2 分钟一次）。
 - 只在首次安装时复制 `/etc/warp-keeper.env`。不会碰 sing-box，也不会碰账户。
 
 > [!WARNING]
-> `init`、自动换号、片段有变化时都会**重载 sing-box**，所有入站的连接都会断开一下，不只是 WARP。每小时的检查只有确认 WARP 不通时才会重载。
+> `init`、自动换号、片段有变化时都会**重载 sing-box**，所有入站的连接都会断开一下，不只是 WARP。定时检查只有确认 WARP 不通时才会重载 / 冷重启，没救回来的话 `HEAL_MIN_GAP`（默认 30 分钟）内不再动 sing-box。
 
 ## 🧭 使用
 
@@ -136,6 +137,7 @@ systemctl enable --now warp-keeper@hy2.timer
 | `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | 片段文件名（排序有意义）；实例固定为 `00-warp-keeper-名字.json` |
 | `SYSTEM_IFACE` | ❌ | — | 把 endpoint 建成这张系统网卡（需要 `/dev/net/tun`，对端必须是 IP） |
 | `RENEW_MIN_GAP` | ❌ | `360` | 两次自动换号的最小间隔（分钟） |
+| `HEAL_MIN_GAP` | ❌ | `30` | 重载 / 冷重启没救回来后，多少分钟内不再动 sing-box |
 | `WARP_PLUS` | ❌ | `off`（模板里是 `auto`） | `auto`、`off` 或许可证本身 |
 | `TIMEZONE` | ❌ | `Asia/Taipei` | 消息和日报用的时区 |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` | ❌ | — | Telegram |
@@ -181,13 +183,14 @@ flowchart LR
   R[Your route rules] -->|outbound 🧩 WARP| E[WireGuard endpoint<br/>in sing-box]
   L[127.0.0.1:18650<br/>mixed inbound] --> E
   E --> W[Cloudflare WARP]
-  T[warp-keeper.timer<br/>hourly] --> K[warp-keeper check]
+  T[warp-keeper.timer<br/>every 2 min] --> K[warp-keeper check]
   K -->|probe /cdn-cgi/trace via 18650| L
-  K -->|down| RL[reload sing-box] -->|still down| RN[new account + fragment]
+  K -->|down| RL[reload sing-box] -->|still down| RS[restart sing-box] -->|still down| RN[new account + fragment]
 ```
 
 - **放片段，不改主配置** → sing-box 会合并 `-C` 目录里所有 `.json`；`00-` 排在最前，探测规则排在你的规则之前。
 - **沿真实路径探测** → 经入站请求 `1.1.1.1/cdn-cgi/trace`，要求 `warp=on` 或 `plus`。
+- **先换源端口，再换号** → 偶尔某个 UDP 源端口的握手 Cloudflare 一直不回，wireguard-go 会在同一个端口上无限重试；重载 / 冷重启让它换个端口重新握手，通常就好了，不用换号。
 - **换号有频率限制** → 两次至少隔 `RENEW_MIN_GAP`（注册接口请求太频繁会返回 429），原账户已被删除时除外。
 - **每次改动都能撤回** → 重载前 `sing-box check`，`fragment.prev` 用于回滚，新账户不通就注销。
 
