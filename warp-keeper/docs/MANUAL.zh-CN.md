@@ -182,6 +182,29 @@ warp-keeper remove      # 删片段 → check → 重载 → 注销账户；主�
 
 日志：`journalctl -u warp-keeper --output cat`
 
+## 实例与系统网卡
+
+一台机器要两个互不相干的 WARP（比如一个给路由规则用，一个专门给 Hysteria 2 Realms 绑网卡），就开一个实例。所有命令前加 `-i 名字`：
+
+| | 主实例 | 实例 `hy2` |
+|---|---|---|
+| 配置 | `/etc/warp-keeper.env` | `/etc/warp-keeper-hy2.env`（先 source 主配置，再覆盖名字 / tag / 端口） |
+| 状态 | `/var/lib/warp-keeper/` | `/var/lib/warp-keeper-hy2/` |
+| 片段 | `FRAGMENT_NAME`（默认 `00-warp-keeper.json`） | 固定 `00-warp-keeper-hy2.json` |
+| 入站 tag | `warp-keeper-in` | `warp-keeper-hy2-in` |
+| timer | `warp-keeper.timer` | `warp-keeper@hy2.timer` |
+
+- 第一次 `warp-keeper -i hy2 init` 只生成 env 就停下（端口自动挑一个空的），看过再 init 一次才注册。
+- 名字、tag、端口和主实例一样时直接报错：撞了要么 check 不过，要么 Sonde 卡片互相覆盖。
+- 所有实例共用 `/run/warp-keeper.lock`：一个在重载 sing-box 时，另一个不会去探测、误判成故障。timer 最多等 5 分钟。
+
+**`SYSTEM_IFACE`**：endpoint 加上 `"system": true, "name": 网卡名`，sing-box 在系统里建这张网卡，并自己加一张独立路由表（默认路由指向这张网卡）和一条 `oif 网卡 → 这张表` 的规则；主路由表不动，其他流量不受影响。入站写 `"bind_interface": "网卡名"` 后，它的 socket 发出的包都从 WARP 走，回包也从 WARP 回来。限制：
+
+- 需要 `/dev/net/tun`；`STACK` 含 v6 时内核要开着 IPv6。
+- 对端必须是 IP：域名对端的 endpoint 要等 DNS，晚于入站启动，绑网卡的入站会因为网卡还不存在而起不来。`PEER=auto` 本来就是 IP。
+- 别的片段绑着这张网卡时，`remove` 和改 `SYSTEM_IFACE` 都会拒绝；`status` 会列出谁绑着它。
+- 每次重载 sing-box 网卡都会重建，表和规则跟着网卡由 sing-box 加删，不需要另外的服务。
+
 ## 更新
 
 ```bash
@@ -189,7 +212,7 @@ cd /opt/scripts-de-moi
 git am -3 *.patch && rm *.patch && git push && ./update.sh
 ```
 
-根目录的 `update.sh` 会更新本机装了的所有工具；只更新这一个：`sudo ./warp-keeper/update.sh`。它会重新安装程序和单元，然后运行 `warp-keeper sync`：新版本生成的片段和现在的一样就什么都不做；不一样时 check → 重载 → 探测，不通就退回原来的片段。`--status` 只看版本和上次检查的结果。
+根目录的 `update.sh` 会更新本机装了的所有工具；只更新这一个：`sudo ./warp-keeper/update.sh`。它会重新安装程序和单元，然后对主实例和每个实例运行 `sync`：新版本生成的片段和现在的一样就什么都不做；不一样时 check → 重载 → 探测，不通就退回原来的片段。`--status` 只看版本和上次检查的结果。
 
 ## 卸载
 
@@ -198,7 +221,7 @@ git am -3 *.patch && rm *.patch && git push && ./update.sh
 sudo ./warp-keeper/uninstall.sh    # 或者根目录的 sudo ./uninstall.sh，在菜单里选
 ```
 
-先执行 `warp-keeper remove`（删片段 → 检查 → 重载 sing-box → 注销 WARP 账户），成功了才删 timer、服务、`/opt/warp-keeper` 和 `/usr/local/bin/warp-keeper`；remove 被拒绝时什么都不删。配置 `/etc/warp-keeper.env` 和状态 `/var/lib/warp-keeper` 保留，卸载完会打印彻底删除的命令。
+先对每个实例执行 `warp-keeper -i 名字 remove`，再执行 `warp-keeper remove`（删片段 → 检查 → 重载 sing-box → 注销 WARP 账户），成功了才删 timer、服务、`/opt/warp-keeper` 和 `/usr/local/bin/warp-keeper`；remove 被拒绝时什么都不删。配置 `/etc/warp-keeper.env` 和状态 `/var/lib/warp-keeper` 保留，卸载完会打印彻底删除的命令。
 
 ## 注意事项
 

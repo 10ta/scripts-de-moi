@@ -121,6 +121,15 @@ cd "$(dirname "$SELF")"
 APP=/opt/warp-keeper
 [[ -f "$APP/warp-keeper.sh" && -f /etc/warp-keeper.env ]] || die "本机还没安装 warp-keeper，首次安装：sudo bash install.sh"
 ver() { sed -n 's/^VERSION="\(.*\)"/\1/p' "$1" | head -1; }
+instances() {   # 有配置的实例名，一行一个
+  local e i
+  for e in /etc/warp-keeper-*.env; do
+    [[ -f "$e" ]] || continue
+    i=${e#/etc/warp-keeper-}; i=${i%.env}
+    [[ "$i" =~ ^[a-z0-9]{1,12}$ ]] && echo "$i"
+  done
+  return 0
+}
 
 if (( STATUS )); then
   echo "warp-keeper   仓库 $(short)（v$(ver warp-keeper.sh)）· 已部署 $(deployed_of "$APP/DEPLOYED")（v$(ver "$APP/warp-keeper.sh")）· timer $(systemctl is-active warp-keeper.timer 2>/dev/null || true)"
@@ -129,6 +138,11 @@ if (( STATUS )); then
     k=$(sed -n 's/^LAST_KIND=//p' /var/lib/warp-keeper/state); r=$(sed -n 's/^LAST_REASON=//p' /var/lib/warp-keeper/state)
     echo "              上次检查：${k:-?}${r:+ · $r}"
   fi
+  for i in $(instances); do
+    s=/var/lib/warp-keeper-$i/state
+    k=$(sed -n 's/^LAST_KIND=//p' "$s" 2>/dev/null); r=$(sed -n 's/^LAST_REASON=//p' "$s" 2>/dev/null)
+    echo "  实例 $i     timer $(systemctl is-active "warp-keeper@$i.timer" 2>/dev/null || true) · 上次检查：${k:-?}${r:+ · $r}"
+  done
   exit 0
 fi
 
@@ -155,5 +169,15 @@ if systemctl is-enabled --quiet warp-keeper.timer 2>/dev/null; then
 else
   warn "warp-keeper.timer 没有启用，不会自动检查。要启用：systemctl enable --now warp-keeper.timer"
 fi
+for i in $(instances); do
+  step "同步实例 $i 的片段（warp-keeper -i $i sync）"
+  if [[ -s /var/lib/warp-keeper-$i/account.json ]]; then
+    "$APP/warp-keeper.sh" -i "$i" sync 2>&1 | sed 's/^/  /' || die "warp-keeper -i $i sync 失败（见上面），sing-box 还在用原来的片段"
+  else
+    warn "实例 $i 还没有账户（没运行过 warp-keeper -i $i init），跳过"
+  fi
+  systemctl is-enabled --quiet "warp-keeper@$i.timer" 2>/dev/null \
+    || warn "warp-keeper@$i.timer 没有启用，不会自动检查。要启用：systemctl enable --now warp-keeper@$i.timer"
+done
 mark_deployed "$APP/DEPLOYED"
 ok "warp-keeper 已更新到 $(short)"

@@ -18,7 +18,7 @@ mkdir -p "$DIR" /var/lib/warp-keeper
 chmod 700 /var/lib/warp-keeper
 install -m 755 warp-keeper.sh "$DIR/warp-keeper.sh"
 ln -sf "$DIR/warp-keeper.sh" /usr/local/bin/warp-keeper
-install -m 644 warp-keeper.service warp-keeper.timer /etc/systemd/system/
+install -m 644 warp-keeper.service warp-keeper.timer warp-keeper@.service warp-keeper@.timer /etc/systemd/system/
 ENV_KEPT=""
 if [[ -f /etc/warp-keeper.env ]]; then ENV_KEPT=1
 else install -m 600 warp-keeper.env.example /etc/warp-keeper.env; fi
@@ -27,6 +27,9 @@ if systemctl is-enabled --quiet warp-keeper.timer 2>/dev/null; then
   systemctl restart warp-keeper.timer
   echo "已重启 warp-keeper.timer"
 fi
+for t in $(systemctl list-units --all --plain --no-legend 'warp-keeper@*.timer' 2>/dev/null | awk '{print $1}'); do
+  systemctl is-enabled --quiet "$t" 2>/dev/null && systemctl restart "$t" && echo "已重启 $t"
+done
 
 if [[ -z "$ENV_KEPT" ]]; then
   cat <<'EOF'
@@ -38,6 +41,7 @@ if [[ -z "$ENV_KEPT" ]]; then
   3. 注册并接入    warp-keeper init     （会重载一次 sing-box，所有入站断开一下）
   4. 看状态        warp-keeper status
   5. 启用每小时检查 systemctl enable --now warp-keeper.timer
+  再要一个独立的 WARP（比如给某个入站绑网卡用）：warp-keeper -i 名字 init，见 README「再加一个 WARP」
 EOF
 else
   echo

@@ -1,0 +1,11 @@
+[Unit]
+Description=warp-keeper（实例 %i）：检查 sing-box 的 WARP 出口，不通就自愈
+Documentation=https://github.com/10ta/scripts-de-moi/tree/main/warp-keeper
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/warp-keeper/warp-keeper.sh -i %i check
+# 所有实例共用一把锁，最多先等别的实例 5 分钟，再加上自己最坏的几分钟
+TimeoutStartSec=15min

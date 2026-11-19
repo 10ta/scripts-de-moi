@@ -107,6 +107,19 @@ warp-keeper plus xxxxxxxx-xxxxxxxx-xxxxxxxx
 
 不用重载，下一次握手后生效。
 
+### 再加一个 WARP（实例）
+
+```bash
+warp-keeper -i hy2 init          # 第一次只生成 /etc/warp-keeper-hy2.env 就停下
+nano /etc/warp-keeper-hy2.env    # 比如 STACK=v6、SYSTEM_IFACE=wkhy2
+warp-keeper -i hy2 init          # 注册它自己的账户，写 00-warp-keeper-hy2.json，重载
+systemctl enable --now warp-keeper@hy2.timer
+```
+
+实例完全独立：自己的账户、片段、endpoint tag、探测端口、状态（`/var/lib/warp-keeper-hy2/`）、timer 和 Sonde 卡片。它的 env 先 source `/etc/warp-keeper.env`，Telegram / Sonde / WARP+ 直接继承。所有命令加 `-i hy2`；主实例不受影响。所有实例共用一把锁，不会两个同时重载 sing-box。
+
+开了 `SYSTEM_IFACE`，endpoint 就是一张真网卡：sing-box 给它维护一张独立路由表和一条「oif 这张网卡」的规则（主路由表不动），任何入站写 `"bind_interface": "网卡名"`，它的 UDP 就全从 WARP 进出。还有别的配置绑着这张网卡时，`remove`（以及给网卡改名）会拒绝——那个入站会让整个 sing-box 起不来。
+
 ## 🔧 配置
 
 配置在 `/etc/warp-keeper.env`；改完运行 `warp-keeper init`（沿用现有账户，片段有变化才重载）。模板：[`warp-keeper.env.example`](warp-keeper.env.example)。
@@ -120,7 +133,8 @@ warp-keeper plus xxxxxxxx-xxxxxxxx-xxxxxxxx
 | `MTU` | ❌ | `1280` | WireGuard MTU |
 | `PEER` / `PEER_PORT` | ❌ | `auto` / `2408` | 对端地址和端口 |
 | `SB_SERVICE` / `SB_CONFIG_DIR` | ❌ | `sing-box` / 从单元读取 | sing-box 服务名和配置目录 |
-| `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | 片段文件名（排序有意义） |
+| `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | 片段文件名（排序有意义）；实例固定为 `00-warp-keeper-名字.json` |
+| `SYSTEM_IFACE` | ❌ | — | 把 endpoint 建成这张系统网卡（需要 `/dev/net/tun`，对端必须是 IP） |
 | `RENEW_MIN_GAP` | ❌ | `360` | 两次自动换号的最小间隔（分钟） |
 | `WARP_PLUS` | ❌ | `off`（模板里是 `auto`） | `auto`、`off` 或许可证本身 |
 | `TIMEZONE` | ❌ | `Asia/Taipei` | 消息和日报用的时区 |
@@ -141,12 +155,13 @@ cd /opt/scripts-de-moi
 
 ### 数据与备份
 
-`/var/lib/warp-keeper/`（700）：`account.json`（设备 ID、令牌、私钥）、`state`、`checks.log`（近 8 天的结果）、`fragment.prev`、`bad-keys`。
+`/var/lib/warp-keeper/`（700；实例是 `/var/lib/warp-keeper-名字/`）：`account.json`（设备 ID、令牌、私钥）、`state`、`checks.log`（近 8 天的结果）、`fragment.prev`、`bad-keys`。
 
 ### 日志
 
 ```bash
 journalctl -u warp-keeper --output cat
+journalctl -u warp-keeper@hy2 --output cat   # 实例
 ```
 
 ### 卸载
@@ -157,7 +172,7 @@ journalctl -u warp-keeper --output cat
 ./warp-keeper/uninstall.sh
 ```
 
-它先运行 `warp-keeper remove`（删片段 → 检查 → 重载 → 注销账户），成功后才删单元和程序。配置和状态保留。
+它先对每个实例运行 `warp-keeper -i 名字 remove`，再运行 `warp-keeper remove`（删片段 → 检查 → 重载 → 注销账户），成功后才删单元和程序。配置和状态保留。
 
 ## 🧠 工作原理
 

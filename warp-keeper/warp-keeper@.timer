@@ -1,0 +1,11 @@
+[Unit]
+Description=每小时检查一次 WARP（实例 %i）
+
+[Timer]
+OnBootSec=4min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

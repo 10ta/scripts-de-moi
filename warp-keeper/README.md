@@ -107,6 +107,19 @@ warp-keeper plus xxxxxxxx-xxxxxxxx-xxxxxxxx
 
 No reload needed; it takes effect on the next handshake.
 
+### Add a second WARP (instance)
+
+```bash
+warp-keeper -i hy2 init          # first run writes /etc/warp-keeper-hy2.env and stops
+nano /etc/warp-keeper-hy2.env    # e.g. STACK=v6, SYSTEM_IFACE=wkhy2
+warp-keeper -i hy2 init          # registers its own account, writes 00-warp-keeper-hy2.json, reloads
+systemctl enable --now warp-keeper@hy2.timer
+```
+
+An instance is fully separate: its own account, fragment, endpoint tag, probe port, state (`/var/lib/warp-keeper-hy2/`), timer and Sonde card. Its env sources `/etc/warp-keeper.env` first, so Telegram / Sonde / WARP+ settings are inherited. Every command takes `-i hy2`; the main instance is unchanged. All instances share one lock, so two of them never reload sing-box at the same time.
+
+With `SYSTEM_IFACE`, the endpoint becomes a real network interface. sing-box keeps its own route table plus an `oif <iface>` rule for it (the main table is untouched), so any inbound with `"bind_interface": "<iface>"` sends and receives all its UDP through WARP. `remove` (and renaming the interface) refuses while another config file still binds to it, because that inbound would stop sing-box from starting.
+
 ## 🔧 Configuration
 
 Settings live in `/etc/warp-keeper.env`; run `warp-keeper init` after editing (keeps the account, reloads only if the fragment changed). Template: [`warp-keeper.env.example`](warp-keeper.env.example).
@@ -120,7 +133,8 @@ Settings live in `/etc/warp-keeper.env`; run `warp-keeper init` after editing (k
 | `MTU` | ❌ | `1280` | WireGuard MTU |
 | `PEER` / `PEER_PORT` | ❌ | `auto` / `2408` | Peer address and port |
 | `SB_SERVICE` / `SB_CONFIG_DIR` | ❌ | `sing-box` / from unit | sing-box service and config directory |
-| `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | Fragment file name (sort order matters) |
+| `FRAGMENT_NAME` | ❌ | `00-warp-keeper.json` | Fragment file name (sort order matters); fixed to `00-warp-keeper-<name>.json` for instances |
+| `SYSTEM_IFACE` | ❌ | — | Create the endpoint as this system interface (needs `/dev/net/tun` and an IP peer) |
 | `RENEW_MIN_GAP` | ❌ | `360` | Minutes between automatic renewals |
 | `WARP_PLUS` | ❌ | `off` (template: `auto`) | `auto`, `off`, or licence keys |
 | `TIMEZONE` | ❌ | `Asia/Taipei` | Time zone for messages and the daily summary |
@@ -141,12 +155,13 @@ Reinstalls the program, then runs `warp-keeper sync`: if the regenerated fragmen
 
 ### Data & backup
 
-`/var/lib/warp-keeper/` (700): `account.json` (device ID, token, private key), `state`, `checks.log` (8 days of results), `fragment.prev`, `bad-keys`.
+`/var/lib/warp-keeper/` (700; instances: `/var/lib/warp-keeper-<name>/`): `account.json` (device ID, token, private key), `state`, `checks.log` (8 days of results), `fragment.prev`, `bad-keys`.
 
 ### Logs
 
 ```bash
 journalctl -u warp-keeper --output cat
+journalctl -u warp-keeper@hy2 --output cat   # an instance
 ```
 
 ### Uninstall
@@ -157,7 +172,7 @@ Remove route rules that use `WARP_TAG` from the main config first, then:
 ./warp-keeper/uninstall.sh
 ```
 
-It runs `warp-keeper remove` (delete fragment → check → reload → deregister) and only then deletes the units and program. Config and state are kept.
+It runs `warp-keeper -i <name> remove` for every instance and then `warp-keeper remove` (delete fragment → check → reload → deregister) and only then deletes the units and program. Config and state are kept.
 
 ## 🧠 How It Works
 

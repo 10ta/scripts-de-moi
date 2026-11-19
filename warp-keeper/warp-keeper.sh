@@ -10,25 +10,38 @@
 #   warp-keeper.sh sync        按当前版本和 env 重新生成片段，有变化才重载（update.sh 用）
 #   warp-keeper.sh remove      删掉配置片段、重载 sing-box、注销账户（主配置还在引用 tag 时会拒绝）
 #
+#   warp-keeper.sh -i 名字 命令  管理另一个独立的 WARP（实例）：自己的账户、片段、入站和 timer（warp-keeper@名字.timer）
+#                              配置 /etc/warp-keeper-名字.env（第一次 init 时生成），状态 /var/lib/warp-keeper-名字/
+#
 # 工作方式：在 sing-box 的配置目录（systemd 里 -C 指定的那个）放一个独立的 JSON 片段：
 #   · wireguard endpoint（tag 默认「🧩 <WARP>」，你的路由规则直接引用它）
 #   · 一个只监听 127.0.0.1 的 mixed 入站（默认 18650，可以顶替原来 wireproxy 的 socks5 地址）
 #   · 一条规则：这个入站的流量全部走上面的 endpoint
 # sing-box 按文件名合并目录里的所有 .json，主配置一行不用改。
 # 配置在 /etc/warp-keeper.env，状态在 /var/lib/warp-keeper/。
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -uo pipefail
 umask 077
 
-ENV_FILE="${WARP_KEEPER_ENV:-/etc/warp-keeper.env}"
+# 实例：-i 名字。不带就是主实例（/etc/warp-keeper.env），和以前完全一样
+INST=""
+if [[ "${1:-}" == -i || "${1:-}" == --instance ]]; then
+  INST=${2:-}
+  shift 2 2>/dev/null || shift $#
+  [[ "$INST" =~ ^[a-z0-9]{1,12}$ ]] || { printf '错误: 实例名只能是 1–12 个小写字母或数字，例如 -i hy2\n' >&2; exit 2; }
+fi
+SFX=${INST:+-$INST}
+CMD="warp-keeper${INST:+ -i $INST}"
+MAIN_ENV=/etc/warp-keeper.env
+ENV_FILE="${WARP_KEEPER_ENV:-/etc/warp-keeper$SFX.env}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 # ---------- 配置（含义见 warp-keeper.env.example）----------
 WARP_NAME="${WARP_NAME:-}"
-WARP_TAG="${WARP_TAG:-🧩 <WARP>}"
+WARP_TAG="${WARP_TAG:-🧩 <WARP$SFX>}"
 LOCAL_PORT="${LOCAL_PORT:-18650}"
 STACK="${STACK:-dual}"                      # dual / v4 / v6
 MTU="${MTU:-1280}"
@@ -41,6 +54,8 @@ RENEW_MIN_GAP="${RENEW_MIN_GAP:-360}"       # 分钟：两次自动换号的最�
 SB_SERVICE="${SB_SERVICE:-sing-box}"
 SB_CONFIG_DIR="${SB_CONFIG_DIR:-}"
 FRAGMENT_NAME="${FRAGMENT_NAME:-00-warp-keeper.json}"
+[[ -n "$INST" ]] && FRAGMENT_NAME="00-warp-keeper-$INST.json"   # 实例的片段名固定，绝不会覆盖主实例的片段
+SYSTEM_IFACE="${SYSTEM_IFACE:-}"            # 留空 = 用户态 endpoint（默认）；写网卡名 = 在系统里建这张网卡
 TIMEZONE="${TIMEZONE:-Asia/Taipei}"
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
@@ -54,14 +69,15 @@ WARP_UA="${WARP_UA:-okhttp/3.12.1}"
 WARP_CLIENT_VER="${WARP_CLIENT_VER:-a-6.10-2158}"
 
 export TZ="$TIMEZONE"
-STATE_DIR=/var/lib/warp-keeper
+STATE_DIR=/var/lib/warp-keeper$SFX
 ACC="$STATE_DIR/account.json"
 STATE="$STATE_DIR/state"
 HIST="$STATE_DIR/checks.log"
 BADKEYS="$STATE_DIR/bad-keys"
-IN_TAG="warp-keeper-in"
+IN_TAG="warp-keeper$SFX-in"
+TIMER="warp-keeper${INST:+@$INST}.timer"
 HOST="$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname)"
-[[ -n "$WARP_NAME" ]] || WARP_NAME="$HOST"
+[[ -n "$WARP_NAME" ]] || WARP_NAME="$HOST$SFX"
 NOW=$(date +%s)
 
 log()  { printf '%s\n' "$*"; }
@@ -92,21 +108,75 @@ save_state() {
   } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 
-# 同一时间只跑一个（timer 和手动命令撞上时，手动的等一会儿）
+# 同一时间只跑一个——所有实例共用一把锁：它们重载的是同一个 sing-box，
+# 一个在重载时另一个去探测，会把对方的重载误判成故障。手动命令最多等 3 分钟，timer 最多等 5 分钟
 take_lock() {
   exec 9>/run/warp-keeper.lock
   if [[ "${1:-}" == wait ]]; then
     flock -w 180 9 || fatal "另一个 warp-keeper 一直在运行（3 分钟没结束），稍后再试"
   else
-    flock -n 9 || { log "另一个 warp-keeper 正在运行，这次跳过"; exit 0; }
+    flock -w 300 9 || { log "另一个 warp-keeper 一直在运行（5 分钟没结束），这次跳过"; exit 0; }
   fi
 }
 
 need_root() { [[ $EUID -eq 0 ]] || fatal "请用 root 运行"; }
 need_deps() {
   local c miss=()
-  for c in curl jq ss flock base64 od systemctl; do command -v "$c" >/dev/null || miss+=("$c"); done
+  for c in curl jq ss ip flock base64 od systemctl; do command -v "$c" >/dev/null || miss+=("$c"); done
   (( ${#miss[@]} == 0 )) || fatal "缺少命令：${miss[*]}（重新运行 install.sh 会自动安装）"
+}
+
+# ---------- 实例 ----------
+# 实例和主实例撞了名字 / tag / 端口：要么 sing-box check 不过，要么两个 WARP 的 Sonde 卡片互相覆盖
+inst_guard() {
+  [[ -n "$INST" ]] || return 0
+  local m_name m_tag m_port
+  { IFS= read -r m_name; IFS= read -r m_tag; IFS= read -r m_port; } < <(HOST="$HOST" bash -c \
+    '[[ -f "$1" ]] && source "$1" >/dev/null 2>&1; printf "%s\n%s\n%s\n" "${WARP_NAME:-$HOST}" "${WARP_TAG:-🧩 <WARP>}" "${LOCAL_PORT:-18650}"' _ "$MAIN_ENV")
+  [[ "$WARP_NAME" != "$m_name" ]] || fatal "实例 $INST 的 WARP_NAME（$WARP_NAME）和主实例一样，在 $ENV_FILE 里换一个"
+  [[ "$WARP_TAG" != "$m_tag" ]]   || fatal "实例 $INST 的 WARP_TAG（$WARP_TAG）和主实例一样，在 $ENV_FILE 里换一个"
+  [[ "$LOCAL_PORT" != "$m_port" ]] || fatal "实例 $INST 的 LOCAL_PORT（$LOCAL_PORT）和主实例一样，在 $ENV_FILE 里换一个"
+}
+# 第一次 init 一个实例：生成它的 env。先 source 主配置（继承 Telegram / Sonde / WARP+ / 时区…），再覆盖必须不同的几项
+make_inst_env() {
+  local port=18651
+  while ss -Hlnt "sport = :$port" 2>/dev/null | grep -q .; do port=$((port + 1)); done
+  {
+    printf '# %s —— warp-keeper 实例「%s」的配置（%s init 生成，权限 600）\n' "$ENV_FILE" "$INST" "$CMD"
+    printf '# 先读主配置，继承 Telegram / Sonde / WARP+ / 时区 / MTU 等；下面三项每个实例都必须和主实例不同\n'
+    printf '[[ -f %s ]] && source %s\n' "$MAIN_ENV" "$MAIN_ENV"
+    printf 'WARP_NAME="%s"\nWARP_TAG="🧩 <WARP-%s>"\nLOCAL_PORT=%s\n\n' "$HOST-$INST" "$INST" "$port"
+    printf '# 按需打开（含义见 warp-keeper.env.example）。片段名固定是 00-warp-keeper-%s.json\n' "$INST"
+    printf '#STACK=v6\n#SYSTEM_IFACE=wk%s\n' "$INST"
+  } > "$ENV_FILE.tmp" && chmod 600 "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+}
+
+# ---------- 系统网卡（SYSTEM_IFACE）----------
+# endpoint 开 system：sing-box 建一张真网卡，并自己维护一张路由表 + 「oif 这张网卡」的规则（主路由表不动）。
+# 别的入站写 bind_interface 绑上它，那个 socket 收发的包就全走 WARP
+sys_check() {
+  [[ -n "$SYSTEM_IFACE" ]] || return 0
+  [[ "$SYSTEM_IFACE" =~ ^[A-Za-z0-9_-]{1,15}$ ]] || fatal "SYSTEM_IFACE=$SYSTEM_IFACE 不是合法的网卡名（1–15 个字母、数字、_ 或 -）"
+  [[ -c /dev/net/tun ]] || fatal "本机没有 /dev/net/tun（OpenVZ / LXC 常见），建不了系统网卡。去掉 SYSTEM_IFACE，或者换台机器"
+  if [[ "$STACK" != v4 && "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" != 0 ]]; then
+    fatal "内核关掉了 IPv6（net.ipv6.conf.all.disable_ipv6），WARP 网卡拿不到 IPv6 地址。改 STACK=v4，或者打开 IPv6"
+  fi
+  if ip link show "$SYSTEM_IFACE" >/dev/null 2>&1 && [[ "$(jq -r '.endpoints[0].name // empty' "$FRAG" 2>/dev/null)" != "$SYSTEM_IFACE" ]]; then
+    fatal "系统里已经有网卡 $SYSTEM_IFACE（不是这个实例建的），sing-box 会起不来。换一个 SYSTEM_IFACE"
+  fi
+}
+iface_refs() {   # iface_refs 网卡：配置目录里（本片段以外）还有谁 bind_interface 绑着它
+  [[ -n "$1" ]] || return 0
+  grep -lE "\"bind_interface\"[[:space:]]*:[[:space:]]*\"$1\"" "$SB_DIR"/*.json 2>/dev/null | grep -vxF "$FRAG" | xargs -r -n1 basename | paste -sd ' '
+}
+# 网卡要消失或改名时：还有入站绑着旧网卡就拒绝——那个入站启动失败会让整个 sing-box 起不来
+iface_change_guard() {
+  local old refs
+  old=$(jq -r '.endpoints[0].name // empty' "$FRAG" 2>/dev/null)
+  [[ -n "$old" && "$old" != "${1-$SYSTEM_IFACE}" ]] || return 0
+  refs=$(iface_refs "$old")
+  [[ -z "$refs" ]] || fatal "这些配置还绑着网卡 $old（bind_interface）：$refs
+  网卡没了它们会让整个 sing-box 起不来。先改掉或删掉它们，再来"
 }
 
 # ---------- sing-box：从 systemd 单元里读出它实际的启动参数 ----------
@@ -146,6 +216,7 @@ sb_detect() {
     然后：$SB_BIN -c /etc/sing-box/config.json -C /etc/sing-box check && systemctl restart $SB_SERVICE"
   fi
   FRAG="$SB_DIR/$FRAGMENT_NAME"
+  inst_guard
 }
 sb_check() { "$SB_BIN" "${SB_ARGS[@]}" check 2>&1; }
 sb_version() { "$SB_BIN" version 2>/dev/null | sed -n '1s/.*version //p'; }
@@ -271,6 +342,10 @@ build_fragment() {   # build_fragment 账户文件 → stdout
     if ip -4 route show default 2>/dev/null | grep -q .; then host=$(acc endpoint_v4 "$f"); else host=$(acc endpoint_v6 "$f"); fi
     [[ -n "$host" ]] || host="engage.cloudflareclient.com"
   fi
+  # 对端是域名时 sing-box 要等 DNS 就绪才启动 endpoint（晚于所有入站），绑这张网卡的入站就会因为网卡还不存在而起不来
+  if [[ -n "$SYSTEM_IFACE" && ! "$host" =~ ^[0-9.]+$ && "$host" != *:* ]]; then
+    CHECK_ERR="SYSTEM_IFACE 要求对端是 IP，现在是 $host：把 PEER 写成 IP（比如 162.159.192.1）"; return 1
+  fi
   case "$STACK" in
     v4) addr=$(jq -nc --arg a "$(acc v4 "$f")" '[$a + "/32"]'); allowed='["0.0.0.0/0"]' ;;
     v6) addr=$(jq -nc --arg b "$(acc v6 "$f")" '[$b + "/128"]'); allowed='["::/0"]' ;;
@@ -278,11 +353,13 @@ build_fragment() {   # build_fragment 账户文件 → stdout
   esac
   jq -n --arg tag "$WARP_TAG" --arg in "$IN_TAG" --argjson port "$LOCAL_PORT" --argjson mtu "$MTU" \
     --argjson addr "$addr" --arg key "$(acc private_key "$f")" --arg host "$host" --argjson pport "$PEER_PORT" \
-    --arg pub "$(acc peer_public_key "$f")" --argjson allowed "$allowed" --argjson ka "$KEEPALIVE" --argjson res "$rjson" '{
+    --arg pub "$(acc peer_public_key "$f")" --argjson allowed "$allowed" --argjson ka "$KEEPALIVE" --argjson res "$rjson" \
+    --arg sys "$SYSTEM_IFACE" '{
     inbounds: [{type: "mixed", tag: $in, listen: "127.0.0.1", listen_port: $port}],
-    endpoints: [{type: "wireguard", tag: $tag, mtu: $mtu, address: $addr, private_key: $key,
+    endpoints: [({type: "wireguard", tag: $tag, mtu: $mtu, address: $addr, private_key: $key,
       peers: [({address: $host, port: $pport, public_key: $pub, allowed_ips: $allowed,
-                persistent_keepalive_interval: $ka} + (if ($res | length) == 3 then {reserved: $res} else {} end))]}],
+                persistent_keepalive_interval: $ka} + (if ($res | length) == 3 then {reserved: $res} else {} end))]}
+      + (if $sys != "" then {system: true, name: $sys} else {} end))],
     route: {rules: [{inbound: [$in], action: "route", outbound: $tag}]}
   }'
 }
@@ -290,8 +367,9 @@ build_fragment() {   # build_fragment 账户文件 → stdout
 # 临时文件不能以 .json 结尾：sing-box 会把配置目录里所有 .json 都读进去
 CHECK_ERR=""
 write_fragment() {   # write_fragment 账户文件
-  local tmp="$SB_DIR/.warp-keeper.tmp" out
-  build_fragment "$1" > "$tmp" || { rm -f "$tmp"; CHECK_ERR="生成配置片段失败"; return 1; }
+  local tmp="$SB_DIR/.warp-keeper$SFX.tmp" out
+  CHECK_ERR=""
+  build_fragment "$1" > "$tmp" || { rm -f "$tmp"; CHECK_ERR=${CHECK_ERR:-生成配置片段失败}; return 1; }
   if [[ -f "$FRAG" ]] && cmp -s "$tmp" "$FRAG"; then rm -f "$tmp"; return 2; fi
   rm -f "$STATE_DIR/fragment.prev"
   [[ -f "$FRAG" ]] && cp -p "$FRAG" "$STATE_DIR/fragment.prev"
@@ -535,13 +613,20 @@ renew() {
 
 # ---------- 命令 ----------
 cmd_init() {
-  need_root; need_deps; take_lock wait; load_state
+  need_root; need_deps
+  if [[ -n "$INST" && ! -f "$ENV_FILE" ]]; then
+    make_inst_env
+    log "已生成实例 $INST 的配置 $ENV_FILE（继承主配置；名字、tag、端口已和主实例错开）"
+    log "看一眼、按需加 STACK / SYSTEM_IFACE，然后再运行一次：$CMD init"
+    exit 0
+  fi
+  take_lock wait; load_state
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-  sb_detect
+  sb_detect; sys_check; iface_change_guard
   local v; v=$(sb_version)
   [[ -n "$v" ]] || fatal "$SB_BIN 运行不了"
   if [[ "$(printf '%s\n' 1.11.0 "${v%%-*}" | sort -V | head -1)" != 1.11.0 ]]; then fatal "sing-box $v 太旧，wireguard endpoint 需要 1.11 以上"; fi
-  log "sing-box $v · 配置目录 $SB_DIR · 片段 $FRAGMENT_NAME"
+  log "sing-box $v · 配置目录 $SB_DIR · 片段 $FRAGMENT_NAME${SYSTEM_IFACE:+ · 系统网卡 $SYSTEM_IFACE}"
 
   # 端口：没被占用，或者已经是本脚本让 sing-box 监听的
   local owner; owner=$(port_owner)
@@ -570,7 +655,7 @@ cmd_init() {
   (( rc != 1 )) || fatal "sing-box check 不通过，已恢复原样：
 $CHECK_ERR
   常见原因：主配置里还留着同名的「$WARP_TAG」（旧的 endpoint 或 socks 出站），删掉它（先别重启 sing-box），再运行 init"
-  sb_active || fatal "$SB_SERVICE 没在运行。片段已经写好并通过检查，启动它：systemctl start $SB_SERVICE，然后运行 $0 status"
+  sb_active || fatal "$SB_SERVICE 没在运行。片段已经写好并通过检查，启动它：systemctl start $SB_SERVICE，然后运行 $CMD status"
   if (( rc == 2 )) && [[ "$(port_owner)" == sing-box* ]]; then
     log "配置片段和现在的一样，不用重载 sing-box"
   else
@@ -591,7 +676,7 @@ $CHECK_ERR
 
 cmd_check() {
   need_root; need_deps; take_lock; load_state
-  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$0 init"
+  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$CMD init"
   sb_detect
   if ! sb_active; then KIND=sbdown; REASON="$SB_SERVICE 没在运行，WARP 不做处理"; finish; fi
   if [[ "$(port_owner)" != sing-box* ]]; then
@@ -640,7 +725,7 @@ cmd_check() {
   local gap=$(( RENEW_MIN_GAP * 60 ))
   if [[ "$alive" != dead ]] && (( NOW - LAST_RENEW < gap )); then
     KIND=failed; REASON="$PROBE_FAIL 不通，重载也没用"
-    NOTE="距上次换号不到 $((RENEW_MIN_GAP / 60)) 小时，这次先不换（RENEW_MIN_GAP）；急的话手动运行 warp-keeper.sh renew"
+    NOTE="距上次换号不到 $((RENEW_MIN_GAP / 60)) 小时，这次先不换（RENEW_MIN_GAP）；急的话手动运行 $CMD renew"
     finish
   fi
   log "第 2 步：换新账户"
@@ -656,7 +741,7 @@ cmd_check() {
 cmd_sync() {
   need_root; need_deps; take_lock wait; load_state
   [[ -s "$ACC" ]] || { log "还没有账户，跳过（首次请运行 init）"; exit 0; }
-  sb_detect
+  sb_detect; sys_check; iface_change_guard
   local rc=0
   write_fragment "$ACC" || rc=$?
   case $rc in
@@ -675,7 +760,7 @@ $CHECK_ERR" ;;
 
 cmd_renew() {
   need_root; need_deps; take_lock wait; load_state
-  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$0 init"
+  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$CMD init"
   sb_detect
   sb_active || fatal "$SB_SERVICE 没在运行"
   log "换新账户（sing-box 会重载一次）..."
@@ -686,7 +771,7 @@ cmd_renew() {
 
 cmd_plus() {
   need_root; need_deps; take_lock wait; load_state
-  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$0 init"
+  [[ -s "$ACC" ]] || fatal "还没有账户，先运行：$CMD init"
   sb_detect
   local key=${1:-}
   if [[ -z "$key" && "$WARP_PLUS" == off ]]; then fatal "env 里 WARP_PLUS=off：要么在命令后面带上许可证，要么把 WARP_PLUS 设成 auto"; fi
@@ -700,6 +785,7 @@ cmd_plus() {
 cmd_remove() {
   need_root; need_deps; take_lock wait
   sb_detect
+  iface_change_guard ""
   if [[ -f "$FRAG" ]]; then
     cp -p "$FRAG" "$STATE_DIR/fragment.prev"; rm -f "$FRAG"
     local out
@@ -719,11 +805,15 @@ $(tail -n 3 <<<"$out")
 cmd_status() {
   need_root; need_deps; load_state
   sb_detect
-  [[ -s "$ACC" ]] || { echo "还没有账户，先运行：$0 init"; exit 1; }
+  [[ -s "$ACC" ]] || { echo "还没有账户，先运行：$CMD init"; exit 1; }
   local s a b alive
   echo "warp-keeper v$VERSION · $WARP_NAME · sing-box $(sb_version)（$( sb_active && echo 运行中 || echo 没在运行)）"
   echo "片段     $FRAG $( [[ -f "$FRAG" ]] && echo '' || echo '（不存在！）')"
   echo "入站     127.0.0.1:$LOCAL_PORT（$(port_owner || true)）→ $WARP_TAG"
+  if [[ -n "$SYSTEM_IFACE" ]]; then
+    local st; st=$(ip -br link show dev "$SYSTEM_IFACE" 2>/dev/null | awk '{print $2}')
+    echo "网卡     $SYSTEM_IFACE（${st:-不存在！}）· 被这些配置绑定：$(iface_refs "$SYSTEM_IFACE" || true)"
+  fi
   alive=$(account_alive)
   echo "账户     $(acct_label) · 已用 $(acct_days) 天 · Cloudflare 侧：$alive · WARP+ 来源：$WARP_PLUS"
   echo "换号     累计 $RENEW_TOTAL 次（上次 $(ago "$LAST_RENEW")）· 重载 $RELOAD_TOTAL 次 · 上次正常 $(ago "$LAST_OK")"
@@ -733,7 +823,7 @@ cmd_status() {
   echo "实测："
   probe_all >/dev/null 2>&1 || true
   for s in $(stacks); do echo "  $(stack_line "$s")"; done
-  echo "下次检查：$(systemctl show -p NextElapseUSecRealtime --value warp-keeper.timer 2>/dev/null || echo '?')"
+  echo "下次检查：$(systemctl show -p NextElapseUSecRealtime --value "$TIMER" 2>/dev/null || echo '?')"
 }
 
 case "${1:-}" in

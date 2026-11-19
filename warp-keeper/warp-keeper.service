@@ -7,5 +7,5 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/opt/warp-keeper/warp-keeper.sh check
-# 最坏情况：探测重试 + 重载 + 注册 + 再探测，几分钟内一定结束
-TimeoutStartSec=10min
+# 最坏情况：先等别的实例（最多 5 分钟）+ 探测重试 + 重载 + 注册 + 再探测
+TimeoutStartSec=15min
