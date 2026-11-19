@@ -49,14 +49,16 @@ fi
 
 install -m 755 cfst-ddns.sh "$DIR/cfst-ddns.sh"
 
-TIMER_WAS_ON=""
+TIMER_WAS_ON=""; BOT_WAS_ON=""
 systemctl is-enabled --quiet cfst-ddns.timer 2>/dev/null && TIMER_WAS_ON=1
-install -m 644 'cfst-ddns@.service' cfst-ddns.timer /etc/systemd/system/
+systemctl is-enabled --quiet cfst-ddns-bot.service 2>/dev/null && BOT_WAS_ON=1
+install -m 644 'cfst-ddns@.service' cfst-ddns.timer cfst-ddns-bot.service /etc/systemd/system/
 ENV_KEPT=""
 if [[ -f /etc/cfst-ddns.env ]]; then ENV_KEPT=1
 else install -m 600 cfst-ddns.env.example /etc/cfst-ddns.env; fi
 systemctl daemon-reload
 if [[ -n "$TIMER_WAS_ON" ]]; then systemctl restart cfst-ddns.timer; echo "已重启 cfst-ddns.timer（新的调度方式已生效）"; fi
+if [[ -n "$BOT_WAS_ON" ]]; then systemctl restart cfst-ddns-bot.service; echo "已重启 cfst-ddns-bot（Telegram 命令）"; fi
 
 cat <<EOF
 
@@ -68,6 +70,8 @@ cat <<EOF
   4. 看进度和结果    journalctl -fu 'cfst-ddns@*' --output cat
   5. 没问题就启用    systemctl enable --now cfst-ddns.timer
                      （每 5 分钟检查一次时间表，按 env 里的 FULL_AT / PEAK_* 决定做什么）
+  6. 可选：Telegram 命令（/pool 看榜单、点按钮切换）
+                     systemctl enable --now cfst-ddns-bot
 EOF
 if [[ -n "$ENV_KEPT" ]]; then
   echo

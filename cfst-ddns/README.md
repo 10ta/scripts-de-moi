@@ -42,12 +42,12 @@ Which CDN edge IP is fast depends on your ISP's routing and the time of day, and
 ## ✨ Highlights
 
 - **Three levels of work** — usually only the current IP is checked; the shortlist is re-tested when it degrades; a full scan runs once a day before the evening peak.
-- **Peak-aware schedule** — checks every 30 min during peak hours and every 2 h otherwise, in your time zone.
-- **No flapping** — a new IP must beat the current one by `SWITCH_MARGIN` (20%) to replace it.
-- **Download, upload or latency** — rank by `RANK_BY`; split candidates by latency to compare two routes.
+- **Peak-aware schedule** — checks every 30 min during peak hours and every 2 h otherwise, plus fixed re-tests at peak (`POOL_AT`).
+- **Learns across days** — ranks by the median of recent same-period results and always re-tests the IPs that held up best at peak.
+- **Download, upload or latency** — rank by `RANK_BY` (latency ranks loss first); a new IP must beat the current one by `SWITCH_MARGIN`, and no result or an API error never changes the record.
 - **Seeds** — public "preferred IP" domains and pages are re-tested on your line and tracked against the official scan (`stats`).
 - **Several CDNs** — each target in `TARGETS` keeps its own record, shortlist and schedule; CloudFront and Fastly IP lists are built in.
-- **Safe by default** — no result, zero speed or an API error never changes the existing record.
+- **Switch from Telegram** — `/pool` lists each shortlist with buttons; a tap switches and holds that IP for `MANUAL_HOLD` minutes.
 
 ## 🚀 Quick Start
 
@@ -107,6 +107,17 @@ systemctl start cfst-ddns@full:cloudfront
 
 `start` returns at once; progress goes to `journalctl -fu 'cfst-ddns@*' --output cat`. Add `:<target>` to run a single target.
 
+### Switch from Telegram
+
+```bash
+systemctl enable --now cfst-ddns-bot
+```
+
+Then send the bot `/pool`: one message per target with rank, colo, ms, loss, MB/s and sample count, plus a button per rank. A tap switches the record and keeps it for `MANUAL_HOLD` minutes (240) unless it stops working; `/use cloudfront 2` does the same by text, `/auto` returns to automatic. Only `TG_CHAT_ID` is obeyed.
+
+> [!WARNING]
+> The bot receives with `getUpdates`. If the same bot token is already read by another program or has a webhook, both break with a 409 error: create a separate bot and set `TG_CMD_BOT_TOKEN`.
+
 ### Compare seeds with the official scan
 
 ```bash
@@ -137,11 +148,17 @@ Settings live in `/etc/cfst-ddns.env`. The full commented list is [`cfst-ddns.en
 | `MIN_SPEED` / `SWITCH_MARGIN` / `HEALTH_RATIO` | ❌ | `0` / `20` / `70` | Floor (MB/s), switch margin (%), health ratio (%) |
 | `SPEED_TOLERANCE` | ❌ | `0` | Within this % of the fastest, prefer lower loss, then lower latency |
 | `FULL_MIN_GAP` | ❌ | `120` | Minutes between full scans after a failed one or a failed shortlist |
+| `POOL_AT` | ❌ | — | Daily time(s) to re-test the shortlist regardless of health, e.g. `"20:00 22:00"` |
+| `RETEST_PINGS` | ❌ | `0` | Latency probes per IP in checks, re-tests and full-scan candidates (`cfst -t`); 0 = cfst default 4 |
+| `HEALTH_LOSS` / `LOSS_MARGIN` | ❌ | `1` / `0.05` | Loss rate that fails a check; loss gap that wins a switch when `RANK_BY=latency` |
+| `TRACK_DAYS` / `PROVEN_KEEP` | ❌ | `7` / `5` | Days of same-period results used for ranking; best peak IPs always re-tested |
+| `MANUAL_HOLD` | ❌ | `240` | Minutes a Telegram-chosen IP is kept |
 | `CFST_ARGS` | ❌ | `-tl 250` | Extra cfst flags; never `-f -o -p -dn -dd` |
 | `SEEDS_DNS` / `SEEDS_URL` | ❌ | — | Seed sources |
 | `API_PROXY` | ❌ | direct | Proxy for API and Telegram requests |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_NOTIFY` | ❌ | — / — / `all` | Telegram summaries (`all`, `change`, `off`) |
 | `TG_NOTIFY_CHECK` | ❌ | `off` | Also send a message when a check finds the current IP healthy |
+| `TG_CMD_BOT_TOKEN` | ❌ | `TG_BOT_TOKEN` | Separate bot for commands, if the main token is read elsewhere |
 | `SONDE_URL` / `SONDE_TOKEN` | ❌ | — | Sonde panel reporting |
 | `<TARGET>_XXX` | ❌ | — | Per-target override, e.g. `CLOUDFRONT_RECORD_NAME` |
 
@@ -156,12 +173,13 @@ cd /opt/scripts-de-moi
 
 ### Data & backup
 
-Config: `/etc/cfst-ddns.env` (600). Per-target state in `/var/lib/cfst-ddns/<target>/`: `pool.csv` (shortlist), `state` (last runs, baseline), `history.csv` (for `stats`), `colo.cache`, `cfst.log`.
+Config: `/etc/cfst-ddns.env` (600). Per-target state in `/var/lib/cfst-ddns/<target>/`: `pool.csv` (shortlist), `top.csv` (last ranking, used by `/pool`), `track.csv` (per-IP results for `TRACK_DAYS`), `state` (last runs, baseline, manual hold), `history.csv` (for `stats`), `colo.cache`, `cfst.log`.
 
 ### Logs
 
 ```bash
 journalctl -fu 'cfst-ddns@*' --output cat
+journalctl -fu cfst-ddns-bot --output cat
 ```
 
 The timer starts `cfst-ddns@auto` every 5 minutes; when nothing is due it exits in milliseconds, so short start/stop lines in the journal are normal.
@@ -172,7 +190,7 @@ The timer starts `cfst-ddns@auto` every 5 minutes; when nothing is due it exits 
 ./cfst-ddns/uninstall.sh
 ```
 
-Removes the timer, units and `/opt/cfst-ddns`. Config, history and the `cfst-ddns` user are kept, and the delete commands are printed. The DNS record keeps its last IP.
+Removes the timer, units (including the bot) and `/opt/cfst-ddns`. Config, history and the `cfst-ddns` user are kept, and the delete commands are printed. The DNS record keeps its last IP.
 
 ## 🧠 How It Works
 
@@ -180,10 +198,13 @@ Removes the timer, units and `/opt/cfst-ddns`. Config, history and the `cfst-ddn
 flowchart LR
   T[cfst-ddns.timer<br/>every 5 min] --> A[cfst-ddns@auto]
   A -->|FULL_AT reached| F[③ full scan]
+  A -->|POOL_AT reached| P
   A -->|check due| C[① check current IP]
   C -->|degraded| P[② re-test shortlist]
   P -->|nothing good| F
+  H[(track.csv<br/>days of results)] -.->|medians, proven IPs| P & F
   P & F -->|beats current by SWITCH_MARGIN| D[Cloudflare DNS API]
+  B[Telegram /pool<br/>button] -->|use:target| D
   C & P & F --> N[Telegram / Sonde]
 ```
 
@@ -192,6 +213,8 @@ flowchart LR
 - **Runs never overlap** → a `flock` makes a new round skip while one is running; each run is capped at 30 minutes.
 - **A failed full scan waits before retrying** → at most one full scan per `FULL_MIN_GAP`, so a broken direct route does not turn into thousands of probes every 5 minutes. The same failure goes to Telegram once per 2 hours.
 - **Re-testing never shrinks the shortlist** → IPs that are unreachable for one round stay until the next full scan.
+- **One measurement is noise** → every tested IP is logged to `track.csv`; ranking uses the median latency / speed and mean loss of the last `TRACK_DAYS` days in the same period (peak or off-peak), and the `PROVEN_KEEP` best peak IPs join every re-test. An IP that is unreachable now is never picked for its history.
+- **Upload legs care about loss** → with `RANK_BY=latency`, a lower loss rate (by `LOSS_MARGIN`) wins before latency is compared; `RETEST_PINGS` makes the loss rate fine enough to tell.
 - **Seeds must fall inside the CDN's official ranges** → a hijacked public domain cannot inject foreign IPs (unless `SEED_ALLOW_OUTSIDE=1`).
 - **Messages show the edge's colo code, not the IP** → Telegram and Sonde never carry IPs or domains.
 
@@ -201,7 +224,7 @@ flowchart LR
 bash cfst-ddns/tests/run.sh
 ```
 
-Runs the whole flow offline with a fake cfst and a fake Cloudflare / Telegram API, no root needed; it ends with `通过 25 项，失败 0 项`. Before relying on a change, also run it once against a throw-away record and watch the journal.
+Runs the whole flow offline with a fake cfst and a fake Cloudflare / Telegram API, no root needed; it ends with `通过 60 项，失败 0 项`. Before relying on a change, also run it once against a throw-away record and watch the journal.
 
 ## 📚 Documentation
 

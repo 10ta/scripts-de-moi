@@ -42,12 +42,12 @@
 ## ✨ 亮点
 
 - **三级流程**：平时只巡检当前 IP；变差了才复测榜单；每天晚高峰前做一次全量扫描。
-- **按时段调度**：晚高峰每 30 分钟巡检一次，其余时间每 2 小时，按你设的时区。
-- **不来回跳**：新 IP 要比当前的好 `SWITCH_MARGIN`（20%）以上才会替换。
-- **按下载、上传或延迟选**：由 `RANK_BY` 决定；可以按延迟分段，比较两条线路。
+- **按时段调度**：晚高峰每 30 分钟巡检一次，其余时间每 2 小时；还可以在高峰中段定时复测（`POOL_AT`）。
+- **跨天积累**：排名用近几天同一时段的中位数，晚高峰表现最好的几个 IP 每次复测都在。
+- **按下载、上传或延迟选**：由 `RANK_BY` 决定（只看延迟时先比丢包）；新 IP 要比当前的好 `SWITCH_MARGIN` 才替换，没有结果或 API 报错时一律不动解析。
 - **种子**：公共优选域名和网页里的 IP 会在你的线路上重测，并和官方扫描对比（`stats`）。
 - **多个 CDN**：`TARGETS` 里的每个目标各有自己的记录、榜单和时间表；内置 CloudFront、Fastly 的官方 IP 列表。
-- **默认安全**：没有结果、速度为 0、API 报错时，一律不动现有解析。
+- **Telegram 切换**：`/pool` 列出各目标的榜单和按钮，点一下就切过去，并保留 `MANUAL_HOLD` 分钟。
 
 ## 🚀 快速开始
 
@@ -107,6 +107,17 @@ systemctl start cfst-ddns@full:cloudfront
 
 `start` 会立即返回，进度看 `journalctl -fu 'cfst-ddns@*' --output cat`。后面加 `:<目标>` 只跑这一个目标。
 
+### 用 Telegram 切换
+
+```bash
+systemctl enable --now cfst-ddns-bot
+```
+
+然后给 bot 发 `/pool`：每个目标一条消息，列出排名、机房、延迟、丢包、速度和样本数，每个排名一个按钮。点按钮就切过去，保留 `MANUAL_HOLD` 分钟（240），期间只要它还能用就不会被自动换走；`/use cloudfront 2` 用文字做同样的事，`/auto` 恢复自动。只认 `TG_CHAT_ID` 这个会话。
+
+> [!WARNING]
+> bot 用 `getUpdates` 收消息。同一个 bot token 如果已经有别的程序在收消息、或者设了 webhook，两边都会 409 报错：给命令单独建一个 bot，填 `TG_CMD_BOT_TOKEN`。
+
 ### 对比种子和官方扫描
 
 ```bash
@@ -137,11 +148,17 @@ systemctl start cfst-ddns@full:cloudfront
 | `MIN_SPEED` / `SWITCH_MARGIN` / `HEALTH_RATIO` | ❌ | `0` / `20` / `70` | 速度底线（MB/s）、切换门槛（%）、健康比例（%） |
 | `SPEED_TOLERANCE` | ❌ | `0` | 速度在最快的这个百分比以内时，先比丢包、再比延迟 |
 | `FULL_MIN_GAP` | ❌ | `120` | 全量扫描失败、榜单全不达标后，至少隔这么多分钟才再全量扫描 |
+| `POOL_AT` | ❌ | — | 每天几点不管健不健康都复测一次榜单，如 `"20:00 22:00"` |
+| `RETEST_PINGS` | ❌ | `0` | 巡检、复测、全量候选每个 IP 测几次延迟（`cfst -t`）；0 = cfst 默认 4 次 |
+| `HEALTH_LOSS` / `LOSS_MARGIN` | ❌ | `1` / `0.05` | 巡检时丢包率超过多少算变差；只看延迟时丢包率低多少就切换 |
+| `TRACK_DAYS` / `PROVEN_KEEP` | ❌ | `7` / `5` | 排名用近几天同一时段的结果；晚高峰最好的几个 IP 每次都复测 |
+| `MANUAL_HOLD` | ❌ | `240` | Telegram 手动切换后保留多少分钟 |
 | `CFST_ARGS` | ❌ | `-tl 250` | 额外的 cfst 参数；不要写 `-f -o -p -dn -dd` |
 | `SEEDS_DNS` / `SEEDS_URL` | ❌ | — | 种子来源 |
 | `API_PROXY` | ❌ | 直连 | API 和 Telegram 请求用的代理 |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` / `TG_NOTIFY` | ❌ | — / — / `all` | Telegram 简报（`all`、`change`、`off`） |
 | `TG_NOTIFY_CHECK` | ❌ | `off` | 巡检发现当前 IP 健康时也发一条 |
+| `TG_CMD_BOT_TOKEN` | ❌ | `TG_BOT_TOKEN` | 命令单独用一个 bot（主 bot 的 token 已被别的程序收消息时） |
 | `SONDE_URL` / `SONDE_TOKEN` | ❌ | — | 上报 Sonde 面板 |
 | `<目标>_XXX` | ❌ | — | 按目标覆盖，如 `CLOUDFRONT_RECORD_NAME` |
 
@@ -156,12 +173,13 @@ cd /opt/scripts-de-moi
 
 ### 数据与备份
 
-配置：`/etc/cfst-ddns.env`（600）。每个目标的状态在 `/var/lib/cfst-ddns/<目标>/`：`pool.csv`（榜单）、`state`（上次运行时间、基准）、`history.csv`（`stats` 用）、`colo.cache`、`cfst.log`。
+配置：`/etc/cfst-ddns.env`（600）。每个目标的状态在 `/var/lib/cfst-ddns/<目标>/`：`pool.csv`（榜单）、`top.csv`（最近一次排名，`/pool` 用）、`track.csv`（每个 IP 近 `TRACK_DAYS` 天的测量）、`state`（上次运行时间、基准、手动保留）、`history.csv`（`stats` 用）、`colo.cache`、`cfst.log`。
 
 ### 日志
 
 ```bash
 journalctl -fu 'cfst-ddns@*' --output cat
+journalctl -fu cfst-ddns-bot --output cat
 ```
 
 定时器每 5 分钟启动一次 `cfst-ddns@auto`；没到时间时几毫秒就退出，所以 journal 里有很短的启动 / 结束记录是正常的。
@@ -172,7 +190,7 @@ journalctl -fu 'cfst-ddns@*' --output cat
 ./cfst-ddns/uninstall.sh
 ```
 
-删除定时器、单元和 `/opt/cfst-ddns`。配置、历史和 `cfst-ddns` 用户保留，并打印删除命令。DNS 记录停在最后一次的 IP。
+删除定时器、单元（包括 bot）和 `/opt/cfst-ddns`。配置、历史和 `cfst-ddns` 用户保留，并打印删除命令。DNS 记录停在最后一次的 IP。
 
 ## 🧠 工作原理
 
@@ -180,10 +198,13 @@ journalctl -fu 'cfst-ddns@*' --output cat
 flowchart LR
   T[cfst-ddns.timer<br/>every 5 min] --> A[cfst-ddns@auto]
   A -->|FULL_AT reached| F[③ full scan]
+  A -->|POOL_AT reached| P
   A -->|check due| C[① check current IP]
   C -->|degraded| P[② re-test shortlist]
   P -->|nothing good| F
+  H[(track.csv<br/>days of results)] -.->|medians, proven IPs| P & F
   P & F -->|beats current by SWITCH_MARGIN| D[Cloudflare DNS API]
+  B[Telegram /pool<br/>button] -->|use:target| D
   C & P & F --> N[Telegram / Sonde]
 ```
 
@@ -192,6 +213,8 @@ flowchart LR
 - **两轮不会重叠** → `flock` 让新的一轮在上一轮没结束时直接跳过；每次运行最长 30 分钟。
 - **全量扫描失败后不马上重试** → 每 `FULL_MIN_GAP` 最多全量扫描一次，直连坏了也不会每 5 分钟探测几千个 IP。同样的失败 2 小时内只发一次 Telegram。
 - **复测不会让榜单变少** → 某一轮暂时连不上的 IP 留在榜单里，到下次全量扫描再重建。
+- **一次测量不算数** → 测过的每个 IP 都记进 `track.csv`；排名用近 `TRACK_DAYS` 天同一时段（晚高峰 / 非高峰）的延迟、速度中位数和平均丢包，晚高峰最好的 `PROVEN_KEEP` 个 IP 每次复测都在。现在连不上的 IP，历史再好也不选。
+- **上行看丢包** → `RANK_BY=latency` 时先比丢包（低 `LOSS_MARGIN` 以上就赢），再比延迟；`RETEST_PINGS` 让丢包率细到分得清。
 - **种子必须落在该 CDN 的官方网段内** → 被劫持的公共域名混不进别的 IP（除非 `SEED_ALLOW_OUTSIDE=1`）。
 - **消息里写机房代码，不写 IP** → Telegram 和 Sonde 里不会出现 IP 和域名。
 
@@ -201,7 +224,7 @@ flowchart LR
 bash cfst-ddns/tests/run.sh
 ```
 
-用假的 cfst 和假的 Cloudflare / Telegram API 离线跑完整流程，不需要 root；最后输出 `通过 25 项，失败 0 项`。正式使用改动之前，再用一条临时记录真实跑一次，看 journal 确认。
+用假的 cfst 和假的 Cloudflare / Telegram API 离线跑完整流程，不需要 root；最后输出 `通过 60 项，失败 0 项`。正式使用改动之前，再用一条临时记录真实跑一次，看 journal 确认。
 
 ## 📚 文档地图
 

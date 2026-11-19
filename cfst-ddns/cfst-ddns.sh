@@ -2,11 +2,14 @@
 # cfst-ddns —— 定时找出最好的 Cloudflare IP，更新到 Cloudflare 上的一条 DNS 记录
 # 由 systemd 调度（cfst-ddns.timer 每 5 分钟触发 cfst-ddns@auto.service），配置在 /etc/cfst-ddns.env
 #
-# 用法：cfst-ddns.sh [auto|check|pool|full]
+# 用法：cfst-ddns.sh [auto|check|pool|full|use|release|bot|stats]
 #   auto   按 env 里的时间表决定这一轮做什么，不到时间就什么都不做（timer 用这个）
 #   check  巡检：只测当前在用的 IP，变差了才升级为 pool
 #   pool   复测榜单：重测上次全量扫描留下的榜单，选最好的；榜单全不达标才升级为 full
 #   full   全量扫描：测约 6000 个 IP 的延迟，重建榜单，再测速选最好的
+#   use:目标      手动切到榜单第 USE_RANK 名（Telegram 按钮调用），保留 MANUAL_HOLD 分钟
+#   release:目标  取消手动指定，恢复自动
+#   bot    常驻：收 Telegram 命令（/pool 看榜单、点按钮切换），由 cfst-ddns-bot.service 运行
 #
 # 联网情况：
 #   cfst       直接连各个 CF IP（不解析域名），必须直连 → sing-box TUN 里 exclude_uid 放行
@@ -14,12 +17,12 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.11.03"
+VERSION="2026.11.19"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
 ONLY=""; [[ "$MODE_ARG" == *:* ]] && ONLY=${MODE_ARG#*:}
-case "$MODE" in auto|check|pool|full|stats) ;; *) echo "失败: 用法 cfst-ddns.sh [auto|check|pool|full][:目标] 或 stats[:天数]" >&2; exit 1 ;; esac
+case "$MODE" in auto|check|pool|full|stats|use|release|bot) ;; *) echo "失败: 用法 cfst-ddns.sh [auto|check|pool|full|use|release][:目标]、stats[:天数] 或 bot" >&2; exit 1 ;; esac
 
 # ---------- 多目标：TARGETS 里每个目标各自测速、各自更新一条记录 ----------
 # 目标的配置 = <前缀>_XXX（如 CLOUDFRONT_RECORD_NAME）> 内置预设 > 全局的 XXX > 默认值
@@ -27,7 +30,8 @@ case "$MODE" in auto|check|pool|full|stats) ;; *) echo "失败: 用法 cfst-ddns
 TARGET_KEYS="LABEL RECORD_NAME ZONE_ID TTL IPFILE IPLIST_URL IPLIST_JQ IP_EXCLUDE IP_SAMPLE CFST_ARGS RANK_BY
   MIN_SPEED SPEED_TOLERANCE LATENCY_SPLIT PICK_PER_GROUP UPLOAD_URL UP_SECONDS FULL_AT PEAK_HOURS PEAK_EVERY
   OFFPEAK_EVERY HEALTH_RATIO SWITCH_MARGIN FULL_MIN_GAP TG_NOTIFY TG_NOTIFY_CHECK
-  SEEDS_DNS SEEDS_URL SEED_PICK_PER_GROUP SEED_DOH SEED_ALLOW_OUTSIDE"
+  SEEDS_DNS SEEDS_URL SEED_PICK_PER_GROUP SEED_DOH SEED_ALLOW_OUTSIDE
+  RETEST_PINGS HEALTH_LOSS LOSS_MARGIN POOL_AT TRACK_DAYS PROVEN_KEEP MANUAL_HOLD"
 OWN_KEYS="LABEL RECORD_NAME IPFILE IPLIST_URL IPLIST_JQ IP_EXCLUDE IP_SAMPLE CFST_ARGS UPLOAD_URL SEEDS_DNS SEEDS_URL RANK_BY"   # 非 cloudflare 目标不继承全局
 target_prefix() { tr 'a-z-' 'A-Z_' <<<"$1" | tr -cd 'A-Z0-9_'; }
 internal_name() {
@@ -99,12 +103,148 @@ if [[ "$MODE" == stats ]]; then
   exit 0
 fi
 
+# ---------- Telegram 命令（bot 模式，由 cfst-ddns-bot.service 常驻运行）----------
+#   /pool [目标]   各目标的榜单：排名、机房、延迟、丢包、速度、样本数；每个排名一个按钮，点了就切过去
+#   /use 目标 N    切到这个目标榜单的第 N 名（只有一个目标时可省略目标）
+#   /auto [目标]   取消手动指定，恢复自动
+# 只认 TG_CHAT_ID 这个会话发来的命令。用 getUpdates 长轮询收消息：同一个 bot token 不能同时被别的程序收消息
+# （或设了 webhook），否则会 409 冲突——这时给命令单独建一个 bot，填 TG_CMD_BOT_TOKEN
+run_bot() {
+  export STATE_DIRECTORY="${STATE_DIRECTORY:-/var/lib/cfst-ddns}"
+  export TZ="${TIMEZONE:-Asia/Taipei}"
+  BOT_TOKEN="${TG_CMD_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
+  [[ -n "$BOT_TOKEN" && -n "${TG_CHAT_ID:-}" ]] || { echo "失败: bot 需要 TG_BOT_TOKEN（或 TG_CMD_BOT_TOKEN）和 TG_CHAT_ID" >&2; exit 1; }
+  TARGETS="${TARGETS:-cloudflare}"
+  local off resp code u
+  off=$(cat "$STATE_DIRECTORY/bot.offset" 2>/dev/null || echo 0)
+  bot_api setMyCommands 30 --data-urlencode 'commands=[{"command":"pool","description":"查看优选 IP 榜单，点按钮切换"},{"command":"use","description":"切到榜单第 N 名：/use 目标 N"},{"command":"auto","description":"取消手动指定，恢复自动"}]' >/dev/null || true
+  echo "cfst-ddns bot 已启动（v${VERSION}），目标：${TARGETS}；只接受会话 ${TG_CHAT_ID} 的命令"
+  while :; do
+    resp=$(bot_api getUpdates 70 -d timeout=50 -d "offset=$off" --data-urlencode 'allowed_updates=["message","callback_query"]') || resp=""
+    if ! jq -e '.ok' >/dev/null 2>&1 <<<"$resp"; then
+      code=$(jq -r '.error_code // empty' <<<"$resp" 2>/dev/null) || code=""
+      if [[ "$code" == 409 ]]; then
+        echo "警告: 收消息冲突（409）：这个 bot token 正被别的程序收消息，或设了 webhook。给命令单独建一个 bot，填 TG_CMD_BOT_TOKEN" >&2
+        [[ -n "${BOT_ONCE:-}" ]] && exit 1; sleep 60
+      else
+        echo "警告: 收消息失败：${resp:0:200}" >&2
+        [[ -n "${BOT_ONCE:-}" ]] && exit 1; sleep 10
+      fi
+      continue
+    fi
+    while IFS= read -r u; do
+      [[ -n "$u" ]] || continue
+      off=$(( $(jq -r '.update_id' <<<"$u") + 1 )); echo "$off" > "$STATE_DIRECTORY/bot.offset"   # 先记下：处理出错也不会反复收到同一条
+      bot_handle "$u" </dev/null || echo "警告: 处理消息出错" >&2
+    done < <(jq -c '.result[]' <<<"$resp")
+    [[ -n "${BOT_ONCE:-}" ]] && exit 0
+  done
+}
+bh() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+bot_api() {   # bot_api 方法 超时秒数 [curl 参数...]；token 经标准输入交给 curl，不出现在命令行里
+  local m=$1 tmo=$2; shift 2
+  local px=(); [[ -n "${API_PROXY:-}" ]] && px=(-x "$API_PROXY")
+  printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$BOT_TOKEN" "$m" \
+    | curl -sS --connect-timeout 10 -m "$tmo" "${px[@]}" -K - "$@" 2>&1
+}
+bot_say() {   # bot_say HTML 正文 [reply_markup JSON]
+  local a=(--data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" -d parse_mode=HTML -d disable_web_page_preview=true)
+  [[ -n "${2:-}" ]] && a+=(--data-urlencode "reply_markup=$2")
+  bot_api sendMessage 30 "${a[@]}" >/dev/null || true
+}
+valid_target() { [[ -n "$1" && " $TARGETS " == *" $1 "* ]]; }
+target_val() { ( load_target "$1"; v=$(internal_name "$2"); echo "${!v:-$3}" ); }   # target_val 目标 键 默认值
+bot_list() {   # 一个目标的榜单，一条消息 + 按钮
+  local t=$1 f="$STATE_DIRECTORY/$1/top.csv" st="$STATE_DIRECTORY/$1/state" lab stamp mode pk rk cur hold now txt kb hdr tbl mn
+  lab=$(target_val "$t" LABEL "$t")
+  if [[ ! -s "$f" ]]; then bot_say "<b>$(bh "$lab")</b>：还没有榜单（等下一次复测或全量扫描）"; return; fi
+  read -r _ stamp mode pk rk < "$f"
+  cur=$(awk -F= '$1 == "BASE_IP" { v = $2 } END { print v }' "$st" 2>/dev/null) || cur=""
+  hold=$(awk -F= '$1 == "MANUAL_UNTIL" { v = $2 } END { print v + 0 }' "$st" 2>/dev/null) || hold=0
+  now=$(date +%s)
+  case "$mode" in pool) mn="复测榜单" ;; full) mn="全量扫描" ;; *) mn=$mode ;; esac
+  if [[ "$rk" == latency ]]; then hdr="#  机房   ms  loss   n 来源"; else hdr="#  机房   ms  loss   MB/s   n 来源"; fi
+  tbl=$(awk -F, -v cur="$cur" -v rk="$rk" 'NR > 1 { src = ($6 ~ /^种子/) ? "种子" : "官方"; mk = ($1 == cur) ? " ◀" : ""
+      if (rk == "latency") printf "%-2d %-4s %4.0f %5.2f %3s %s%s\n", NR - 1, $2, $3, $4, $7, src, mk
+      else printf "%-2d %-4s %4.0f %5.2f %6.2f %3s %s%s\n", NR - 1, $2, $3, $4, $5 + 0, $7, src, mk }' "$f")
+  txt="<b>$(bh "$lab") · 榜单</b>  <i>$(date -d "@$stamp" '+%m-%d %H:%M') ${mn}$([[ "$pk" == 1 ]] && echo " · 晚高峰")</i>"
+  txt+=$'\n'"<pre>$(bh "$hdr"$'\n'"$tbl")</pre>"
+  txt+=$'\n'"◀ 当前解析 · n 样本数 · 点按钮切过去，保留 $(target_val "$t" MANUAL_HOLD 240) 分钟"
+  (( hold > now )) && txt+=$'\n'"🔒 手动指定中，保留到 $(date -d "@$hold" '+%H:%M')（/auto ${t} 恢复自动）"
+  kb=$(awk -F, -v t="$t" -v st="$stamp" 'NR > 1 { printf "{\"text\":\"#%d %s\",\"callback_data\":\"u|%s|%d|%s\"}\n", NR - 1, $2, t, NR - 1, st }' "$f" \
+       | jq -sc '{inline_keyboard: [range(0; length; 4) as $i | .[$i:$i + 4]]}')
+  bot_say "$txt" "$kb"
+}
+bot_use_run() {   # bot_use_run 目标 名次 [榜单时间] → 输出「状态|一句话」
+  local out rc colo
+  out=$(USE_RANK="$2" USE_STAMP="${3:-}" bash "$SELF" "use:$1" </dev/null 2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$out" | sed "s/^/[use:$1] /" >&2
+  if (( rc == 75 )); then echo "busy|⏳ 正在测速，稍后再试"
+  elif (( rc != 0 )); then
+    echo "fail|❌ $(grep -m1 '^失败: ' <<<"$out" | sed -E -e 's/^失败: //' -e 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/***/g')"
+  elif grep -q '^已经是这个 IP' <<<"$out"; then echo "same|已经是第 $2 名，保留时间已重新计算"
+  else colo=$(awk -F, -v n="$2" 'NR == n + 1 { print $2 }' "$STATE_DIRECTORY/$1/top.csv" 2>/dev/null); echo "ok|✅ $(target_val "$1" LABEL "$1") 已切到第 $2 名（$colo）"
+  fi
+}
+bot_help() {
+  bot_say "<b>cfst-ddns 命令</b>
+/pool — 看各目标的榜单，点按钮切换
+/pool 目标 — 只看一个目标
+/use 目标 N — 切到第 N 名（只有一个目标时可省略目标）
+/auto [目标] — 取消手动指定，恢复自动
+目标：$(bh "$TARGETS")"
+}
+bot_handle() {
+  local u=$1 chat text cb data kind t n st res cmd a1 a2 x
+  if jq -e '.callback_query' >/dev/null 2>&1 <<<"$u"; then
+    chat=$(jq -r '.callback_query.message.chat.id // empty' <<<"$u"); cb=$(jq -r '.callback_query.id' <<<"$u")
+    data=$(jq -r '.callback_query.data // ""' <<<"$u")
+    if [[ "$chat" != "$TG_CHAT_ID" ]]; then echo "忽略：会话 ${chat:-?} 不是 TG_CHAT_ID"; return 0; fi
+    IFS='|' read -r kind t n st <<<"$data"
+    if [[ "$kind" == u ]] && valid_target "$t"; then res=$(bot_use_run "$t" "$n" "$st"); else res="fail|按钮无效"; fi
+    local a=(-d "callback_query_id=$cb" --data-urlencode "text=${res#*|}")
+    [[ "${res%%|*}" == fail ]] && a+=(-d show_alert=true)
+    bot_api answerCallbackQuery 30 "${a[@]}" >/dev/null || true
+    return 0
+  fi
+  chat=$(jq -r '.message.chat.id // empty' <<<"$u"); text=$(jq -r '.message.text // ""' <<<"$u")
+  [[ -n "$chat" ]] || return 0
+  if [[ "$chat" != "$TG_CHAT_ID" ]]; then echo "忽略：会话 $chat 不是 TG_CHAT_ID"; return 0; fi
+  read -r cmd a1 a2 _ <<<"$text"; cmd=${cmd%%@*}
+  case "$cmd" in
+    /pool|/list)
+      if [[ -n "$a1" ]]; then valid_target "$a1" && bot_list "$a1" || bot_say "没有这个目标：$(bh "$a1")（可选：$(bh "$TARGETS")）"
+      else for t in $TARGETS; do bot_list "$t"; done; fi ;;
+    /use)
+      if [[ "$a1" =~ ^[0-9]+$ && -n "$a2" ]]; then x=$a1; a1=$a2; a2=$x; fi            # /use 2 cloudfront 也认
+      if [[ "$a1" =~ ^[0-9]+$ && -z "$a2" && $(wc -w <<<"$TARGETS") -eq 1 ]]; then a2=$a1; a1=$TARGETS; fi
+      if ! valid_target "$a1" || [[ ! "$a2" =~ ^[1-9][0-9]*$ ]]; then bot_say "用法：/use 目标 N（目标：$(bh "$TARGETS")）"; return 0; fi
+      res=$(bot_use_run "$a1" "$a2")
+      # 切换成功时 use 模式自己会发简报；简报关了、或者没切（已经是它 / 正在测速 / 失败）时在这里回一句
+      [[ "${res%%|*}" != ok || "$(target_val "$a1" TG_NOTIFY all)" == off ]] && bot_say "$(bh "${res#*|}")" ;;
+    /auto)
+      for t in ${a1:-$TARGETS}; do
+        valid_target "$t" || { bot_say "没有这个目标：$(bh "$t")"; continue; }
+        if bash "$SELF" "release:$t" </dev/null >/dev/null 2>&1; then bot_say "✅ $(bh "$(target_val "$t" LABEL "$t")") 已恢复自动"
+        else bot_say "⏳ $(bh "$(target_val "$t" LABEL "$t")") 正在测速，稍后再试"; fi
+      done ;;
+    /start|/help) bot_help ;;
+    /*) bot_help ;;
+  esac
+  return 0
+}
+if [[ "$MODE" == bot ]]; then run_bot; exit 0; fi
+
 if [[ -z "${CFST_TARGET:-}" ]]; then
   TARGETS="${TARGETS:-cloudflare}"; [[ -n "$ONLY" ]] && TARGETS="$ONLY"
   export STATE_DIRECTORY="${STATE_DIRECTORY:-$(mktemp -d)}"
   mkdir -p "$STATE_DIRECTORY"; cd "$STATE_DIRECTORY"
   exec 9>.lock
-  flock -n 9 || { echo "另一轮测速正在进行，跳过"; exit 0; }
+  if ! flock -n 9; then
+    echo "另一轮测速正在进行，跳过"
+    [[ "$MODE" == use || "$MODE" == release ]] && exit 75   # Telegram 命令据此回复「正在测速，稍后再试」
+    exit 0
+  fi
   rc=0
   for tgt in $TARGETS; do
     ( load_target "$tgt"; exec bash "$SELF" "$MODE" ) || rc=1
@@ -140,12 +280,20 @@ SEED_DOH="${SEED_DOH:-https://dns.alidns.com/resolve}"   # 解析优选域名用
 # 调度
 TIMEZONE="${TIMEZONE:-Asia/Taipei}"      # 下面所有时间按这个时区算，日志和简报里的时间也用它
 FULL_AT="${FULL_AT:-18:30}"              # 每天几点全量扫描，可写多个，空格分隔
-PEAK_HOURS="${PEAK_HOURS:-19-24}"        # 晚高峰时段 [开始, 结束)，留空 = 不区分
+PEAK_HOURS="${PEAK_HOURS-19-24}"         # 晚高峰时段 [开始, 结束)，写成空值 = 不区分（没写这一项才用默认 19-24）
 PEAK_EVERY="${PEAK_EVERY:-30}"           # 晚高峰每隔多少分钟巡检一次
 OFFPEAK_EVERY="${OFFPEAK_EVERY:-120}"    # 其余时间每隔多少分钟巡检一次
 HEALTH_RATIO="${HEALTH_RATIO:-70}"       # %；当前 IP 速度 ≥ 基准 × 这个比例算健康
 SWITCH_MARGIN="${SWITCH_MARGIN:-20}"     # %；新 IP 比当前 IP 好这么多才切换
 FULL_MIN_GAP="${FULL_MIN_GAP:-120}"      # 分钟；距上次全量扫描不到这么久，就不因榜单不达标而补扫
+POOL_AT="${POOL_AT:-}"                   # 每天几点不管健不健康都复测一次榜单（如晚高峰中段 "20:30"），可写多个
+# 稳定性与历史
+RETEST_PINGS="${RETEST_PINGS:-0}"        # 巡检、复测、全量候选每个 IP 测几次延迟（cfst -t）；0 = 和全量扫描一样（cfst 默认 4 次）
+HEALTH_LOSS="${HEALTH_LOSS:-1}"          # 巡检时当前 IP 丢包率超过它就算变差；1 = 不看丢包
+LOSS_MARGIN="${LOSS_MARGIN:-0.05}"       # 只看延迟时：第一名丢包率比当前低这么多就切换
+TRACK_DAYS="${TRACK_DAYS:-7}"            # 排名用近几天同一时段（晚高峰 / 非高峰）的测量：延迟、速度取中位数，丢包取平均；0 = 只看本轮
+PROVEN_KEEP="${PROVEN_KEEP:-5}"          # 晚高峰历史表现最好的几个 IP，每次复测 / 全量都进候选，不会因为一次没挤进前几名就丢掉
+MANUAL_HOLD="${MANUAL_HOLD:-240}"        # 分钟；Telegram 手动切换后保留这么久（当前 IP 还能用就不自动换走）
 # 其他
 PROGRESS_EVERY="${PROGRESS_EVERY:-15}"   # 测速期间每隔多少秒往日志打一次进度
 API_PROXY="${API_PROXY:-}"               # API 请求用的代理，如 socks5h://127.0.0.1:2080；留空则直连
@@ -175,7 +323,7 @@ mode_name() { case "$1" in check) echo 巡检 ;; pool) echo 复测榜单 ;; full
 
 # 运行状态，结束时用来写日志和 Telegram 简报
 KIND=""; REASON=""; WHY=""; PATH_DESC=""; IP=""; OLD_IP=""; LAT=""; LOSS=""; SPEED=""; GROUP=""; SRC=""; COMPARE=""
-PID=""; t=0; QUICK=""; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""
+PID=""; t=0; QUICK=""; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""; PING_T=""; HOLD=""
 
 # ---------- 状态文件：上次全量/巡检时间、当前 IP 的基准速度 ----------
 STATE="$WORK/state"
@@ -211,11 +359,22 @@ colo_of() {     # IP → 机房代码（cfst 结果第 7 列「地区码」）
   [[ -n "$cc" && "$cc" != N/A ]] && echo "$cc" || echo "?"
 }
 
+# 当前解析的 IP 本轮测到的情况：「延迟 丢包 速度 有无速度」。测速结果里没有就用延迟测速的，都没有输出空
+cur_measure() {
+  local r has=1
+  [[ -n "$OLD_IP" ]] || return 0
+  r=$(row_of "$OLD_IP" "$WORK/result.csv" 2>/dev/null)
+  [[ -n "$r" ]] || { r=$(row_of "$OLD_IP" "$WORK/latency.all.csv" 2>/dev/null); has=0; }
+  [[ -n "$r" ]] || return 0
+  awk -F, -v has="$has" -v m="$METRIC" '{ sp = $6; sub(/\r$/, "", sp)
+    printf "%s %s %s %s\n", $5 + 0, $4 + 0, (has && m != "" ? sp + 0 : "-"), (has && m != "" ? 1 : 0) }' <<<"$r"
+}
+
 top_table() {   # 前 5 名，等宽表格；用排名 + 机房代码代替 IP，标出这次选用的和原来的
   awk -F, -v s="$LATENCY_SPLIT" -v m="$METRIC" -v pick="$IP" -v cur="$OLD_IP" -v kind="$KIND" '
     FILENAME == ARGV[1] { lab[$1] = $2; next }
     FNR == 1 { g = (s + 0 > 0) ? "   段 " : ""
-               if (m != "") printf "%-2s %-2s %5s %6s%s  来源\n", "#", "机房", "ms", "MB/s", g
+               if (m != "") printf "%-2s %-2s %5s %5s %6s%s  来源\n", "#", "机房", "ms", "loss", "MB/s", g
                else         printf "%-2s %-2s %5s %5s%s  来源\n", "#", "机房", "ms", "loss", g
                next }
     FNR <= 6 {
@@ -226,7 +385,7 @@ top_table() {   # 前 5 名，等宽表格；用排名 + 机房代码代替 IP�
       mk = ""
       if (kind != "failed" && $1 == pick) mk = (pick == cur) ? "  ◀ 保持" : "  ◀ 选用"
       else if ($1 == cur) mk = "  ◀ 原"
-      if (m != "") printf "%-2d %-4s %5.0f %6.2f%s  %s%s\n", FNR - 1, cc, $5, $6, g, l, mk
+      if (m != "") printf "%-2d %-4s %5.0f %5.2f %6.2f%s  %s%s\n", FNR - 1, cc, $5, $4, $6, g, l, mk
       else         printf "%-2d %-4s %5.0f %5s%s  %s%s\n", FNR - 1, cc, $5, $4, g, l, mk }' "$WORK/origin.map" "$WORK/result.csv" 2>/dev/null
 }
 
@@ -256,6 +415,7 @@ fail_repeated() {
 notify() {
   [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" && "$TG_NOTIFY" != off ]] || return 0
   [[ "$KIND" == skip || -z "$KIND" ]] && return 0
+  [[ "$MODE" == use && "$KIND" == failed ]] && return 0      # 手动切换失败由 Telegram 命令那边回复
   if [[ "$KIND" == failed ]]; then
     if fail_repeated; then echo "同样的失败 $((FAIL_QUIET / 3600)) 小时内已经通知过，这次不发 Telegram"; return 0; fi
   elif [[ -f "$STATE" ]] && [[ -n "$(state_get FAIL_KEY)" ]]; then
@@ -277,7 +437,14 @@ notify() {
   # 引用块：这一轮最重要的东西
   if [[ "$KIND" == failed ]]; then
     box="⚠️ <b>$(h "$REASON")</b>"
-    [[ -n "$OLD_IP" ]] && box+=$'\n'"当前解析保持不变（机房 <b>$(h "$(colo_of "$OLD_IP")")</b>）"
+    if [[ -n "$OLD_IP" ]]; then
+      box+=$'\n'"当前解析保持不变（机房 <b>$(h "$(colo_of "$OLD_IP")")</b>）"
+      local ml mls mp mv
+      read -r ml mls mp mv <<<"$(cur_measure)"
+      if [[ -z "$ml" ]]; then box+=$'\n'"当前 IP 本轮没测到结果"
+      elif [[ "$mv" == 1 ]]; then box+=$'\n'"⚡ ${METRIC} $(h "$mp") MB/s · 🕒 $(h "$ml") ms · 丢包 $(h "$mls")"
+      else box+=$'\n'"🕒 $(h "$ml") ms · 丢包 $(h "$mls")"; fi
+    fi
   else
     if [[ "$KIND" == updated ]]; then
       if [[ -n "$OLD_IP" ]]; then box="🔀 机房 <b>$(h "$(colo_of "$OLD_IP")")</b>  ➜  <b>$(h "$(colo_of "$IP")")</b>"
@@ -328,10 +495,18 @@ notify() {
 sonde_report() {
   [[ -n "$SONDE_URL" && -n "$SONDE_TOKEN" ]] || return 0
   [[ "$KIND" == skip || -z "$KIND" ]] && return 0
+  [[ "$MODE" == use && "$KIND" == failed ]] && return 0
   local top="[]" cur="" old="" body series iv
   [[ -n "$IP" ]] && cur=$(colo_of "$IP")
   [[ -n "$OLD_IP" ]] && old=$(colo_of "$OLD_IP")
-  [[ "$KIND" == failed && -z "$cur" ]] && cur=$old
+  [[ "$KIND" == failed && -n "$old" ]] && cur=$old        # 失败时解析没动，显示当前解析的机房
+  local current="null" ml mls mp mv
+  if [[ "$KIND" == failed ]]; then
+    read -r ml mls mp mv <<<"$(cur_measure)"
+    [[ -n "$ml" ]] && current=$(jq -nc --arg c "$old" --arg l "$ml" --arg s "$mls" --arg p "$mp" --arg v "$mv" \
+      --arg src "$(src_name "$(label_of "$OLD_IP")")" \
+      '{colo: $c, lat: ($l | tonumber), loss: ($s | tonumber), speed: (if $v == "1" then ($p | tonumber) else null end), src: $src}')
+  fi
   if [[ "$KIND" != healthy && -s "$WORK/result.csv" ]]; then
     top=$(awk -F, -v s="$LATENCY_SPLIT" -v pick="$IP" -v cur="$OLD_IP" -v kind="$KIND" '
       FILENAME == ARGV[1] { lab[$1] = $2; next }
@@ -380,13 +555,13 @@ sonde_report() {
     --arg src "$(src_name "$SRC")" --arg why "$(scrub "$WHY")" --arg reason "$(scrub "$REASON")" \
     --arg compare "$cmp" --arg ver "$VERSION" \
     --arg host "$(cat /proc/sys/kernel/hostname)" --argjson t "${t:-0}" --arg peak "$(is_peak && echo 1)" \
-    --arg scan "$scan" --arg params "$params" --argjson top_ts "$top_ts" --arg mode "$MODE" \
+    --arg scan "$scan" --arg params "$params" --argjson top_ts "$top_ts" --arg mode "$MODE" --argjson current "$current" \
     '{source: $source, ts: now | floor, interval: $iv, series: $series,
       data: {label: $label, kind: $kind, path: $path, colo: $colo, old_colo: $old, metric: $metric,
              speed: ($speed | tonumber? // null), lat: ($lat | tonumber? // null), loss: ($loss | tonumber? // null),
              group: $group, src: $src, why: $why, reason: $reason, compare: $compare, top: $top,
              version: $ver, host: $host, elapsed: $t, peak: ($peak == "1"),
-             scan: $scan, params: $params, top_ts: $top_ts, mode: $mode}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
+             scan: $scan, params: $params, top_ts: $top_ts, mode: $mode, current: $current}}') || { echo "警告: Sonde 上报数据生成失败" >&2; return 0; }
   if printf 'header = "Authorization: Bearer %s"\n' "$SONDE_TOKEN" \
        | curl "${CURL_BASE[@]}" --retry 0 -m 8 -K - -o /dev/null -w '%{http_code}' -X POST "$SONDE_URL/ingest" \
            -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null | grep -q '^200$'; then
@@ -438,6 +613,17 @@ full_due() {
   for tt in $FULL_AT; do
     at=$(date -d "today $tt" +%s 2>/dev/null) || continue
     if (( at <= now && last < at )); then return 0; fi
+  done
+  return 1
+}
+# POOL_AT：到点后一小时内复测一次榜单（不管当前 IP 健不健康），拿到晚高峰当时的数据；错过一小时就等明天
+pool_due() {
+  [[ -n "$POOL_AT" && -s "$WORK/pool.csv" ]] || return 1
+  local now last tt at
+  now=$(date +%s); last=$(state_get LAST_POOL); last=${last:-0}
+  for tt in $POOL_AT; do
+    at=$(date -d "today $tt" +%s 2>/dev/null) || continue
+    if (( at <= now && now - at < 3600 && last < at )); then return 0; fi
   done
   return 1
 }
@@ -518,7 +704,8 @@ ip_lat_desc() {
 # 带 relax 时（全量扫描），一个都不满足就放宽：用全部能连通的 IP 继续，免得整轮白跑。
 ping_list() {
   local reach pass min seed
-  run_cfst latency.all.csv "${LAT_ARGS[@]}" -f "$1" -dd
+  local extra=(); [[ -n "$PING_T" ]] && extra=(-t "$PING_T")
+  run_cfst latency.all.csv "${LAT_ARGS[@]}" "${extra[@]}" -f "$1" -dd
   [[ -s latency.all.csv ]] || : > latency.all.csv            # 一个都连不上时 cfst 不写文件
   LAT_RELAXED=""
   if [[ -s latency.all.csv ]]; then
@@ -626,6 +813,7 @@ pick_candidates() {
       g = (s + 0 > 0 && $5 + 0 >= s + 0) ? "hi" : "lo"
       c = ($8 ~ /^种子/) ? "seed" : "off"
       if (cnt[g c]++ < ((c == "seed") ? ks : k)) print }' labeled.csv > candidates.lab
+  add_proven
   ns=$(grep -c ',种子:' labeled.csv) || ns=0
   if split_on; then
     read -r nlo nhi < <(awk -F, -v s="$LATENCY_SPLIT" '{ if ($5 + 0 < s + 0) a++; else b++ } END { print a + 0, b + 0 }' labeled.csv)
@@ -633,6 +821,59 @@ pick_candidates() {
   else
     echo "  参与挑选 $(rows latency.csv) 个（其中种子 ${ns} 个）"
   fi
+}
+
+# ---------- 历史：track.csv 记下每次测到的每个 IP（时间,是否晚高峰,IP,延迟,丢包,速度） ----------
+# 用途：① 排名用近 TRACK_DAYS 天同一时段的中位数，偶然一次测得快的不会压过一直稳定的；
+#       ② 晚高峰表现最好的几个 IP 每次都进候选（PROVEN_KEEP），好 IP 跨天积累，不用每晚重新淘金
+track_add() {
+  (( TRACK_DAYS > 0 )) && [[ -s result.csv ]] || return 0
+  local now pk
+  now=$(date +%s); pk=$(is_peak && echo 1 || echo 0)
+  awk -F, -v OFS=, -v now="$now" -v pk="$pk" -v m="$METRIC" \
+    'NR > 1 { sp = $6; sub(/\r$/, "", sp); print now, pk, $1, $5 + 0, $4 + 0, (m != "" ? sp + 0 : "") }' result.csv >> track.csv
+  awk -F, -v cut=$((now - TRACK_DAYS * 86400)) '$1 >= cut' track.csv | tail -n 20000 > track.tmp && mv track.tmp track.csv
+}
+# 把 result.csv 的延迟、丢包、速度换成近 TRACK_DAYS 天同一时段的统计值，第 8 列写样本数。
+# 本轮连不上（丢包 1）或测速为 0 的保留本轮的值：现在不能用的，历史再好也不选
+track_smooth() {
+  (( TRACK_DAYS > 0 )) && [[ -s track.csv && -s result.csv ]] || return 0
+  local pk; pk=$(is_peak && echo 1 || echo 0)
+  awk -F, -v OFS=, -v pk="$pk" -v m="$METRIC" '
+    function med(s,   a, n, i, j, x) {
+      n = split(s, a, " ")
+      for (i = 2; i <= n; i++) { x = a[i] + 0; for (j = i - 1; j >= 1 && a[j] + 0 > x; j--) a[j + 1] = a[j]; a[j + 1] = x }
+      return (n % 2) ? a[(n + 1) / 2] + 0 : (a[n / 2] + a[n / 2 + 1]) / 2 }
+    FILENAME == ARGV[1] { if ($2 == pk) { L[$3] = L[$3] " " $4; S[$3] += $5; N[$3]++; if (m != "") P[$3] = P[$3] " " $6 }; next }
+    FNR == 1 { print; next }
+    { ip = $1; sp = $6; sub(/\r$/, "", sp); c = $7; sub(/\r$/, "", c); $7 = c
+      if ((ip in N) && N[ip] > 1 && $4 + 0 < 1 && (m == "" || sp + 0 > 0)) {
+        $4 = sprintf("%.2f", S[ip] / N[ip]); $5 = sprintf("%.2f", med(L[ip]))
+        if (m != "") $6 = sprintf("%.2f", med(P[ip])) }
+      $8 = (ip in N) ? N[ip] : 1; print }' track.csv result.csv > result.tmp && mv result.tmp result.csv
+  echo "  排名用近 ${TRACK_DAYS} 天$([[ $pk == 1 ]] && echo 晚高峰 || echo 非高峰)的测量（延迟${METRIC:+、速度}取中位数，丢包取平均；样本数见结果最后一列）"
+}
+# 晚高峰（没设高峰时段就是全部时间）历史表现最好的 PROVEN_KEEP 个 IP，至少有 2 次样本：
+# 按速度时比平均速度，只看延迟时先比平均丢包、再比平均延迟
+proven_ips() {
+  (( TRACK_DAYS > 0 && PROVEN_KEEP > 0 )) && [[ -s track.csv ]] || return 0
+  local pk=""; [[ "$PEAK_HOURS" == *-* ]] && pk=1
+  awk -F, -v pk="$pk" -v m="$METRIC" '(pk == "" || $2 == pk) { N[$3]++; L[$3] += $4; S[$3] += $5; P[$3] += $6 }
+    END { for (ip in N) if (N[ip] >= 2) printf "%s %.4f\n", ip, (m != "") ? -P[ip] / N[ip] : S[ip] / N[ip] * 10000 + L[ip] / N[ip] }' track.csv \
+    | sort -k2,2g | head -n "$PROVEN_KEEP" | cut -d' ' -f1
+}
+# 把历史表现好、本轮也通过了延迟筛选的 IP 加进候选（已经在候选里的不重复）
+add_proven() {
+  local ips n=0 ip
+  ips=$(proven_ips) || ips=""
+  [[ -n "$ips" ]] || return 0
+  for ip in $ips; do
+    [[ "$ip" == "$OLD_IP" ]] && continue                 # 当前 IP 由 add_current 负责
+    awk -F, -v ip="$ip" '$1 == ip { f = 1 } END { exit !f }' candidates.lab && continue
+    awk -F, -v ip="$ip" '$1 == ip { print; f = 1; exit } END { exit !f }' labeled.csv >> candidates.lab && n=$((n + 1))
+  done
+  (( n )) && echo "  晚高峰历史表现好的 IP：加进候选 $n 个"
+  return 0
 }
 
 # 当前 IP 也一起测，好跟新候选比较（它没通过延迟筛选就不管它）
@@ -650,6 +891,21 @@ finish_candidates() {
   local cur=""
   [[ -n "$OLD_IP" ]] && awk -F, -v ip="$OLD_IP" '$1 == ip { f = 1 } END { exit !f }' candidates.lab && cur="，含当前 IP"
   echo "  候选 $(wc -l < candidates.csv) 个：官方 $(grep -vc ',种子:' candidates.lab) 个，种子 $(grep -c ',种子:' candidates.lab) 个${cur}"
+}
+
+# 全量扫描时每个 IP 只测了几次延迟（cfst 默认 4 次），丢包率只有 0、0.25、0.5 几档。
+# 候选定下来以后用 RETEST_PINGS 次重测一遍，丢包才分得清「偶尔丢一个」和「一直在丢」
+reping_candidates() {
+  (( RETEST_PINGS > 0 )) && [[ -s candidates.csv ]] || return 0
+  cut -d, -f1 candidates.csv > reping.txt
+  echo "候选延迟复测: $(wc -l < reping.txt) 个 IP，每个 ${RETEST_PINGS} 次"
+  run_cfst reping.csv "${LAT_ARGS[@]}" -t "$RETEST_PINGS" -f reping.txt -dd
+  [[ -s reping.csv ]] || : > reping.csv
+  awk -F, -v OFS=, -v n="$RETEST_PINGS" '
+    FILENAME == ARGV[1] { if (FNR > 1) { s[$1] = $2; r[$1] = $3; lo[$1] = $4; la[$1] = $5 }; next }
+    { if ($1 in s) { $2 = s[$1]; $3 = r[$1]; $4 = lo[$1]; $5 = la[$1] } else { $2 = n; $3 = 0; $4 = "1.00" }; print }' \
+    reping.csv candidates.csv > candidates.tmp && mv candidates.tmp candidates.csv
+  rm -f reping.txt reping.csv
 }
 
 # 上传测速：对 candidates.csv 里每个 IP 用 curl 直连上传 UP_SECONDS 秒，结果写到 result.csv
@@ -722,7 +978,13 @@ speed_test() {
       run_cfst result.csv "${LAT_ARGS[@]}" -f candidates.txt -dn "$n" ;;   # 候选已按限制条件筛过，这里不让 cfst 再筛一遍
   esac
   fill_colo
-  [[ $(rows result.csv) -ge 1 && -n "$METRIC" ]] || return 0
+  [[ $(rows result.csv) -ge 1 ]] || return 0
+  track_add
+  [[ "$MODE" == check ]] || track_smooth
+  if [[ -z "$METRIC" ]]; then   # 只看延迟：丢包少的在前，同丢包延迟低的在前
+    { head -n1 result.csv; tail -n +2 result.csv | sort -t, -k4,4g -k5,5g -s; } > result.tmp && mv result.tmp result.csv
+    return 0
+  fi
   # 按速度从高到低排序（表头保持在第一行）
   { head -n1 result.csv; tail -n +2 result.csv | sort -t, -k6,6gr -s; } > result.tmp && mv result.tmp result.csv
   FASTEST=$(sed -n 2p result.csv | cut -d, -f1)
@@ -797,8 +1059,9 @@ print_results() {
     g = (s+0>0) ? (($5+0 < s+0) ? "  <" s "ms" : "  ≥" s "ms") : ""
     c = ($1 == cur) ? "  ← 当前" : ""
     l = "  " (($1 in lab) ? lab[$1] : "官方")
-    if (m != "") printf "  %-16s %8s %6s %8s%s%s%s\n", $1, $5, $4, $6, g, l, c
-    else         printf "  %-16s %8s %6s%s%s%s\n", $1, $5, $4, g, l, c }' origin.map result.csv
+    n = ($8 != "") ? "  n=" $8 : ""
+    if (m != "") printf "  %-16s %8s %6s %8s%s%s%s%s\n", $1, $5, $4, $6, g, l, n, c
+    else         printf "  %-16s %8s %6s%s%s%s%s\n", $1, $5, $4, g, l, n, c }' origin.map result.csv
 }
 
 # 读一行结果到 IP / LAT / LOSS / SPEED / GROUP
@@ -835,7 +1098,11 @@ config_brief() {
   b+=" · 每段官方 ${PICK_PER_GROUP}"
   [[ -n "$SEEDS_DNS$SEEDS_URL" ]] && b+="+种子 ${SEED_PICK_PER_GROUP}"
   [[ -n "$METRIC" ]] && b+=" · 底线 ${MIN_SPEED}MB/s · 容差 ${SPEED_TOLERANCE}%"
+  [[ -z "$METRIC" ]] && b+=" · 丢包差 ${LOSS_MARGIN}"
   b+=" · 切换 ${SWITCH_MARGIN}% · 健康 ${HEALTH_RATIO}%"
+  awk -v x="$HEALTH_LOSS" 'BEGIN{exit !(x+0 < 1)}' && b+="/丢包≤${HEALTH_LOSS}"
+  (( RETEST_PINGS > 0 )) && b+=" · 复测 ${RETEST_PINGS} 次"
+  (( TRACK_DAYS > 0 )) && b+=" · 近 ${TRACK_DAYS} 天中位数"
   args=$(sed -E 's#(-url )https?://([^/ ]+)[^ ]*#\1\2/…#' <<<"$CFST_ARGS")
   echo "$b · cfst ${args:-默认}"
 }
@@ -848,32 +1115,55 @@ missing_reason() {
   fi
 }
 
+# 榜单快照 top.csv：Telegram /pool 列表和按钮切换都从这里读（第一行「# 时间 模式 是否晚高峰 RANK_BY」，
+# 之后每行「IP,机房,延迟,丢包,速度,来源,样本数」，最多 10 行）。按钮带着时间，榜单更新后旧按钮会失效
+save_top() {
+  awk -F, -v OFS=, 'FILENAME == ARGV[1] { lab[$1] = $2; next }
+    FNR > 1 && FNR <= 11 { l = ($1 in lab) ? lab[$1] : "官方"; c = $7; sub(/\r$/, "", c); sp = $6; sub(/\r$/, "", sp)
+      print $1, c, $5 + 0, $4 + 0, sp, l, ($8 != "" ? $8 : 1) }' origin.map result.csv > top.tmp
+  { echo "# $(date +%s) $MODE $(is_peak && echo 1 || echo 0) $RANK_BY"; cat top.tmp; } > top.csv
+  rm -f top.tmp
+}
+
 # ---------- 选 IP 并更新 DNS（pool / full 共用） ----------
 select_and_update() {
-  local c k cip cs cl ks kl best action
-  NOGOOD=""
+  local c k cip cs cl closs ks kl kloss best action hold_until
+  NOGOOD=""; HOLD=""
   if [[ $(rows result.csv) -lt 1 ]]; then
     [[ " $CFST_ARGS " == *" -sl "* ]] && die "测速没有结果：没有任何 IP 达到 -sl 下载速度下限"
     if [[ "$MODE" == pool ]]; then NOGOOD=1; return; fi
     die "测速没有结果（全部超出延迟/丢包条件？）"
   fi
   print_results
+  save_top
 
-  c=$(sed -n 2p result.csv); IFS=, read -r cip _ _ _ cl cs _ <<<"$c"; cs=${cs%$'\r'}
+  c=$(sed -n 2p result.csv); IFS=, read -r cip _ _ closs cl cs _ <<<"$c"; cs=${cs%$'\r'}
   best=$(awk -F, -v ip="$FASTEST" 'NR>1 && $1==ip { print $6; exit }' result.csv)
   k=""; [[ -n "$OLD_IP" ]] && k=$(row_of "$OLD_IP" result.csv)
-  ks=0; kl=0; [[ -n "$k" ]] && IFS=, read -r _ _ _ _ kl ks _ <<<"$k" && ks=${ks%$'\r'}
+  ks=0; kl=0; kloss=1; [[ -n "$k" ]] && IFS=, read -r _ _ _ kloss kl ks _ <<<"$k" && ks=${ks%$'\r'}
 
   local why_missing=""; [[ -z "$k" && -n "$OLD_IP" ]] && why_missing=$(missing_reason)
   [[ -z "$OLD_IP" ]] && why_missing="还没有解析记录，新建"
+  # Telegram 手动指定的 IP：保留期内只要它还能用（测到了、速度不为 0、没有全丢包）就不换走
+  hold_until=$(state_get MANUAL_UNTIL); hold_until=${hold_until:-0}
+  if [[ -n "$k" && "$(state_get MANUAL_IP)" == "$OLD_IP" ]] && (( $(date +%s) < hold_until )) \
+     && awk -v s="$ks" -v l="$kloss" -v m="$METRIC" 'BEGIN{exit !((m == "" || s+0 > 0) && l+0 < 1)}'; then
+    HOLD=1; action=keep
+    WHY="Telegram 手动指定，保留到 $(date -d "@$hold_until" '+%H:%M')（发 /auto 提前恢复自动）"
+  else
   # 切换门槛：新 IP 明显更好才换，避免在差不多的 IP 之间来回跳
   read -r action WHY < <(awk -v mode="$RANK_BY" -v same="$([[ "$cip" == "$OLD_IP" ]] && echo 1)" -v miss="$why_missing" \
       -v kin="$([[ -n "$k" ]] && echo 1)" -v cs="$cs" -v cl="$cl" -v ks="$ks" -v kl="$kl" \
+      -v closs="${closs:-0}" -v kloss="${kloss:-1}" -v lm="$LOSS_MARGIN" \
       -v best="${best:-0}" -v tol="$SPEED_TOLERANCE" -v m="$SWITCH_MARGIN" -v floor="$MIN_SPEED" 'BEGIN {
     if (same)  { print "keep 当前 IP 就是第一名"; exit }
     if (!kin)  { print "switch " miss; exit }
     if (mode == "latency") {
-      if (cl+0 <= kl * (1 - m/100)) printf "switch 延迟 %s → %s ms，低了 %.0f%%\n", kl, cl, (1 - cl/kl) * 100
+      # 只看延迟（上行用）：先比丢包，丢包差不多（相差小于 LOSS_MARGIN）再比延迟
+      dl = kloss - closs
+      if (dl >= lm - 1e-9) { printf "switch 丢包 %s → %s\n", kloss, closs; exit }
+      if (dl <= -lm) { printf "keep 第一名丢包 %s 比当前 %s 多\n", closs, kloss; exit }
+      if (cl+0 <= kl * (1 - m/100)) printf "switch 丢包相当，延迟 %s → %s ms，低了 %.0f%%\n", kl, cl, (1 - cl/kl) * 100
       else printf "keep 第一名延迟只低 %.0f%%，未达切换门槛 %s%%\n", (kl > 0 ? (1 - cl/kl) * 100 : 0), m
       exit
     }
@@ -885,6 +1175,7 @@ select_and_update() {
     if (cs+0 < ks+0) printf "keep 第一名 %s MB/s 比当前 %s MB/s 慢，延迟 %s → %s ms 只低 %.0f%%，未达切换门槛 %s%%\n", cs, ks, kl, cl, (kl > 0 ? (1 - cl/kl) * 100 : 0), m
     else printf "keep 第一名 %s MB/s，比当前 %s MB/s 只快 %.0f%%，未达切换门槛 %s%%\n", cs, ks, (cs/ks - 1) * 100, m
   }')
+  fi
 
   if [[ "$action" == keep ]]; then load_row "${k:-$c}"; else load_row "$c"; fi
   [[ -n "$FASTEST" && "$IP" != "$FASTEST" && "$action" == switch ]] \
@@ -894,8 +1185,8 @@ select_and_update() {
   echo "说明: $WHY"
   record_compare
 
-  # 兜底底线：选中的 IP 速度为 0 或低于 MIN_SPEED 时不动现有解析
-  if [[ -n "$METRIC" ]]; then
+  # 兜底底线：选中的 IP 速度为 0 或低于 MIN_SPEED 时不动现有解析（手动指定保留中的不受底线限制）
+  if [[ -n "$METRIC" && -z "$HOLD" ]]; then
     if awk -v s="$SPEED" 'BEGIN{exit !(s+0<=0)}'; then
       [[ "$RANK_BY" == upload && "$UP_OK" -eq 0 ]] \
         && die "上传测速全部失败：${UP_ERR:-未知原因}（检查 UPLOAD_URL，或改成自建的上传地址），保留现有解析"
@@ -927,6 +1218,7 @@ do_check() {
   [[ -n "$OLD_IP" ]] || { echo "当前没有解析记录"; NEXT=pool; return; }
   echo "巡检当前 IP: $OLD_IP"
   echo "$OLD_IP" > check.txt
+  (( RETEST_PINGS > 0 )) && PING_T=$RETEST_PINGS
   ping_list check.txt
   if [[ $(rows latency.csv) -lt 1 ]]; then
     echo "当前 IP 本轮$(ip_lat_desc "$OLD_IP")，限制条件：$(limits_desc)"; NEXT=pool; return
@@ -939,6 +1231,11 @@ do_check() {
 
   base_ip=$(state_get BASE_IP); base_sp=$(state_get BASE_SPEED); base_lat=$(state_get BASE_LAT)
   if [[ "$base_ip" != "$OLD_IP" ]]; then base_sp=""; base_lat=""; fi   # 基准不是这个 IP 的，作废
+
+  # 丢包：上行最怕丢包，丢包率超过 HEALTH_LOSS 直接算变差
+  if awk -v l="$LOSS" -v h="$HEALTH_LOSS" 'BEGIN{exit !(h+0 < 1 && l+0 > h+0)}'; then
+    echo "变差：丢包率 ${LOSS}，超过 HEALTH_LOSS=${HEALTH_LOSS}"; NEXT=pool; return
+  fi
 
   if [[ -z "$METRIC" ]]; then
     # 只看延迟：延迟没有比基准高出太多就算健康
@@ -979,10 +1276,12 @@ keep_pool_members() {
 # 复测榜单：重测上次留下的榜单（加上当前 IP 和本轮的新种子），选最好的
 do_pool() {
   [[ -s pool.csv ]] || { echo "还没有榜单"; NEXT=full; return; }
+  state_set "LAST_POOL=$(date +%s)"
   collect_seeds
-  { tail -n +2 pool.csv | cut -d, -f1; cut -d, -f1 seeds.txt; if [[ -n "$OLD_IP" ]]; then echo "$OLD_IP"; fi; } \
+  { tail -n +2 pool.csv | cut -d, -f1; cut -d, -f1 seeds.txt; proven_ips; if [[ -n "$OLD_IP" ]]; then echo "$OLD_IP"; fi; } \
     | awk 'NF && !seen[$0]++' > pool.txt
-  echo "复测榜单: $(wc -l < pool.txt) 个 IP（榜单 + 种子 + 当前 IP）"
+  (( RETEST_PINGS > 0 )) && PING_T=$RETEST_PINGS
+  echo "复测榜单: $(wc -l < pool.txt) 个 IP（榜单 + 种子 + 历史好的 + 当前 IP）${PING_T:+，每个测 ${PING_T} 次延迟}"
   cp pool.csv pool.old; cp origin.map origin.old
   ping_list pool.txt
   if [[ $(rows latency.csv) -lt 1 ]]; then
@@ -1038,10 +1337,12 @@ do_full() {
   [[ -s "$CFST_IPFILE" ]] || die "IP 列表不存在或为空：$CFST_IPFILE"
   expand_24 < "$CFST_IPFILE" > all24.txt
   total=$(wc -l < all24.txt)
-  # IP_SAMPLE：每次随机抽一部分 /24（每天换一批）；上一轮榜单和种子总会一起测，好的不会丢
+  # IP_SAMPLE：网段太多时分批轮换，每天测下一批，几天覆盖全部；上一轮榜单、历史好的 IP 和种子总会一起测，好的不会丢
   if (( IP_SAMPLE > 0 && total > IP_SAMPLE )); then
-    shuf -n "$IP_SAMPLE" all24.txt > scan.txt
-    echo "官方网段：从 ${total} 个 /24 里随机抽 ${IP_SAMPLE} 个（IP_SAMPLE）"
+    local batches idx
+    batches=$(( (total + IP_SAMPLE - 1) / IP_SAMPLE )); idx=$(( $(date +%s) / 86400 % batches ))
+    sort -t. -k1,1n -k2,2n -k3,3n all24.txt | tail -n +$((idx * IP_SAMPLE + 1)) | head -n "$IP_SAMPLE" > scan.txt
+    echo "官方网段：${total} 个 /24 分 ${batches} 批轮换（IP_SAMPLE=${IP_SAMPLE}），今天第 $((idx + 1)) 批 $(wc -l < scan.txt) 个，${batches} 天覆盖一遍"
   else
     cp all24.txt scan.txt
     echo "官方网段：${total} 个 /24"
@@ -1051,14 +1352,39 @@ do_full() {
   cut -d, -f1 seeds.txt >> scan.txt
   if [[ -n "$OLD_IP" ]]; then echo "$OLD_IP" >> scan.txt; fi        # 当前 IP 一定参加，好跟新候选比较
   if [[ -s pool.csv ]]; then tail -n +2 pool.csv | cut -d, -f1 >> scan.txt; fi
+  proven_ips >> scan.txt
   echo "延迟测速（全量）: cfst $CFST_ARGS -dd"
   ping_list scan.txt relax
   [[ $(rows latency.csv) -ge 1 ]] || die "延迟测速：扫描的 $(wc -l < scan.txt) 个 IP 全部连不上（TCP 端口 ${TP}），检查本机网络或 sing-box 的 exclude_uid"
   pick_candidates "$PICK_PER_GROUP"
   add_current
   finish_candidates
+  reping_candidates
   speed_test
   select_and_update
+}
+
+# 手动切换（Telegram 按钮 / 命令调用）：切到 top.csv 里第 USE_RANK 名，保留 MANUAL_HOLD 分钟
+do_use() {
+  local stamp line ip cc lat loss sp src n
+  [[ -s top.csv ]] || die "还没有榜单，等下一次复测或全量扫描"
+  stamp=$(head -n1 top.csv | awk '{ print $2 }')
+  [[ -z "${USE_STAMP:-}" || "$USE_STAMP" == "$stamp" ]] || die "榜单已经更新过，按钮失效了，请重新发 /pool 再选"
+  [[ "${USE_RANK:-}" =~ ^[1-9][0-9]*$ ]] || die "没有指定第几名"
+  line=$(sed -n "$((USE_RANK + 1))p" top.csv)
+  [[ -n "$line" ]] || die "榜单里没有第 ${USE_RANK} 名"
+  IFS=, read -r ip cc lat loss sp src n <<<"$line"
+  IP=$ip; LAT=$lat; LOSS=$loss; SPEED=${sp:-0}; GROUP=$(group_of "$lat"); SRC=$src
+  local hold_end=$(( $(date +%s) + MANUAL_HOLD * 60 ))
+  WHY="Telegram 手动切到榜单第 ${USE_RANK} 名，保留到 $(date -d "@$hold_end" '+%H:%M')（发 /auto 提前恢复自动）"
+  echo "手动切换: 第 ${USE_RANK} 名 $IP（$cc）"
+  state_set "MANUAL_IP=$IP" "MANUAL_UNTIL=$hold_end" "BASE_IP=$IP" "BASE_SPEED=$SPEED" "BASE_LAT=$LAT"
+  if [[ "$IP" == "$OLD_IP" ]]; then KIND=unchanged; echo "已经是这个 IP，只设置了保留时间"; return; fi
+  BODY=$(jq -nc --arg t "$TYPE" --arg n "$CF_RECORD_NAME" --arg c "$IP" --argjson ttl "$CF_TTL" \
+    '{type:$t, name:$n, content:$c, ttl:$ttl, proxied:false}')
+  if [[ -n "$REC_ID" ]]; then cf PATCH "$API/$REC_ID" "$BODY"; else cf POST "$API" "$BODY"; fi
+  KIND=updated
+  echo "已更新 $CF_RECORD_NAME ($TYPE): ${OLD_IP:-<新建>} -> $IP"
 }
 
 # ---------- 主流程 ----------
@@ -1089,8 +1415,12 @@ if [[ "$CFST_TARGET" != cloudflare ]]; then
   fi
 fi
 
+if [[ "$MODE" == release ]]; then
+  state_set "MANUAL_UNTIL=0"; echo "[$TARGET_LABEL] 已取消手动指定，恢复自动"; KIND=skip; exit 0
+fi
 if [[ "$MODE" == auto ]]; then
   if full_due; then MODE=full; state_set "LAST_FULL=$(date +%s)"   # 先记下，后面查 API 失败也算尝试过
+  elif pool_due; then MODE=pool
   elif check_due; then MODE=check
   else KIND=skip; exit 0                                 # 还没到时间，安静退出
   fi
@@ -1099,7 +1429,7 @@ echo "########## ${TARGET_LABEL} ##########  cfst-ddns ${VERSION}"
 echo "参数: $(config_brief)"
 if is_peak; then echo "$(date '+%m-%d %H:%M') 晚高峰（${PEAK_HOURS}），每 ${PEAK_EVERY} 分钟巡检"
 else echo "$(date '+%m-%d %H:%M') 非高峰，每 ${OFFPEAK_EVERY} 分钟巡检"; fi
-state_set "LAST_CHECK=$(date +%s)"
+[[ "$MODE" == use ]] || state_set "LAST_CHECK=$(date +%s)"
 
 # 先读当前解析：巡检要测它，复测和全量要拿它做比较
 if grep -q ':' "$CFST_IPFILE" 2>/dev/null; then TYPE=AAAA; else TYPE=A; fi
@@ -1112,6 +1442,9 @@ fi
 echo "当前解析: $CF_RECORD_NAME ($TYPE) = ${OLD_IP:-<无>}${API_PROXY:+（API 经代理 $API_PROXY）}"
 
 rm -f result.csv latency.csv latency.all.csv candidates.csv candidates.txt
+if [[ "$MODE" == use ]]; then
+  PATH_DESC="手动切换（Telegram）"; do_use; t=$SECONDS; exit 0
+fi
 while :; do
   PATH_DESC+="${PATH_DESC:+ → }$(mode_name "$MODE")"
   echo "===== $(mode_name "$MODE") ====="

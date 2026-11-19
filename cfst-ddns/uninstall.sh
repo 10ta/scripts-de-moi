@@ -22,12 +22,12 @@ kept() {   # kept 用户名或- 路径...
   return 0
 }
 
-systemctl disable --now cfst-ddns.timer >/dev/null 2>&1 || true
+systemctl disable --now cfst-ddns.timer cfst-ddns-bot.service >/dev/null 2>&1 || true
 systemctl stop 'cfst-ddns@*.service' cfst-ddns.service >/dev/null 2>&1 || true
-rm -f '/etc/systemd/system/cfst-ddns@.service' /etc/systemd/system/cfst-ddns.timer /etc/systemd/system/cfst-ddns.service
+rm -f '/etc/systemd/system/cfst-ddns@.service' /etc/systemd/system/cfst-ddns.timer /etc/systemd/system/cfst-ddns.service /etc/systemd/system/cfst-ddns-bot.service
 systemctl daemon-reload
 rm -rf /opt/cfst-ddns
-echo "✔ cfst-ddns 已卸载（timer、服务、/opt/cfst-ddns）"
+echo "✔ cfst-ddns 已卸载（timer、服务、Telegram 命令服务、/opt/cfst-ddns）"
 uid=$(id -u cfst-ddns 2>/dev/null || true)
 kept cfst-ddns /etc/cfst-ddns.env /var/lib/cfst-ddns
 [[ -n "$uid" ]] && echo "  （删用户后把 sing-box TUN 的 exclude_uid 里的 $uid 也去掉）"

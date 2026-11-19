@@ -25,7 +25,7 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 
 - `traffic-bot/bot.py` — the whole bot. One `get_<provider>_data()` per source returns a `Section`; `PROVIDERS` lists them; `collect_sections()` runs them in threads with `PROVIDER_TIMEOUT_SEC`; `evaluate_alerts()` dedups alerts; `sonde_report()` builds the panel payload. The env template lives inside `traffic-bot/install.sh` (`write_env`, `ensure_line`).
 - `CDT-Management/cdt_guard.py` — `check()` is the fuse logic; `rpc()` signs Aliyun RPC calls; `get_komari()` / `komari_track()` read and accumulate Komari's monthly upload; `apply_request()` takes traffic-bot's `/cdt hold|release`; `sonde_due()` throttles Sonde. `init.sh` installs and configures (`init.sh komari` for Komari only).
-- `cfst-ddns/cfst-ddns.sh` — `do_check` / `do_pool` / `do_full` are the three levels; `select_and_update` decides and writes DNS; `notify` / `sonde_report` format output.
+- `cfst-ddns/cfst-ddns.sh` — `do_check` / `do_pool` / `do_full` are the three levels; `select_and_update` decides and writes DNS; `notify` / `sonde_report` format output; `do_use` and `run_bot` / `bot_*` are the Telegram switch.
 - `warp-keeper/warp-keeper.sh` — `cmd_check` is the self-healing ladder; `build_fragment` writes the sing-box JSON.
 - `brutal-cn.sh` — config constants at the top; embedded Python (`PY_HELPER`) builds the add/delete plan.
 - `update.sh`, `uninstall.sh` (root) — iterate over installed tools. `docs/` — pages for the root-level scripts.
@@ -52,7 +52,9 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 - warp-keeper must `sing-box check` before every reload and keep `fragment.prev` for rollback. Temp files in the sing-box config dir must not end in `.json`.
 - cfst-ddns: speed tests must go direct (service user UID 950 is excluded from sing-box TUN); API calls may use `API_PROXY`.
 - cfst-ddns: at most one full scan per `FULL_MIN_GAP`, including when there is no shortlist yet (`full_due`); a broken route must never turn into a full scan every timer tick. Shortlist re-tests keep members that failed latency (`keep_pool_members`); only `do_full` rebuilds `pool.csv`.
-- cfst-ddns: tokens reach `curl` through `-K -` on stdin (`cf`, `tg_send`, `sonde_report`), never on the command line; the test suite fails if a token shows up in argv. The same failure reason is sent to Telegram at most once per `FAIL_QUIET` (2 h).
+- cfst-ddns: `track.csv` holds every measurement (`track_add`); `track_smooth` rewrites `result.csv` with same-period medians (col 8 = samples) before sorting, but never for an IP unreachable / zero-speed this round. `RANK_BY=latency` compares loss (`LOSS_MARGIN`) before latency. `top.csv` is the ranking snapshot that `/pool` and `use:` read; its first line carries a timestamp that buttons must match.
+- cfst-ddns bot (`cfst-ddns.sh bot`, `cfst-ddns-bot.service`): obeys only `TG_CHAT_ID`, never shows IPs, switches via `cfst-ddns.sh use:<target>` (same lock as tests; exit 75 = busy). A manual pick (`MANUAL_IP`/`MANUAL_UNTIL` in `state`) is kept by `select_and_update` while it still works. Failures in `use` mode are answered by the bot, not by `notify` / Sonde.
+- cfst-ddns: tokens reach `curl` through `-K -` on stdin (`cf`, `tg_send`, `sonde_report`, `bot_api`), never on the command line; the test suite fails if a token shows up in argv. The same failure reason is sent to Telegram at most once per `FAIL_QUIET` (2 h).
 
 ## Do not
 

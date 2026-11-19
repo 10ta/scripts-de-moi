@@ -1,0 +1,26 @@
+[Unit]
+Description=cfst-ddns Telegram 命令（/pool 看榜单、点按钮切换优选 IP）
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# 常驻：用 getUpdates 长轮询收 TG_CHAT_ID 发来的命令；切换时调用 cfst-ddns.sh use:目标（和测速共用一把锁）
+# 启用：systemctl enable --now cfst-ddns-bot    看日志：journalctl -fu cfst-ddns-bot --output cat
+Type=simple
+EnvironmentFile=/etc/cfst-ddns.env
+ExecStart=/opt/cfst-ddns/cfst-ddns.sh bot
+Restart=always
+RestartSec=15
+
+# 和测速服务同一个专用用户、同一个状态目录（榜单 top.csv、状态 state 都在这里）
+User=cfst-ddns
+Group=cfst-ddns
+StateDirectory=cfst-ddns
+WorkingDirectory=/var/lib/cfst-ddns
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

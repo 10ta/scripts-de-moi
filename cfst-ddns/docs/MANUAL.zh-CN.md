@@ -49,9 +49,10 @@ IPv4 写 A 记录，IPv6 写 AAAA 记录。记录会被设为 **DNS only（灰�
 | `cfst-ddns.sh` | `/opt/cfst-ddns/` | 主脚本：调度 + 测速 + 更新 DNS + 发送简报 |
 | `cfst-ddns@.service` | `/etc/systemd/system/` | 服务模板，`%i` 是模式（auto / check / pool / full），沙箱化运行，最长 30 分钟 |
 | `cfst-ddns.timer` | `/etc/systemd/system/` | 每 5 分钟触发一次 `cfst-ddns@auto` |
+| `cfst-ddns-bot.service` | `/etc/systemd/system/` | 可选，常驻：收 Telegram 命令（`/pool` 看榜单、点按钮切换），默认不启用 |
 | `cfst-ddns.env.example` | `/etc/cfst-ddns.env` | 配置模板（首次安装时复制，之后不会覆盖） |
 
-运行时数据在 `/var/lib/cfst-ddns/<目标>/`（如 `cloudflare/`、`cloudfront/`）：`pool.csv`（榜单）、`origin.map`（榜单里每个 IP 的来源）、`history.csv`（每轮官方/种子最佳，`stats` 用）、`state`（上次全量/巡检时间、当前 IP 的基准速度）、`cfst.log`（cfst 原始输出）、`iplist.txt`（从官方地址下载的 IP 列表，仅 CloudFront 等）。
+运行时数据在 `/var/lib/cfst-ddns/<目标>/`（如 `cloudflare/`、`cloudfront/`）：`pool.csv`（榜单）、`origin.map`（榜单里每个 IP 的来源）、`history.csv`（每轮官方/种子最佳，`stats` 用）、`track.csv`（每个 IP 每次测到的延迟、丢包、速度，保留 `TRACK_DAYS` 天）、`top.csv`（最近一次排名，Telegram `/pool` 用）、`state`（上次全量/巡检/定时复测时间、当前 IP 的基准、手动保留）、`cfst.log`（cfst 原始输出）、`iplist.txt`（从官方地址下载的 IP 列表，仅 CloudFront 等）。
 
 ## 安装
 
@@ -105,12 +106,15 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 |---|---|---|
 | `TIMEZONE` | `Asia/Taipei` | 下面所有时间按这个时区算，日志和简报里的时间也用它 |
 | `FULL_AT` | `18:30` | 每天几点全量扫描，可写多个，空格分隔，如 `"04:00 18:30"` |
-| `PEAK_HOURS` | `19-24` | 晚高峰 [开始, 结束)，跨午夜写 `22-2`，留空 = 不区分 |
+| `PEAK_HOURS` | `19-24` | 晚高峰 [开始, 结束)，跨午夜写 `22-2`，写成 `PEAK_HOURS=` 空值 = 不区分 |
 | `PEAK_EVERY` | `30` | 晚高峰巡检间隔（分钟） |
 | `OFFPEAK_EVERY` | `120` | 其余时间巡检间隔（分钟） |
 | `HEALTH_RATIO` | `70` | 健康标准 %：当前 IP 速度 ≥ 基准 × 这个比例 |
 | `SWITCH_MARGIN` | `20` | 切换门槛 %：新 IP 至少快这么多才换 |
 | `FULL_MIN_GAP` | `120` | 全量扫描之间至少隔这么多分钟：榜单全不达标时的补扫、全量失败后的重试都受它限制 |
+| `POOL_AT` | 空 | 每天几点不管健不健康都复测一次榜单，可写多个，如 `"20:00 22:00"`；到点一小时内没跑上就等明天 |
+| `HEALTH_LOSS` | `1` | 巡检时当前 IP 丢包率超过它就算变差；`1` = 不看丢包 |
+| `MANUAL_HOLD` | `240` | Telegram 手动切换后保留多少分钟 |
 
 **测速**（见下方「选 IP 的规则」）
 
@@ -121,6 +125,10 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 | `PICK_PER_GROUP` | `5` | 榜单大小：每段取几个（不分段时就是总数） |
 | `MIN_SPEED` | `0`（模板里是 `1`） | 速度底线 MB/s |
 | `SPEED_TOLERANCE` | `0` | 速度容差 % |
+| `LOSS_MARGIN` | `0.05` | `RANK_BY=latency` 时，第一名丢包率比当前低这么多就切换（不再看延迟） |
+| `RETEST_PINGS` | `0` | 巡检、复测、全量候选每个 IP 测几次延迟（`cfst -t`）；`0` = cfst 默认 4 次。设 30 左右丢包率才分得清 |
+| `TRACK_DAYS` | `7` | 排名用近几天同一时段的测量；`0` = 只看本轮 |
+| `PROVEN_KEEP` | `5` | 晚高峰历史表现最好的几个 IP，每次复测 / 全量都进候选 |
 | `UPLOAD_URL` | `https://speed.cloudflare.com/__up` | 上传测速地址，见下方「上传测速」 |
 | `UP_SECONDS` | `5` | 每个 IP 上传测速几秒 |
 | `SEEDS_DNS` | 空 | 种子：优选域名，空格分隔，见下方「种子」 |
@@ -140,6 +148,7 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` | | Telegram bot token 和接收简报的 chat id |
 | `TG_NOTIFY` | `all` | `all` 每次都发；`change` 仅 IP 变化或失败时发；`off` 不发 |
 | `TG_NOTIFY_CHECK` | `off` | 巡检结果正常时要不要也发一条 |
+| `TG_CMD_BOT_TOKEN` | 同 `TG_BOT_TOKEN` | Telegram 命令单独用的 bot（主 bot 的 token 已经被别的程序收消息时必须分开） |
 
 常用 cfst 参数：`-tl` 平均延迟上限（ms），`-tlr` 丢包率上限，`-n` 延迟测速并发数（默认 200，调小发包更平缓），`-dt` 单个下载测速时长（秒），`-url` 自定义下载测速地址。完整说明见 [cfst 文档](https://github.com/XIU2/CloudflareSpeedTest)。
 
@@ -148,11 +157,12 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 | 级别 | 做什么 | 开销 | 什么时候做 |
 |---|---|---|---|
 | ① 巡检 | 只测当前解析的 IP：延迟 + 一次测速 | 几个包 + 一次测速的流量 | 晚高峰每 `PEAK_EVERY` 分钟，其余时间每 `OFFPEAK_EVERY` 分钟 |
-| ② 复测榜单 | 榜单里的 IP（加上当前 IP）重测延迟和速度，选最好的 | 榜单大小 × 一次测速 | 巡检发现当前 IP 变差时 |
+| ② 复测榜单 | 榜单里的 IP（加上种子、历史好的、当前 IP）重测延迟和速度，选最好的 | 榜单大小 × 一次测速 | 巡检发现当前 IP 变差时；每天 `POOL_AT` |
 | ③ 全量扫描 | 测约 6000 个 IP 的延迟，重建榜单，再测速选最好的 | 约 2.4 万次 TCP 握手 + 一轮测速 | 每天 `FULL_AT`；还没有榜单时；榜单全不达标时（后两种受 `FULL_MIN_GAP` 限制） |
 
-- **健康**：当前 IP 速度 ≥ 基准 × `HEALTH_RATIO`%，且不低于 `MIN_SPEED`。基准 = 它上次被选中或被确认留用时测到的速度。晚高峰整体变慢时，复测后如果还是留用它，基准会更新为当时的速度，所以不会每次巡检都触发复测
-- **切换门槛**：复测/全量后，只有新的第一名比当前 IP 快 `SWITCH_MARGIN`% 以上，或当前 IP 已经不达标，才更新 DNS。设了 `SPEED_TOLERANCE` 时，速度相当且延迟低 `SWITCH_MARGIN`% 以上也会切换
+- **健康**：当前 IP 丢包率不超过 `HEALTH_LOSS`，速度 ≥ 基准 × `HEALTH_RATIO`%，且不低于 `MIN_SPEED`（只看延迟时：延迟 ≤ 基准延迟 ÷ 这个比例）。基准 = 它上次被选中或被确认留用时测到的速度。晚高峰整体变慢时，复测后如果还是留用它，基准会更新为当时的速度，所以不会每次巡检都触发复测
+- **切换门槛**：复测/全量后，只有新的第一名比当前 IP 快 `SWITCH_MARGIN`% 以上，或当前 IP 已经不达标，才更新 DNS。设了 `SPEED_TOLERANCE` 时，速度相当且延迟低 `SWITCH_MARGIN`% 以上也会切换。只看延迟时先比丢包：低 `LOSS_MARGIN` 以上就换，丢包差不多才比延迟
+- **定时复测**（`POOL_AT`）：全量扫描在高峰前，测到的是高峰前的样子。在高峰中段定时复测一次榜单，用高峰当时的数据（和过去几天高峰的历史）重新排名
 - **为什么这样分级**：哪些 IP 能连、延迟多少取决于路由，几天才变；拥堵则随时段变化。所以全量延迟扫描一天一次就够，频繁要看的只是「当前 IP 还行不行」。全量放在晚高峰前，进入高峰时榜单是新的；闲时上行/下行往往被自家宽带跑满，任何 IP 都差不多，也就没必要频繁重选
 - 两轮之间不会重叠：上一轮还没跑完时，新触发的一轮会直接跳过
 - **全量扫描失败不会马上重试**：比如 `exclude_uid` 没配好、一个 IP 都连不上，下一次全量至少隔 `FULL_MIN_GAP` 分钟，不会每 5 分钟扫一遍几千个 IP（还没有榜单时也一样）
@@ -165,15 +175,28 @@ My Profile → API Tokens → Create Token → 使用 **Edit zone DNS** 模板�
 2. **挑候选**（全量扫描时，结果就是榜单）
    - **分段**（`LATENCY_SPLIT > 0`）：以该延迟为界分两段，每段取丢包最少、延迟最低的 `PICK_PER_GROUP` 个
    - **不分段**（`LATENCY_SPLIT = 0`）：取延迟最低的 `PICK_PER_GROUP` 个
+   - 晚高峰历史表现最好的 `PROVEN_KEEP` 个 IP（至少测过 2 次）只要本轮通过了延迟筛选，就一定进候选
+   - 设了 `RETEST_PINGS` 时，全量扫描定下候选后再用这么多次握手重测一遍延迟和丢包（扫描阶段每个 IP 只测 4 次，丢包率只有 0、0.25、0.5 几档）
 3. **速度测速**（`RANK_BY=latency` 时跳过，直接按丢包、延迟排序）：`download` 用 cfst 下载测速，每个 `-dt` 秒；`upload` 用 curl 上传测速，每个 `UP_SECONDS` 秒。结果按速度排序
-4. **选第一名**，也就是测过的里面最快的。没有 5 MB/s 的就用 4.9 的，这本身就是兜底
+4. **按历史排名**（`TRACK_DAYS > 0`）：测过的每个 IP 都记进 `track.csv`。排名时把本轮结果换成近 `TRACK_DAYS` 天同一时段（晚高峰 / 非高峰）的统计：延迟、速度取中位数，丢包取平均，日志里 `n=` 是样本数。偶然一次测得快的压不过一直稳定的；本轮连不上或测速为 0 的保留本轮的值，历史再好也不选
+5. **选第一名**，也就是排名第一的。没有 5 MB/s 的就用 4.9 的，这本身就是兜底
    - 设了 `SPEED_TOLERANCE`（%）时，在「速度 ≥ 最快 × (1 − 容差)」的 IP 里选延迟最低的
-5. **和当前 IP 比较**：没过切换门槛就留用当前 IP（见上方「调度」）
-6. **底线**：选中的低于 `MIN_SPEED` 或速度为 0 时，不动现有解析并发送失败简报
+6. **和当前 IP 比较**：没过切换门槛就留用当前 IP（见上方「调度」）。Telegram 手动指定的 IP 在保留期内只要还能用就留用
+7. **底线**：选中的低于 `MIN_SPEED` 或速度为 0 时，不动现有解析并发送失败简报
 
 **为什么要分段：** 在国内，延迟最低的 CF IP 往往走香港等近距离线路，晚高峰拥堵严重，经常握手很快、下载却几乎为 0；延迟较高的（比如 170ms 左右走美国的）反而带宽充裕。不分段时只会测到延迟最低的那一批，全部落在拥堵线路上。分段后两条线路都有候选，谁快选谁。界限请按你实测的两条线路延迟来定，日志和简报里会标出每个 IP 属于哪一段。
 
-**更在乎上传和延迟时**，例如往 CF 节点推流、上传文件、跑对上行敏感的代理：
+**上下行分离的代理**（Cloudflare 走上行、CloudFront 走下行）：上行要的是不丢包，不是绝对速度；下行要速度。
+
+```bash
+RANK_BY=latency              # Cloudflare（上行）：先比丢包，再比延迟
+RETEST_PINGS=30              # 每个候选测 30 次握手，丢包率才分得清
+HEALTH_LOSS=0.1              # 巡检时丢包超过 10% 就复测
+POOL_AT="20:00 22:00"        # 高峰中段定时复测
+CLOUDFRONT_RANK_BY=download  # CloudFront（下行）：按下载速度
+```
+
+**更在乎上传速度时**，例如往 CF 节点推流、上传文件：
 
 ```bash
 RANK_BY=upload
@@ -305,6 +328,20 @@ API_PROXY=socks5h://127.0.0.1:2080
 - Telegram 发送失败只会在日志里记一条警告，不影响 DNS 更新的结果
 - bot token 和 Cloudflare token 经标准输入交给 curl，不出现在进程列表里
 
+**Telegram 命令（可选）**：`systemctl enable --now cfst-ddns-bot` 后，给 bot 发：
+
+| 命令 | 作用 |
+|---|---|
+| `/pool` | 每个目标一条消息：排名、机房、延迟、丢包、速度、样本数，◀ 是当前解析；每个排名一个按钮，点了就切过去 |
+| `/pool cloudfront` | 只看一个目标 |
+| `/use cloudfront 2` | 切到 CloudFront 榜单第 2 名（只有一个目标时 `/use 2`） |
+| `/auto` / `/auto cloudfront` | 取消手动指定，恢复自动 |
+
+- 手动切换后保留 `MANUAL_HOLD` 分钟（默认 240）：期间巡检、复测、全量都不会把它换走，除非它连不上、全丢包或测速为 0
+- 按钮带着榜单时间，榜单更新后旧按钮会提示失效，重新 `/pool` 即可；正在测速时会提示「稍后再试」
+- 只认 `TG_CHAT_ID` 这个会话；列表里只有机房代码，没有 IP
+- bot 用 `getUpdates` 长轮询收消息。同一个 token 已经被别的程序收消息、或者设了 webhook 时会 409 冲突（journal 里写明），这时给命令单独建一个 bot，填 `TG_CMD_BOT_TOKEN`
+
 ### 5. CloudFront 和其他 CDN
 
 在 `TARGETS` 里加上 `cloudfront`，再配两项就能用：
@@ -427,6 +464,7 @@ journalctl -fu 'cfst-ddns@*' --output cat   # 实时日志
 systemctl start cfst-ddns@check             # 立即巡检一次
 systemctl start cfst-ddns@pool              # 立即复测榜单
 systemctl start cfst-ddns@full              # 立即全量扫描
+journalctl -fu cfst-ddns-bot --output cat   # Telegram 命令的日志
 cat /var/lib/cfst-ddns/cloudflare/state     # 上次全量/巡检时间（Unix 时间戳）、当前 IP 的基准
 ```
 
@@ -447,6 +485,9 @@ timer 每 5 分钟会启动一次 `cfst-ddns@auto`，没到时间时几毫秒就
 | `榜单里没有达标的 IP，且 … 刚做过全量扫描` | 高峰期整体都很差，低于 `MIN_SPEED`；保留现有解析，等下一轮。可适当调低 `MIN_SPEED` |
 | `Telegram 发送失败` | 通常是直连不通，配置 `API_PROXY` |
 | `同样的失败 2 小时内已经通知过，这次不发 Telegram` | 正常的去重；原因还在 journal 里，Sonde 照常上报 |
+| `收消息冲突（409）` | 这个 bot token 正被别的程序收消息或设了 webhook，给命令单独建一个 bot，填 `TG_CMD_BOT_TOKEN` |
+| `/pool` 没反应 | `systemctl status cfst-ddns-bot`；`TG_CHAT_ID` 要和发命令的会话一致 |
+| 复测时一直保留同一个 IP，说明写「Telegram 手动指定」 | 手动保留期内；发 `/auto` 恢复自动 |
 | 全量扫描失败后，timer 很久没再扫 | 正常：至少隔 `FULL_MIN_GAP` 分钟才重试；急的话手动 `systemctl start cfst-ddns@full` |
 | 时间表和预期差几个小时 | 检查 `TIMEZONE` |
 | `种子 xxx：0 个` | 域名解析不到（DoH 连不上或域名已失效），或网页里没有 IP（比如页面是 JS 渲染的） |

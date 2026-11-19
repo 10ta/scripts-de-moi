@@ -135,6 +135,7 @@ bash -n cfst-ddns.sh || die "cfst-ddns.sh 有语法错误，没有部署"
 LOG=$(mktemp)   # 不用固定的 /tmp 文件名：root 写可预测的路径可能被软链接劫持
 bash install.sh </dev/null >"$LOG" 2>&1 || { cat "$LOG"; rm -f "$LOG"; die "install.sh 失败"; }
 grep -E "已重启|跳过下载|下载 cfst|移除旧版|注意" "$LOG" | sed 's/^/  /' || true
+systemctl is-enabled --quiet cfst-ddns-bot.service 2>/dev/null && restarted cfst-ddns-bot.service
 rm -f "$LOG"
 same_file cfst-ddns.sh "$APP/cfst-ddns.sh"
 if systemctl is-enabled --quiet cfst-ddns.timer 2>/dev/null; then
