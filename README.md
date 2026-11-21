@@ -2,10 +2,10 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Personal Debian server scripts: quota watchers, a CDT cost fuse, CDN IP selection, WARP upkeep and server setup.
+Personal Debian server scripts: quota watchers, a CDT cost fuse, CDN IP selection, WARP upkeep and server setup — plus couverture, a French text-difficulty checker.
 
 > [!NOTE]
-> Written and tested for my own Debian + systemd machines. Read a script before running it elsewhere. Program output and Telegram messages are in Chinese.
+> Written and tested for my own Debian + systemd machines. Read a script before running it elsewhere. Program output and Telegram messages are in Chinese (couverture: French).
 
 ## Contents
 
@@ -37,6 +37,7 @@ Each tool is a single script or a small directory that installs itself as a syst
 | brutal-cn | TCP Brutal v2 rules for mainland China IP ranges | Timer, 10 min | [docs/brutal-cn.md](docs/brutal-cn.md) |
 | debian-init | Modular first-boot setup for Debian 13 | One-off | [docs/debian-init.md](docs/debian-init.md) |
 | upsing | Installs / updates sing-box from GitHub release `.deb` | One-off | [docs/upsing.md](docs/upsing.md) |
+| couverture | Known-word coverage of French texts / subtitles, one-key vocabulary test | CLI, on demand | [couverture/](couverture/README.md) |
 
 traffic-bot reads cdt-guard's state file, so those two must run on the same machine.
 
@@ -60,7 +61,7 @@ cd /opt/scripts-de-moi
 ./update.sh
 ```
 
-It refuses to run with uncommitted changes or a diverged branch, fast-forwards, then runs `<tool>/update.sh` for each tool installed here (program file **and** `/etc/<tool>.env` present). `./update.sh --status` only compares repo and deployed versions. brutal-cn, debian-init and upsing are not covered; see their docs.
+It refuses to run with uncommitted changes or a diverged branch, fast-forwards, then runs `<tool>/update.sh` for each tool installed here (program file **and** `/etc/<tool>.env` present). `./update.sh --status` only compares repo and deployed versions. brutal-cn, debian-init, upsing and couverture are not covered; see their docs.
 
 To apply changes delivered as patches:
 
@@ -84,6 +85,7 @@ Lists installed tools, lets you pick, asks for `yes`, then removes programs, ser
 ├── traffic-bot/      # bot.py, install.sh (venv + unit + env template), tests/
 ├── cfst-ddns/        # cfst-ddns.sh, install.sh, units, env template
 ├── warp-keeper/      # warp-keeper.sh, install.sh, units, env template
+├── couverture/       # couverture.py, build_data.py, frequency data, tests/ (no install)
 ├── docs/             # Pages for the root-level scripts below
 ├── brutal-cn.sh      # TCP Brutal rule sync (config at the top of the file)
 ├── debian-init.sh    # Debian 13 setup modules
@@ -93,12 +95,13 @@ Lists installed tools, lets you pick, asks for `yes`, then removes programs, ser
 └── uninstall.sh      # Pick and uninstall tools
 ```
 
-Each tool directory has `README.md`, `README.zh-CN.md`, a Chinese `docs/MANUAL.zh-CN.md`, `update.sh` and an uninstaller.
+Each tool directory has `README.md`, `README.zh-CN.md`, a Chinese `docs/MANUAL.zh-CN.md`, `update.sh` and an uninstaller (couverture installs nothing, so it has neither of the last two).
 
 ## 🔨 Development
 
 ```bash
 python3 -m unittest discover CDT-Management/tests
+python3 -m unittest discover couverture/tests
 /opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests
 bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh
 bash cfst-ddns/tests/run.sh
@@ -141,6 +144,7 @@ Facts the code depends on but cannot show. Update this table when one is confirm
 - [docs/brutal-cn.md](docs/brutal-cn.md): TCP Brutal rule sync.
 - [docs/debian-init.md](docs/debian-init.md): Debian 13 setup.
 - [docs/upsing.md](docs/upsing.md): sing-box installer.
+- [couverture/README.md](couverture/README.md): French coverage checker; how to read the numbers in `couverture/docs/`.
 - [debian-note.md](debian-note.md): Server notes (Chinese) — reinstall, init, tuning, proxies, PVE.
 
 ## 📄 License

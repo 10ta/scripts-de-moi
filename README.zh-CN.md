@@ -2,10 +2,10 @@
 
 [English](README.md) · **简体中文**
 
-自用的 Debian 服务器脚本：额度监控、CDT 费用熔断、CDN 优选 IP、WARP 维护和服务器初始化。
+自用的 Debian 服务器脚本：额度监控、CDT 费用熔断、CDN 优选 IP、WARP 维护和服务器初始化，外加法语文本难度检查工具 couverture。
 
 > [!NOTE]
-> 这些脚本按我自己的 Debian + systemd 环境编写和测试。用在别处之前，请先读一遍代码。程序输出和 Telegram 消息都是中文。
+> 这些脚本按我自己的 Debian + systemd 环境编写和测试。用在别处之前，请先读一遍代码。程序输出和 Telegram 消息都是中文（couverture 是法语）。
 
 ## 目录
 
@@ -37,6 +37,7 @@
 | brutal-cn | 按中国大陆 IP 段维护 TCP Brutal v2 规则 | 定时器，10 分钟 | [docs/brutal-cn.zh-CN.md](docs/brutal-cn.zh-CN.md) |
 | debian-init | Debian 13 的模块化初始化 | 一次性 | [docs/debian-init.zh-CN.md](docs/debian-init.zh-CN.md) |
 | upsing | 从 GitHub Release 的 `.deb` 安装 / 更新 sing-box | 一次性 | [docs/upsing.zh-CN.md](docs/upsing.zh-CN.md) |
+| couverture | 法语文本 / 字幕的已知词覆盖率，一键作答的词汇量测试 | 命令行，按需运行 | [couverture/](couverture/README.zh-CN.md) |
 
 traffic-bot 读取 cdt-guard 的状态文件，所以这两个必须装在同一台机器上。
 
@@ -60,7 +61,7 @@ cd /opt/scripts-de-moi
 ./update.sh
 ```
 
-有未提交的改动或分支分叉时它会拒绝运行；否则快进拉取，再对本机装了的每个工具（程序文件**和** `/etc/<工具>.env` 都在）运行 `<工具>/update.sh`。`./update.sh --status` 只对比仓库版本和已部署版本。brutal-cn、debian-init、upsing 不在其中，见各自的文档。
+有未提交的改动或分支分叉时它会拒绝运行；否则快进拉取，再对本机装了的每个工具（程序文件**和** `/etc/<工具>.env` 都在）运行 `<工具>/update.sh`。`./update.sh --status` 只对比仓库版本和已部署版本。brutal-cn、debian-init、upsing、couverture 不在其中，见各自的文档。
 
 应用以补丁形式交付的改动：
 
@@ -84,6 +85,7 @@ git am -3 *.patch && rm *.patch && git push && ./update.sh
 ├── traffic-bot/      # bot.py, install.sh (venv + unit + env template), tests/
 ├── cfst-ddns/        # cfst-ddns.sh, install.sh, units, env template
 ├── warp-keeper/      # warp-keeper.sh, install.sh, units, env template
+├── couverture/       # couverture.py, build_data.py, frequency data, tests/ (no install)
 ├── docs/             # Pages for the root-level scripts below
 ├── brutal-cn.sh      # TCP Brutal rule sync (config at the top of the file)
 ├── debian-init.sh    # Debian 13 setup modules
@@ -93,12 +95,13 @@ git am -3 *.patch && rm *.patch && git push && ./update.sh
 └── uninstall.sh      # Pick and uninstall tools
 ```
 
-每个工具目录里都有 `README.md`、`README.zh-CN.md`、中文的 `docs/MANUAL.zh-CN.md`、`update.sh` 和卸载脚本。
+每个工具目录里都有 `README.md`、`README.zh-CN.md`、中文的 `docs/MANUAL.zh-CN.md`、`update.sh` 和卸载脚本（couverture 不安装任何东西，所以没有后两个）。
 
 ## 🔨 开发
 
 ```bash
 python3 -m unittest discover CDT-Management/tests
+python3 -m unittest discover couverture/tests
 /opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests
 bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh
 bash cfst-ddns/tests/run.sh
@@ -141,6 +144,7 @@ bash cfst-ddns/tests/run.sh
 - [docs/brutal-cn.zh-CN.md](docs/brutal-cn.zh-CN.md)：TCP Brutal 规则同步。
 - [docs/debian-init.zh-CN.md](docs/debian-init.zh-CN.md)：Debian 13 初始化。
 - [docs/upsing.zh-CN.md](docs/upsing.zh-CN.md)：sing-box 安装脚本。
+- [couverture/README.zh-CN.md](couverture/README.zh-CN.md)：法语覆盖率检查；怎么读数字见 `couverture/docs/`。
 - [debian-note.md](debian-note.md)：服务器笔记——重装、初始化、调优、代理、PVE。
 
 ## 📄 许可

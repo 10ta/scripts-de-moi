@@ -2,7 +2,7 @@
 
 ## Project overview
 
-- scripts-de-moi: personal Debian server scripts (quota bot, CDT cost fuse, CDN IP selection, WARP upkeep, server setup). Human docs: [README.md](README.md).
+- scripts-de-moi: personal Debian server scripts (quota bot, CDT cost fuse, CDN IP selection, WARP upkeep, server setup) plus couverture, a French text-difficulty CLI. Human docs: [README.md](README.md).
 - Type: collection repo (F). Sub-tools are CLI/timer scripts (A) plus one long-running bot (C).
 - Runs on: Debian + systemd, as root. Stack: bash, Python 3 (cdt-guard: stdlib only; traffic-bot: venv with `python-telegram-bot[job-queue]`, `boto3`, `requests`, `oci`), `curl`, `jq`.
 - The owner's interactive shell is fish; servers are administered as root.
@@ -14,8 +14,10 @@
 | cdt-guard tests (no deps, no network) | `python3 -m unittest discover CDT-Management/tests` |
 | traffic-bot tests (needs bot deps) | `/opt/traffic-bot/venv/bin/python -m unittest discover traffic-bot/tests` |
 | cfst-ddns tests (offline: fake cfst, fake Cloudflare / Telegram API; no root) | `bash cfst-ddns/tests/run.sh` |
+| couverture tests (stdlib, offline) | `python3 -m unittest discover couverture/tests` |
+| couverture data rebuild (needs Lexique383.txt, wordfreq `large_fr.msgpack.gz`, `msgpack`) | `python3 couverture/build_data.py Lexique383.txt large_fr.msgpack.gz` |
 | Syntax-check shell | `bash -n brutal-cn.sh cfst-ddns/cfst-ddns.sh warp-keeper/warp-keeper.sh upsing.sh debian-init.sh */install.sh */update.sh` |
-| Syntax-check Python | `python3 -m py_compile traffic-bot/bot.py CDT-Management/cdt_guard.py` |
+| Syntax-check Python | `python3 -m py_compile traffic-bot/bot.py CDT-Management/cdt_guard.py couverture/couverture.py couverture/build_data.py` |
 | Deploy on a server | `cd /opt/scripts-de-moi && git am -3 *.patch && rm *.patch && git push && ./update.sh` |
 | Deployed vs repo versions | `./update.sh --status` |
 
@@ -28,11 +30,12 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 - `cfst-ddns/cfst-ddns.sh` — `do_check` / `do_pool` / `do_full` are the three levels; `select_and_update` decides and writes DNS; `notify` / `sonde_report` format output; `do_use` and `run_bot` / `bot_*` are the Telegram switch.
 - `warp-keeper/warp-keeper.sh` — `cmd_check` is the self-healing ladder; `build_fragment` writes the sing-box JSON.
 - `brutal-cn.sh` — config constants at the top; embedded Python (`PY_HELPER`) builds the add/delete plan.
+- `couverture/couverture.py` — `analyse()` counts known tokens; `vcita_known()` reads a VCita export; `vocab_test()` is the one-key test (keys `.` / `,` / Backspace / `q`, pseudo-word correction, saves `~/.local/state/couverture/niveau.json`, which `main()` uses as default `--top`). `build_data.py` regenerates `rank_fr.tsv.gz`, `form2lemma.json.gz`, `pseudo.txt`. Not installed; not in `update.sh` / `uninstall.sh`.
 - `update.sh`, `uninstall.sh` (root) — iterate over installed tools. `docs/` — pages for the root-level scripts.
 
 ## Conventions
 
-- User-facing text (logs, Telegram, prompts, comments) is Chinese; README.md / AGENTS.md are English with `README.zh-CN.md` mirrors.
+- User-facing text (logs, Telegram, prompts, comments) is Chinese; README.md / AGENTS.md are English with `README.zh-CN.md` mirrors. Exception: couverture's output and comments are French (part of the owner's French-learning routine).
 - Commit messages: Chinese, first line `<tool>：<what changed>`, body as bullet list.
 - Changes are delivered to the owner as `git format-patch` files, applied with `git am -3`.
 - Shell commands in docs must run unchanged in fish: no `$(…)` in command position, no `<(…)`, no heredocs, no `export A=1 B=2`; wrap bash-only snippets in `bash -c '…'`. Don't prefix with `sudo`.
@@ -79,7 +82,7 @@ No test venv? `python3 -m venv /tmp/v && /tmp/v/bin/pip install "python-telegram
 
 ## Before you finish
 
-- [ ] All three test suites pass (cdt-guard, traffic-bot, cfst-ddns); `bash -n` and `py_compile` are clean.
+- [ ] All four test suites pass (cdt-guard, traffic-bot, cfst-ddns, couverture); `bash -n` and `py_compile` are clean.
 - [ ] Docs synced: changed a command, config key, default or behavior → update the tool's `README.md` **and** `README.zh-CN.md`, its `docs/MANUAL.zh-CN.md`, the env template, and this file if an invariant moved.
 - [ ] New env key → add it to the env template (`*.env.example` or `install.sh`) and the README config table.
 - [ ] Output still scrubbed (no IP / domain / URL in Telegram or Sonde).

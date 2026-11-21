@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Couverture lexicale d'un texte ou de sous-titres : part des mots connus, mots inconnus, débit.
 
-Mots connus = les N lemmes les plus fréquents + (avec --export) les mots marqués « connus » dans VCita
-et ceux de tes cartes stables (intervalle >= 21 j, non suspendues) — même règle que l'onglet
-« 短文挖词 » de VCita.
+Mots connus = les N lemmes les plus fréquents (N : dernier --test, sinon 8000)
+            + avec --export : les mots marqués « 认识 » dans VCita et ceux des cartes stables
+              (intervalle >= 21 j, non suspendues), même règle que l'onglet 短文挖词.
 
-Fréquences : Lexique 3.83 (sous-titres de films) et wordfreq (7 corpus), lemmatisés et fusionnés ;
-rang = position parmi les lemmes de Lexique.
-
-Exemples :
+  python3 couverture.py --test                        test de vocabulaire, une touche par mot
   python3 couverture.py texte.txt
-  python3 couverture.py *.srt --export vcita.json.gz          # plusieurs fichiers : un résumé par ligne, triés
-  python3 couverture.py episode.vtt --export vcita.json.gz --inconnus 40
-  python3 couverture.py texte.txt --courbe                    # couverture pour N = 1000…12000
+  python3 couverture.py subs/*.vtt --export vcita.json.gz
+  python3 couverture.py episode.srt --inconnus 40
+  python3 couverture.py a.txt b.txt --courbe          couverture pour N = 1000 … 12000
 """
-import argparse, gzip, json, os, re, sys, collections as C
+import argparse, collections as C, gzip, json, os, random, re, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+STATE = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state'), 'couverture', 'niveau.json')
+DEFAULT_TOP = 8000
 FUNC = set("le la les l un une des de du d à au aux en et ou se s ne pas y que qu qui ce cet cette ces sa son ses "
            "leur leurs mon ma mes ton ta tes nous vous il ils elle elles on je j me m te t lui eux pour par sur dans "
            "avec sans être avoir faire mais donc car si".split())
@@ -25,10 +24,9 @@ ELISION = re.compile(r"^((?:[ldjmnstc]|qu|jusqu|lorsqu|puisqu|quoiqu)['’])(\w.
 NOT_WORDS = re.compile(r"\([^)]*\)|（[^）]*）|\bqq(?:ch|n)?\b|\binf\b\.?|\bsubj\b\.?|\+|…|⬚|\{\{|\}\}", re.I)
 TIME = re.compile(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})")
 STABLE_DAYS = 21
-# Écart avec l'ancre (texte dont la difficulté est connue : par défaut ancre.txt = T'es pas en retard,
-# dictée réussie). Valeurs de départ, à ajuster à l'usage.
-BANDS = [(1, 'shadowing / écoute extensive'), (-2, 'dictée'), (-5, 'écoute intensive (avec transcription)'),
-         (-99, 'trop difficile')]
+# À partir de 8 000 lemmes, presque tout texte courant dépasse 97 % : la couverture sert à écarter les textes
+# trop chargés en mots rares ; le reste se juge à l'écoute (une minute, sans texte).
+FLOOR = 97.0
 
 
 def norm(w):
@@ -42,7 +40,7 @@ def gzopen(p):
 class Lex:
     def __init__(self):
         self.f2l = json.load(gzopen(os.path.join(HERE, 'form2lemma.json.gz')))
-        self.rank, self.lexique = {}, []      # lexique : lemmes de Lexique, dans l'ordre du rang
+        self.rank, self.lexique = {}, []      # lexique : lemmes présents dans Lexique, dans l'ordre du rang
         with gzopen(os.path.join(HERE, 'rank_fr.tsv.gz')) as fh:
             for line in fh:
                 r, l, inlex = line.rstrip('\n').split('\t')
@@ -56,12 +54,11 @@ class Lex:
 
     def rank_of(self, w):
         r = self.rank.get(self.lemma(w))
-        if r is None and '-' in w:
+        if r is None and '-' in w:             # réjouis-toi : rang de la partie la plus rare
             parts = [self.rank.get(self.lemma(p)) for p in w.split('-') if len(p) > 1]
             parts = [p for p in parts if p]
             r = max(parts) if parts else None
         return r
-
 
 
 def tokens(text):
@@ -133,45 +130,138 @@ def analyse(lex, text, top, known):
     return total, ok, unknown
 
 
-def vocab_test(lex, per_band=12, bands=12, seed=None):
-    """Échantillon de lemmes par tranche de 1000 rangs ; o = connu (je sais ce que ça veut dire), Entrée = non."""
-    import random
+def verdict(pct, delta):
+    if pct < FLOOR:
+        return 'trop de mots rares'
+    if delta is None:
+        return "à juger à l'écoute"
+    return "proche de l'ancre" if delta >= -1 else "plus dur que l'ancre"
+
+
+# ---------------- test de vocabulaire ----------------
+
+KEYS_YES, KEYS_NO, KEYS_UNDO, KEYS_QUIT = '.', ',', ('\x7f', '\b'), ('q', '\x1b')
+
+
+def keys_from_terminal():
+    """Une touche à la fois, sans Entrée ni écho. Hors terminal (tests, tube) : on lit stdin caractère par caractère."""
+    if not sys.stdin.isatty():
+        while True:
+            c = sys.stdin.read(1)
+            if not c:
+                yield 'q'
+                return
+            if c not in '\r\n':
+                yield c
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            yield sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def load_level():
+    try:
+        return json.load(open(STATE, encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def vocab_test(lex, keys, out=sys.stdout, seed=None, per_band=12, pseudo_per_band=2, bands=12, save=True):
+    """12 tranches de 1000 rangs, 12 mots + 2 pseudo-mots par tranche, du plus fréquent au plus rare.
+    Les pseudo-mots acceptés mesurent la tendance à dire « connu » ; l'estimation est corrigée d'autant.
+    S'arrête de lui-même quand deux tranches de suite tombent sous 15 %."""
     rnd = random.Random(seed)
     clean = [l for l in lex.lexique if re.fullmatch(r"[a-zàâäçéèêëîïôöùûüÿ]{3,}", l)]
-    est = 0.0
-    print("Pour chaque mot : o = je connais au moins un sens courant, Entrée = non.\n")
+    pseudo = [w for w in open(os.path.join(HERE, 'pseudo.txt'), encoding='utf-8').read().split() if w]
+    rnd.shuffle(pseudo)
+    items = []                                   # (tranche, mot, est_pseudo)
     for b in range(bands):
         lo, hi = b * 1000 + 1, (b + 1) * 1000
-        pool = [l for l in clean if lo <= lex.rank[l] <= hi]
-        sample = rnd.sample(pool, min(per_band, len(pool)))
-        yes = 0
-        for l in sample:
-            yes += input(f'  [{lo:>5}–{hi:<5}] {l:<20} ').strip().lower() in ('o', 'y', 'oui', '1')
-        share = yes / len(sample)
-        est += share * 1000
-        print(f'  → {share:.0%} connus dans cette tranche\n')
-    print(f'Estimation : environ {round(est, -2):.0f} lemmes parmi les {bands * 1000} plus fréquents.')
-    print(f'Utilise --top {int(est // 500 * 500)} ici, et la même valeur pour « 常用词前 N 个算认识 » dans VCita.')
+        row = [(b, l, False) for l in rnd.sample([l for l in clean if lo <= lex.rank[l] <= hi], per_band)]
+        row += [(b, pseudo.pop(), True) for _ in range(pseudo_per_band)]
+        rnd.shuffle(row)
+        items += row
+    w = lambda s='': print(s, file=out, flush=True)
+    w(f"Un mot à la fois.  {KEYS_YES} = je connais au moins un sens courant   {KEYS_NO} = non"
+      "   ⌫ = corriger le précédent   q = arrêter")
+    w("Certains mots n'existent pas : réponds « non » si tu ne les reconnais pas.\n")
+    answers, i, low_streak, finished = [], 0, 0, True
+    ask = keys if callable(keys) else (lambda it: lambda word: next(it, 'q'))(iter(keys))   # tests : fonction(mot) → touche
+    while i < len(items):
+        b, word, _ = items[i]
+        print(f'  {b * 1000 + 1:>5}–{(b + 1) * 1000:<5} {word:<18}', end='', file=out, flush=True)
+        k = ask(word)
+        if k in KEYS_QUIT:
+            w('arrêt'); finished = False; break
+        if k in KEYS_UNDO:
+            w('↩')
+            if answers:
+                answers.pop(); i -= 1
+            continue
+        if k not in (KEYS_YES, KEYS_NO):
+            w(f"? ({KEYS_YES} ou {KEYS_NO})"); continue
+        answers.append(k == KEYS_YES)
+        w('✓' if k == KEYS_YES else '·')
+        i += 1
+        if i == len(items) or items[i][0] != b:   # fin de tranche
+            real = [a for (bb, _, ps), a in zip(items, answers) if bb == b and not ps]
+            share = sum(real) / len(real)
+            w(f'  → {share:.0%}\n')
+            low_streak = low_streak + 1 if share < 0.15 else 0
+            if low_streak >= 2:
+                w('Deux tranches sous 15 % : on s\'arrête là, la suite compte pour zéro.'); break
+    done = list(zip(items, answers))
+    if not done:
+        w('Aucune réponse.'); return None
+    ps = [a for (_, _, p), a in done if p]
+    fa = sum(ps) / len(ps) if ps else 0.0
+    by_band = C.defaultdict(list)
+    for (b, _, p), a in done:
+        if not p:
+            by_band[b].append(a)
+    raw = sum(sum(v) / len(v) * 1000 for v in by_band.values())
+    corr = sum(max(0.0, (sum(v) / len(v) - fa) / (1 - fa)) * 1000 for v in by_band.values()) if fa < 1 else 0.0
+    top = int(corr // 500 * 500)
+    w(f'\nPseudo-mots acceptés : {sum(ps)}/{len(ps)}')
+    w(f'Estimation brute : {round(raw, -2):.0f} · corrigée : {round(corr, -2):.0f} lemmes parmi les {bands * 1000} plus fréquents.')
+    if fa > 0.25:
+        w("Plus d'un pseudo-mot sur quatre accepté : refais le test en ne validant que les mots dont tu sais un sens.")
+    result = {'complet': finished, 'date': time.strftime('%Y-%m-%d'), 'brut': round(raw), 'pseudo': f'{sum(ps)}/{len(ps)}', 'estimation': round(corr), 'top': top}
+    if not finished:
+        w('Test interrompu : résultat partiel, rien n\'est enregistré.')
+    elif save and top > 0:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        json.dump(result, open(STATE, 'w', encoding='utf-8'), ensure_ascii=False)
+        w(f'Enregistré : --top {top} par défaut ({STATE}). Mets la même valeur dans VCita → 常用词前 N 个算认识.')
+    return result
 
 
-def band(delta):
-    return next(name for th, name in BANDS if delta >= th)
+# ---------------- main ----------------
 
-
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('fichiers', nargs='+')
-    ap.add_argument('--top', type=int, default=None, help='les N lemmes les plus fréquents comptent comme connus (défaut : 5000, ou 2000 avec --export)')
+    ap.add_argument('fichiers', nargs='*')
+    ap.add_argument('--top', type=int, default=None, help=f'les N lemmes les plus fréquents comptent comme connus (défaut : dernier --test, sinon {DEFAULT_TOP})')
     ap.add_argument('--export', help='export VCita (.json ou .json.gz)')
     ap.add_argument('--ancre', default=os.path.join(HERE, 'ancre.txt'), help='texte de référence (défaut : ancre.txt)')
     ap.add_argument('--inconnus', type=int, default=25, help='nombre de mots inconnus à lister (fichier unique)')
     ap.add_argument('--courbe', action='store_true', help='couverture pour N = 1000 … 12000')
-    ap.add_argument('--test', action='store_true', help='test de vocabulaire (≈ 3 min) pour estimer ton N')
-    a = ap.parse_args() if '--test' not in sys.argv else ap.parse_known_args(['-'] + sys.argv[1:])[0]
-    if a.test:
-        return vocab_test(Lex())
-    top = a.top if a.top is not None else (2000 if a.export else 5000)
+    ap.add_argument('--test', action='store_true', help='test de vocabulaire (≈ 2 min) ; le résultat devient le --top par défaut')
+    a = ap.parse_args(argv)
     lex = Lex()
+    if a.test:
+        vocab_test(lex, keys_from_terminal())
+        return
+    if not a.fichiers:
+        ap.error('aucun fichier (ou --test)')
+    level = load_level()
+    top = a.top if a.top is not None else (level['top'] if level else DEFAULT_TOP)
+    src = '' if a.top is not None else (f" (test du {level['date']})" if level else ' (par défaut)')
     known = vcita_known(lex, a.export, top) if a.export else set()
     docs = [(f, *read_input(f)) for f in a.fichiers]
 
@@ -190,20 +280,19 @@ def main():
     rows = []
     for f, text, dur in docs:
         t, k, unk = analyse(lex, text, top, known)
-        pct = 100 * k / max(t, 1)
-        wpm = round(t / dur * 60) if dur else None
-        rows.append((pct, f, t, unk, wpm))
+        rows.append((100 * k / max(t, 1), f, t, unk, round(t / dur * 60) if dur else None))
     rows.sort(key=lambda r: -r[0])
     ref = None
     if a.ancre and os.path.exists(a.ancre):
         t, k, _ = analyse(lex, read_input(a.ancre)[0], top, known)
         ref = 100 * k / max(t, 1)
-    print(f"Connus = top {top}" + (f" + VCita ({len(known)} lemmes)" if a.export else '')
-          + (f" · ancre {os.path.basename(a.ancre)} = {ref:.1f} %" if ref is not None else '') + '\n')
+    print(f'Connus = top {top}{src}' + (f' + VCita ({len(known)} lemmes)' if a.export else '')
+          + (f' · ancre {os.path.basename(a.ancre)} = {ref:.1f} %' if ref is not None else '') + '\n')
     for pct, f, t, unk, wpm in rows:
         sp = f' · {wpm} mots/min' if wpm else ''
-        verdict = f'{pct - ref:+5.1f}  {band(pct - ref):<38}' if ref is not None else ''
-        print(f'{pct:5.1f} %  {verdict}{t:>6} mots · {len(unk):>4} inconnus distincts{sp}  {os.path.basename(f)}')
+        gap = f'{pct - ref:+5.1f}  ' if ref is not None else ''
+        v = verdict(pct, pct - ref if ref is not None else None)
+        print(f'{pct:5.1f} %  {gap}{v:<24}{t:>6} mots · {len(unk):>4} inconnus distincts{sp}  {os.path.basename(f)}')
     if len(rows) == 1:
         unk = rows[0][3]
         print('\nMots inconnus (occurrences · rang) :')
@@ -213,4 +302,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
