@@ -204,6 +204,17 @@ echo "网段多时分批轮换（IP_SAMPLE）"
 fresh; IP_SAMPLE=2 run full
 check "6 个 /24 分 3 批" 'grep -q "分 3 批轮换" "$T/out.log"'
 
+echo "网段很多时分批切片不会因 SIGPIPE 中断（pipefail）"
+fresh; awk 'BEGIN { for (i = 0; i < 30000; i++) printf "%d.%d.%d.0/24\n", 100 + int(i / 65536), int(i / 256) % 256, i % 256 }' > "$T/opt/ip.txt"
+IP_SAMPLE=1000 run full; rc=$?
+check "全量扫描正常结束" '(( rc == 0 )) && grep -q "分 30 批轮换" "$T/out.log"'
+
+echo "意外失败时，失败原因写出是哪一行"
+fresh; printf "#!/usr/bin/env bash\nexit 3\n" > "$T/bin/cut"; chmod +x "$T/bin/cut"
+run full
+check "失败简报里有行号" 'grep -q "脚本异常退出（退出码 [0-9]*，第 [0-9]* 行" "$T/tg.log"'
+rm -f "$T/bin/cut"
+
 echo "手动切换（use）与保留（MANUAL_HOLD）"
 fresh; run full
 check "榜单快照写好了" '[[ -s "$T/state/cloudflare/top.csv" ]]'

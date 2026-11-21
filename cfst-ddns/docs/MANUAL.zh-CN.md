@@ -394,7 +394,7 @@ GCORE_CFST_ARGS="-tl 300 -dt 5 -url https://你在该CDN上的测速文件"
 
 ```bash
 systemctl start cfst-ddns@full               # 先手动全量跑一次，建立榜单
-journalctl -fu 'cfst-ddns@*' --output cat    # 跟踪日志，Ctrl+C 退出
+journalctl -ft cfst-ddns --output cat    # 跟踪日志，Ctrl+C 退出
 systemctl enable --now cfst-ddns.timer       # 没问题再启用定时
 ```
 
@@ -460,11 +460,11 @@ SONDE_TOKEN=<Sonde 的 .sonde.env 里的 INGEST_TOKEN>
 
 ```bash
 systemctl list-timers cfst-ddns.timer       # timer 是否在跑（每 5 分钟）
-journalctl -fu 'cfst-ddns@*' --output cat   # 实时日志
+journalctl -ft cfst-ddns --output cat   # 实时日志
 systemctl start cfst-ddns@check             # 立即巡检一次
 systemctl start cfst-ddns@pool              # 立即复测榜单
 systemctl start cfst-ddns@full              # 立即全量扫描
-journalctl -fu cfst-ddns-bot --output cat   # Telegram 命令的日志
+journalctl -ft cfst-ddns-bot --output cat   # Telegram 命令的日志
 cat /var/lib/cfst-ddns/cloudflare/state     # 上次全量/巡检时间（Unix 时间戳）、当前 IP 的基准
 ```
 
@@ -484,6 +484,8 @@ timer 每 5 分钟会启动一次 `cfst-ddns@auto`，没到时间时几毫秒就
 | 上传测速 `连接失败（curl 退出码 7）` | 连不上这些 IP，多半是上传流量没被 `exclude_uid` 放行 |
 | `榜单里没有达标的 IP，且 … 刚做过全量扫描` | 高峰期整体都很差，低于 `MIN_SPEED`；保留现有解析，等下一轮。可适当调低 `MIN_SPEED` |
 | `Telegram 发送失败` | 通常是直连不通，配置 `API_PROXY` |
+| 简报写「脚本异常退出（退出码 N，第 X 行：…）」 | 脚本自身出错；把 `journalctl -t cfst-ddns --since today --output cat` 里这一轮的日志贴出来 |
+| `journalctl -u 'cfst-ddns@*'` 报 `No data available` | 实例跑完就卸载了，按单元名的通配查不到；用 `journalctl -t cfst-ddns` |
 | `同样的失败 2 小时内已经通知过，这次不发 Telegram` | 正常的去重；原因还在 journal 里，Sonde 照常上报 |
 | `收消息冲突（409）` | 这个 bot token 正被别的程序收消息或设了 webhook，给命令单独建一个 bot，填 `TG_CMD_BOT_TOKEN` |
 | `/pool` 没反应 | `systemctl status cfst-ddns-bot`；`TG_CHAT_ID` 要和发命令的会话一致 |

@@ -17,7 +17,7 @@
 #   API 请求   api.cloudflare.com、api.telegram.org（需要解析域名）→ 可经 API_PROXY 走代理
 set -euo pipefail
 
-VERSION="2026.11.19"
+VERSION="2026.11.21"
 SELF=$(readlink -f "$0")
 MODE_ARG="${1:-auto}"                    # 模式，可带目标：full / full:cloudfront
 MODE=${MODE_ARG%%:*}
@@ -323,7 +323,7 @@ mode_name() { case "$1" in check) echo 巡检 ;; pool) echo 复测榜单 ;; full
 
 # 运行状态，结束时用来写日志和 Telegram 简报
 KIND=""; REASON=""; WHY=""; PATH_DESC=""; IP=""; OLD_IP=""; LAT=""; LOSS=""; SPEED=""; GROUP=""; SRC=""; COMPARE=""
-PID=""; t=0; QUICK=""; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""; PING_T=""; HOLD=""
+PID=""; t=0; ERR_AT=""; QUICK=""; SCAN_NOTE=""; LAT_RELAXED=""; UP_OK=0; UP_ERR=""; NOGOOD=""; NEXT=""; FASTEST=""; PING_T=""; HOLD=""
 
 # ---------- 状态文件：上次全量/巡检时间、当前 IP 的基准速度 ----------
 STATE="$WORK/state"
@@ -579,12 +579,15 @@ finish() {
   t=$SECONDS
   if [[ $rc -ne 0 ]]; then
     KIND=failed
-    [[ -n "$REASON" ]] || REASON="脚本异常退出（退出码 $rc），详见 journalctl -u 'cfst-ddns@*'"
+    [[ -n "$REASON" ]] || REASON="脚本异常退出（退出码 ${rc}${ERR_AT:+，$ERR_AT}），详见 journalctl -t cfst-ddns --since today"
   fi
   notify || true
   sonde_report || true
 }
 trap finish EXIT
+# 意外失败（set -e 触发）时记下是哪一行、哪条命令，写进失败原因
+set -E
+trap 'ERR_AT="第 ${LINENO} 行：${BASH_COMMAND:0:80}"' ERR
 trap 'REASON="被终止（超时或手动停止）"; QUICK=1; exit 143' TERM INT
 
 # cf 方法 URL [JSON] —— 调 Cloudflare API，结果放在全局变量 RESP；success 不为 true 就失败
@@ -860,7 +863,7 @@ proven_ips() {
   local pk=""; [[ "$PEAK_HOURS" == *-* ]] && pk=1
   awk -F, -v pk="$pk" -v m="$METRIC" '(pk == "" || $2 == pk) { N[$3]++; L[$3] += $4; S[$3] += $5; P[$3] += $6 }
     END { for (ip in N) if (N[ip] >= 2) printf "%s %.4f\n", ip, (m != "") ? -P[ip] / N[ip] : S[ip] / N[ip] * 10000 + L[ip] / N[ip] }' track.csv \
-    | sort -k2,2g | head -n "$PROVEN_KEEP" | cut -d' ' -f1
+    | sort -k2,2g | awk -v n="$PROVEN_KEEP" 'NR <= n { print $1 }'
 }
 # 把历史表现好、本轮也通过了延迟筛选的 IP 加进候选（已经在候选里的不重复）
 add_proven() {
@@ -1029,7 +1032,7 @@ fill_colo() {
   touch colo.cache
   # 结果里已有机房的（下载测速）直接记进缓存
   awk -F, -v OFS=, -v now="$(date +%s)" 'NR > 1 { c = $7; sub(/\r$/, "", c); if (c != "" && c != "N/A") print $1, c, now }' result.csv >> colo.cache
-  miss=$(awk -F, 'NR > 1 { c = $7; sub(/\r$/, "", c); if (c == "" || c == "N/A") print $1 }' result.csv | head -n 20)
+  miss=$(awk -F, 'NR > 1 { c = $7; sub(/\r$/, "", c); if (c == "" || c == "N/A") print $1 }' result.csv | awk 'NR <= 20')
   [[ -n "$OLD_IP" ]] && miss+=$'\n'"$OLD_IP"
   if [[ -n "$miss" ]] && t=$(colo_target); then
     read -r host port scheme <<<"$t"
@@ -1045,7 +1048,7 @@ fill_colo() {
     FNR == 1 { print; next }
     { c = $7; sub(/\r$/, "", c); if ((c == "" || c == "N/A") && ($1 in m)) $7 = m[$1]; print }' colo.cache result.csv > result.tmp && mv result.tmp result.csv
   # 缓存只留每个 IP 最新的一条，最多 2000 条
-  tac colo.cache | awk -F, '!s[$1]++' | head -n 2000 | tac > colo.tmp && mv colo.tmp colo.cache
+  tac colo.cache | awk -F, '!s[$1]++ && ++n <= 2000' | tac > colo.tmp && mv colo.tmp colo.cache
   (( n )) && echo "  机房：查到 $n 个 IP 的机房代码"
   return 0
 }
@@ -1341,7 +1344,8 @@ do_full() {
   if (( IP_SAMPLE > 0 && total > IP_SAMPLE )); then
     local batches idx
     batches=$(( (total + IP_SAMPLE - 1) / IP_SAMPLE )); idx=$(( $(date +%s) / 86400 % batches ))
-    sort -t. -k1,1n -k2,2n -k3,3n all24.txt | tail -n +$((idx * IP_SAMPLE + 1)) | head -n "$IP_SAMPLE" > scan.txt
+    # 用 awk 切片、读完全部输入：tail | head 里 head 提前退出会让上游收到 SIGPIPE，pipefail 下整个脚本跟着退出
+    sort -t. -k1,1n -k2,2n -k3,3n all24.txt | awk -v a=$((idx * IP_SAMPLE)) -v n="$IP_SAMPLE" 'NR > a && NR <= a + n' > scan.txt
     echo "官方网段：${total} 个 /24 分 ${batches} 批轮换（IP_SAMPLE=${IP_SAMPLE}），今天第 $((idx + 1)) 批 $(wc -l < scan.txt) 个，${batches} 天覆盖一遍"
   else
     cp all24.txt scan.txt

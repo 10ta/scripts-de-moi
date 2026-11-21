@@ -67,7 +67,7 @@ cat <<EOF
   2. 编辑配置        nano /etc/cfst-ddns.env
   3. 手动全量跑一次  systemctl start cfst-ddns@full   （立即返回，测速在后台进行）
                      其他模式：cfst-ddns@check 巡检 / cfst-ddns@pool 复测榜单
-  4. 看进度和结果    journalctl -fu 'cfst-ddns@*' --output cat
+  4. 看进度和结果    journalctl -ft cfst-ddns --output cat
   5. 没问题就启用    systemctl enable --now cfst-ddns.timer
                      （每 5 分钟检查一次时间表，按 env 里的 FULL_AT / PEAK_* 决定做什么）
   6. 可选：Telegram 命令（/pool 看榜单、点按钮切换）

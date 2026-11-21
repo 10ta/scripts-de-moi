@@ -5,11 +5,13 @@ After=network-online.target
 
 [Service]
 # %i 是模式：auto（timer 用，按 env 里的时间表决定做什么）/ check 巡检 / pool 复测榜单 / full 全量扫描
-# 手动跑：systemctl start cfst-ddns@full    看日志：journalctl -fu 'cfst-ddns@*' --output cat
+# 手动跑：systemctl start cfst-ddns@full    看日志：journalctl -ft cfst-ddns --output cat
 # exec：systemctl start 立即返回，测速在后台进行
 Type=exec
 EnvironmentFile=/etc/cfst-ddns.env
 ExecStart=/opt/cfst-ddns/cfst-ddns.sh %i
+# 日志标识固定为 cfst-ddns：journalctl -t cfst-ddns 能查到所有实例（-u 'cfst-ddns@*' 在实例跑完卸载后会查不到）
+SyslogIdentifier=cfst-ddns
 # 卡死保护：一次运行超过 30 分钟就结束它（会发失败简报）
 RuntimeMaxSec=30min
 Nice=10

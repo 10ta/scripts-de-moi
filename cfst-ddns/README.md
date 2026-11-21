@@ -61,7 +61,7 @@ nano /etc/cfst-ddns.env
 systemctl start cfst-ddns@full
 ```
 
-Fill in `CF_API_TOKEN`, `CF_ZONE_ID` and `CF_RECORD_NAME`, then start one full scan. Follow it with `journalctl -fu 'cfst-ddns@*' --output cat`; it ends with `已更新 <record> (A): … -> …` or `解析保持 …`. Then enable the schedule: `systemctl enable --now cfst-ddns.timer`.
+Fill in `CF_API_TOKEN`, `CF_ZONE_ID` and `CF_RECORD_NAME`, then start one full scan. Follow it with `journalctl -ft cfst-ddns --output cat`; it ends with `已更新 <record> (A): … -> …` or `解析保持 …`. Then enable the schedule: `systemctl enable --now cfst-ddns.timer`.
 
 ## 📦 Installation
 
@@ -105,7 +105,7 @@ systemctl start cfst-ddns@pool
 systemctl start cfst-ddns@full:cloudfront
 ```
 
-`start` returns at once; progress goes to `journalctl -fu 'cfst-ddns@*' --output cat`. Add `:<target>` to run a single target.
+`start` returns at once; progress goes to `journalctl -ft cfst-ddns --output cat`. Add `:<target>` to run a single target.
 
 ### Switch from Telegram
 
@@ -178,8 +178,8 @@ Config: `/etc/cfst-ddns.env` (600). Per-target state in `/var/lib/cfst-ddns/<tar
 ### Logs
 
 ```bash
-journalctl -fu 'cfst-ddns@*' --output cat
-journalctl -fu cfst-ddns-bot --output cat
+journalctl -ft cfst-ddns --output cat
+journalctl -ft cfst-ddns-bot --output cat
 ```
 
 The timer starts `cfst-ddns@auto` every 5 minutes; when nothing is due it exits in milliseconds, so short start/stop lines in the journal are normal.
@@ -224,7 +224,7 @@ flowchart LR
 bash cfst-ddns/tests/run.sh
 ```
 
-Runs the whole flow offline with a fake cfst and a fake Cloudflare / Telegram API, no root needed; it ends with `通过 60 项，失败 0 项`. Before relying on a change, also run it once against a throw-away record and watch the journal.
+Runs the whole flow offline with a fake cfst and a fake Cloudflare / Telegram API, no root needed; it ends with `通过 62 项，失败 0 项`. Before relying on a change, also run it once against a throw-away record and watch the journal.
 
 ## 📚 Documentation
 

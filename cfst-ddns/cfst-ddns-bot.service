@@ -9,6 +9,7 @@ After=network-online.target
 Type=simple
 EnvironmentFile=/etc/cfst-ddns.env
 ExecStart=/opt/cfst-ddns/cfst-ddns.sh bot
+SyslogIdentifier=cfst-ddns-bot
 Restart=always
 RestartSec=15
 

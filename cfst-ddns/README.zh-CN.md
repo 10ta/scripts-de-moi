@@ -61,7 +61,7 @@ nano /etc/cfst-ddns.env
 systemctl start cfst-ddns@full
 ```
 
-填好 `CF_API_TOKEN`、`CF_ZONE_ID` 和 `CF_RECORD_NAME`，然后手动跑一次全量扫描。用 `journalctl -fu 'cfst-ddns@*' --output cat` 跟踪，最后会看到 `已更新 <记录> (A): … -> …` 或 `解析保持 …`。然后启用定时：`systemctl enable --now cfst-ddns.timer`。
+填好 `CF_API_TOKEN`、`CF_ZONE_ID` 和 `CF_RECORD_NAME`，然后手动跑一次全量扫描。用 `journalctl -ft cfst-ddns --output cat` 跟踪，最后会看到 `已更新 <记录> (A): … -> …` 或 `解析保持 …`。然后启用定时：`systemctl enable --now cfst-ddns.timer`。
 
 ## 📦 安装
 
@@ -105,7 +105,7 @@ systemctl start cfst-ddns@pool
 systemctl start cfst-ddns@full:cloudfront
 ```
 
-`start` 会立即返回，进度看 `journalctl -fu 'cfst-ddns@*' --output cat`。后面加 `:<目标>` 只跑这一个目标。
+`start` 会立即返回，进度看 `journalctl -ft cfst-ddns --output cat`。后面加 `:<目标>` 只跑这一个目标。
 
 ### 用 Telegram 切换
 
@@ -178,8 +178,8 @@ cd /opt/scripts-de-moi
 ### 日志
 
 ```bash
-journalctl -fu 'cfst-ddns@*' --output cat
-journalctl -fu cfst-ddns-bot --output cat
+journalctl -ft cfst-ddns --output cat
+journalctl -ft cfst-ddns-bot --output cat
 ```
 
 定时器每 5 分钟启动一次 `cfst-ddns@auto`；没到时间时几毫秒就退出，所以 journal 里有很短的启动 / 结束记录是正常的。
@@ -224,7 +224,7 @@ flowchart LR
 bash cfst-ddns/tests/run.sh
 ```
 
-用假的 cfst 和假的 Cloudflare / Telegram API 离线跑完整流程，不需要 root；最后输出 `通过 60 项，失败 0 项`。正式使用改动之前，再用一条临时记录真实跑一次，看 journal 确认。
+用假的 cfst 和假的 Cloudflare / Telegram API 离线跑完整流程，不需要 root；最后输出 `通过 62 项，失败 0 项`。正式使用改动之前，再用一条临时记录真实跑一次，看 journal 确认。
 
 ## 📚 文档地图
 
